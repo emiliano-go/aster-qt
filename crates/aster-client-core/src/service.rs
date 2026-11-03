@@ -331,9 +331,21 @@ impl ClientRuntime {
                 .map_err(|err| ClientError::Protocol(format!("read {}: {}", path.display(), err)))?;
             builder = builder.attachment(attachment_content_type(name), name, data);
         }
-        let raw = builder
+        let mut raw = builder
             .write_to_vec()
             .map_err(|e| ClientError::Protocol(format!("build message: {e}")))?;
+        let settings = crate::settings::load(self.data_dir());
+        if crate::settings::boolean(&settings, &["security", "gpg_sign_outgoing"], false) {
+            let fingerprint = crate::settings::string(
+                &settings,
+                &["security", "gpg_key_fingerprint"],
+                "",
+            );
+            if !fingerprint.is_empty() {
+                raw = crate::pgp_agent::sign_mime(&raw, &fingerprint)
+                    .map_err(|err| ClientError::Protocol(format!("gpg signing failed: {err}")))?;
+            }
+        }
         let envelope_to = to
             .iter()
             .chain(cc.iter())

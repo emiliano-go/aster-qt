@@ -2493,6 +2493,46 @@ ApplicationWindow {
                                             Text { text: root.gpg.installed ? (root.gpg.version || "gpg detected") : "gpg not detected"; color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-micro", 9); wrapMode: Text.WordWrap; Layout.fillWidth: true }
                                             Text { visible: root.gpg.agent_socket; text: root.gpg.agent_socket || ""; color: c("muted", "#a8ece7de"); font.family: c("font-mono", "JetBrains Mono"); font.pixelSize: n("font-size-micro", 9); elide: Text.ElideMiddle; Layout.fillWidth: true }
                                             Text { text: (root.gpg.secret_keys ? root.gpg.secret_keys.length : 0) + " secret keys in gpg-agent"; color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-micro", 9) }
+                                            Text {
+                                                text: root.settings.security && root.settings.security.gpg_key_fingerprint
+                                                      ? "Selected key: " + root.settings.security.gpg_key_fingerprint
+                                                      : "No key selected"
+                                                color: c("muted", "#a8ece7de")
+                                                font.family: c("font-mono", "JetBrains Mono")
+                                                font.pixelSize: n("font-size-micro", 9)
+                                                elide: Text.ElideMiddle
+                                                Layout.fillWidth: true
+                                            }
+                                            Repeater {
+                                                model: root.gpg.secret_keys || []
+                                                delegate: RowLayout {
+                                                    Layout.fillWidth: true
+                                                    spacing: n("space-2", 8)
+                                                    Text {
+                                                        text: modelData.uid + "  " + modelData.fingerprint.substring(0, 16)
+                                                        color: c("text-2", "#dbebe7de")
+                                                        font.family: c("font-family", "Inter")
+                                                        font.pixelSize: n("font-size-micro", 9)
+                                                        elide: Text.ElideRight
+                                                        Layout.fillWidth: true
+                                                    }
+                                                    LinkText {
+                                                        text: root.settings.security && root.settings.security.gpg_key_fingerprint === modelData.fingerprint ? "Using" : "Use"
+                                                        action: function() {
+                                                            app.applySettings(JSON.stringify({ security: { gpg_key_fingerprint: modelData.fingerprint } }))
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            RowLayout {
+                                                Layout.fillWidth: true
+                                                spacing: n("space-3", 12)
+                                                Text { text: "Sign outgoing mail with gpg-agent"; color: c("text-2", "#dbebe7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-small", 12); Layout.fillWidth: true }
+                                                Toggle {
+                                                    checked: root.settings.security ? root.settings.security.gpg_sign_outgoing === true : false
+                                                    onToggled: app.applySettings(JSON.stringify({ security: { gpg_sign_outgoing: !checked } }))
+                                                }
+                                            }
                                             RowLayout {
                                                 Layout.fillWidth: true
                                                 LinkText { text: "Import Aster key"; action: function() { app.importGpgKey() } }

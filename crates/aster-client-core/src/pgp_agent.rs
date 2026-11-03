@@ -35,6 +35,74 @@ pub fn import_secret_key(armored: &str) -> Result<GpgStatus, String> {
     import_secret_key_with_home(armored, None)
 }
 
+pub fn sign_detached(data: &[u8], fingerprint: &str) -> Result<Vec<u8>, String> {
+    sign_detached_with(data, fingerprint, None, None)
+}
+
+fn sign_detached_with(
+    data: &[u8],
+    fingerprint: &str,
+    home: Option<&Path>,
+    passphrase: Option<&str>,
+) -> Result<Vec<u8>, String> {
+    let mut command = Command::new("gpg");
+    command.args([
+        "--batch",
+        "--yes",
+        "--armor",
+        "--detach-sign",
+        "--local-user",
+        fingerprint,
+    ]);
+    if let Some(passphrase) = passphrase {
+        command.args(["--pinentry-mode", "loopback", "--passphrase", passphrase]);
+    }
+    command
+        .envs(home_env(home))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(|e| format!("run gpg: {e}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(data).map_err(|e| e.to_string())?;
+    }
+    let output = child.wait_with_output().map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err(format!(
+            "gpg signing failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(output.stdout)
+}
+
+pub fn sign_mime(raw: &[u8], fingerprint: &str) -> Result<Vec<u8>, String> {
+    let boundary = format!("aster-sig-{}", uuid::Uuid::new_v4().simple());
+    let mut part = raw.to_vec();
+    while part.ends_with(b"\n") || part.ends_with(b"\r") {
+        part.pop();
+    }
+    part.extend_from_slice(b"\r\n");
+    let signature = sign_detached(&part, fingerprint)?;
+    let mut out = Vec::new();
+    out.extend_from_slice(
+        format!(
+            "Content-Type: multipart/signed; protocol=\"application/pgp-signature\"; micalg=pgp-sha256; boundary=\"{boundary}\"\r\nMIME-Version: 1.0\r\n\r\n--{boundary}\r\n"
+        )
+        .as_bytes(),
+    );
+    out.extend_from_slice(&part);
+    out.extend_from_slice(
+        format!(
+            "\r\n--{boundary}\r\nContent-Type: application/pgp-signature; name=\"signature.asc\"\r\nContent-Description: OpenPGP digital signature\r\nContent-Disposition: attachment; filename=\"signature.asc\"\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    out.extend_from_slice(&signature);
+    out.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    Ok(out)
+}
+
 fn detect_with_home(home: Option<&Path>) -> GpgStatus {
     let version = run_gpg(home, &["--version"])
         .ok()
@@ -215,6 +283,41 @@ mod tests {
         let status = import_secret_key_with_home(&armored, Some(home.path())).unwrap();
         assert!(status.installed);
         assert!(!status.secret_keys.is_empty());
+    }
+
+    #[test]
+    fn signs_detached_in_temp_home() {
+        if Command::new("gpg").arg("--version").output().is_err() {
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let generated = Command::new("gpg")
+            .args([
+                "--batch",
+                "--pinentry-mode",
+                "loopback",
+                "--passphrase",
+                "test-passphrase",
+                "--quick-generate-key",
+                "Test User <test@example.com>",
+                "default",
+                "default",
+                "1d",
+            ])
+            .env("GNUPGHOME", home.path())
+            .output()
+            .unwrap();
+        assert!(generated.status.success());
+        let status = detect_with_home(Some(home.path()));
+        let fingerprint = status.secret_keys.first().unwrap().fingerprint.clone();
+        let signature = sign_detached_with(
+            b"hello signed world\n",
+            &fingerprint,
+            Some(home.path()),
+            Some("test-passphrase"),
+        )
+        .unwrap();
+        assert!(String::from_utf8_lossy(&signature).contains("BEGIN PGP SIGNATURE"));
     }
 
     #[test]

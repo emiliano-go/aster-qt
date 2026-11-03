@@ -23,7 +23,9 @@ pub fn defaults() -> Value {
         },
         "security": {
             "require_post_quantum": false,
-            "encrypt_emails": true
+            "encrypt_emails": true,
+            "gpg_sign_outgoing": false,
+            "gpg_key_fingerprint": ""
         },
         "mcp": {
             "enabled": false,

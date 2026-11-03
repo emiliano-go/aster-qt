@@ -21,7 +21,7 @@
 - MCP send is disabled unless enabled in Settings.
 - Permanent delete always opens a UI dialog and requires typing `delete`.
 - Attachment saves use sanitized filenames under Downloads.
-- The Aster PGP key can be imported into the user's existing gpg-agent through a 0600 temp file. No passphrase is passed on a command line and no export file is created.
+- The user can select an existing gpg-agent key in Settings. The selected key is used for optional outgoing PGP signing. The Aster key can also be imported into gpg-agent through a 0600 temp file. No passphrase is passed on a command line and no export file is created.
 
 ## Known gaps
 

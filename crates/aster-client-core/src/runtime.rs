@@ -213,6 +213,10 @@ impl ClientRuntime {
         &self.session
     }
 
+    pub fn data_dir(&self) -> &std::path::Path {
+        &self.config.data_dir
+    }
+
     pub fn config(&self) -> &ClientConfig {
         &self.config
     }
