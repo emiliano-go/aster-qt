@@ -2,6 +2,7 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
 import QtQuick.Window
+import QtWebEngine
 import AsterQt 1.0
 
 ApplicationWindow {
@@ -79,6 +80,51 @@ ApplicationWindow {
     readonly property var lightThemes: themes.filter(function(t) { return t.light === true; })
     readonly property var darkThemes: themes.filter(function(t) { return t.light !== true; })
     property int currentIndex: 0
+    property bool ruleMatchAll: true
+
+    ListModel {
+        id: conditionModel
+        ListElement { field: "from"; op: "contains"; value: "" }
+    }
+    ListModel {
+        id: actionModel
+        ListElement { kind: "move_to"; target: "" }
+    }
+
+    function createVisualRule() {
+        var conditions = [];
+        for (var i = 0; i < conditionModel.count; i++) {
+            var c = conditionModel.get(i);
+            if (!c.field) continue;
+            conditions.push({ field: c.field, op: c.op || "contains", value: c.value || "" });
+        }
+        var actions = [];
+        for (var j = 0; j < actionModel.count; j++) {
+            var a = actionModel.get(j);
+            var kind = (a.kind || "").trim();
+            var target = (a.target || "").trim();
+            if (kind === "move_to") actions.push({ type: "move_to", folder_token: target });
+            else if (kind === "apply_labels") actions.push({ type: "apply_labels", label_tokens: target.split(",").map(function(s) { return s.trim(); }).filter(function(s) { return s.length > 0; }) });
+            else if (kind === "forward") actions.push({ type: "forward", to: target });
+            else if (kind === "mark_as") actions.push({ type: "mark_as", value: target || "read" });
+            else if (kind === "star") actions.push({ type: "star" });
+            else if (kind === "skip_inbox") actions.push({ type: "skip_inbox" });
+            else if (kind === "delete") actions.push({ type: "delete" });
+            else if (kind === "auto_reply") actions.push({ type: "auto_reply", template_id: target });
+            else if (kind === "pin") actions.push({ type: "pin" });
+            else if (kind === "snooze") actions.push({ type: "snooze", until_iso8601: target });
+            else if (kind === "categorize") actions.push({ type: "categorize", category: target });
+            else if (kind === "notify") actions.push({ type: "notify", enabled: target !== "false" });
+        }
+        app.createRuleJson(JSON.stringify({
+            name: ruleName.text || "Rule",
+            color: "#d98e5c",
+            enabled: true,
+            match_mode: root.ruleMatchAll ? "all" : "any",
+            conditions: conditions,
+            actions: actions
+        }));
+    }
 
     onSystemDarkChanged: app.applySystemDark(systemDark)
 
@@ -168,6 +214,7 @@ ApplicationWindow {
     component ModeChip: Rectangle {
         property string label
         property bool active: false
+        signal clicked()
         implicitWidth: chipText.implicitWidth + n("space-3", 12) * 2
         implicitHeight: 28
         radius: n("radius-control", 8)
@@ -187,7 +234,7 @@ ApplicationWindow {
         MouseArea {
             anchors.fill: parent
             cursorShape: Qt.PointingHandCursor
-            onClicked: app.applyThemeMode(parent.label.toLowerCase())
+            onClicked: parent.clicked()
         }
     }
 
@@ -262,6 +309,7 @@ ApplicationWindow {
         id: fieldRoot
         property alias text: field.text
         property string placeholder: ""
+        signal edited(string value)
         implicitHeight: n("control-height", 36)
         radius: n("radius-control", 8)
         color: c("input", "#221b1e23")
@@ -279,6 +327,7 @@ ApplicationWindow {
             font.family: c("font-family", "Inter")
             font.pixelSize: n("font-size-small", 12)
             clip: true
+            onTextChanged: fieldRoot.edited(text)
             Text {
                 visible: field.text.length === 0
                 text: fieldRoot.placeholder
@@ -1041,23 +1090,46 @@ ApplicationWindow {
 
                             Rectangle {
                                 Layout.fillWidth: true
-                                Layout.preferredHeight: bodyEdit.contentHeight + n("space-4", 16) * 2
+                                Layout.preferredHeight: Math.max(340, Math.min(720, readerFlick.height - 220))
                                 radius: n("radius-card", 14)
-                                color: root.detail.is_html ? c("html-mail-bg", "#ffffff") : "transparent"
-                                TextEdit {
-                                    id: bodyEdit
+                                color: root.detail.is_html ? c("html-mail-bg", "#ffffff") : c("surface", "#1b1e23")
+                                clip: true
+                                WebEngineView {
+                                    id: mailView
                                     anchors.fill: parent
-                                    anchors.margins: n("space-4", 16)
-                                    text: root.detail.body || ""
-                                    textFormat: root.detail.is_html ? TextEdit.RichText : TextEdit.PlainText
-                                    readOnly: true
-                                    selectByMouse: true
-                                    wrapMode: TextEdit.Wrap
-                                    color: root.detail.is_html ? "#1c1b19" : c("text", "#ece7de")
-                                    selectionColor: c("accent", "#d98e5c")
-                                    selectedTextColor: c("accent-ink", "#171717")
-                                    font.family: c("font-mail", "Inter")
-                                    font.pixelSize: n("font-size-html-mail", 15)
+                                    visible: root.detail.body_html && root.detail.body_html.length > 0
+                                    settings.javascriptEnabled: false
+                                    settings.pluginsEnabled: false
+                                    settings.localStorageEnabled: false
+                                    settings.localContentCanAccessRemoteUrls: false
+                                    settings.localContentCanAccessFileUrls: false
+                                    settings.autoLoadImages: false
+                                    backgroundColor: root.detail.is_html ? c("html-mail-bg", "#ffffff") : c("surface", "#1b1e23")
+                                    onNavigationRequested: function(request) {
+                                        if (request.url.toString().indexOf("http") === 0) {
+                                            Qt.openUrlExternally(request.url);
+                                            request.action = WebEngineView.IgnoreRequest;
+                                        }
+                                    }
+                                }
+                                Text {
+                                    anchors.centerIn: parent
+                                    visible: !root.detail.body_html || root.detail.body_html.length === 0
+                                    text: "This message has no readable body."
+                                    color: c("muted", "#a8ece7de")
+                                    font.family: c("font-family", "Inter")
+                                    font.pixelSize: n("font-size-small", 12)
+                                }
+                                Connections {
+                                    target: root
+                                    function onDetailChanged() {
+                                        if (root.detail.body_html)
+                                            mailView.loadHtml(root.detail.body_html, "about:blank");
+                                    }
+                                }
+                                Component.onCompleted: {
+                                    if (root.detail.body_html)
+                                        mailView.loadHtml(root.detail.body_html, "about:blank");
                                 }
                             }
 
@@ -1276,9 +1348,9 @@ ApplicationWindow {
                                     RowLayout {
                                         Layout.fillWidth: true
                                         spacing: n("space-2", 8)
-                                        ModeChip { label: "System"; active: app.themeMode === "system" }
-                                        ModeChip { label: "Light"; active: app.themeMode === "light" }
-                                        ModeChip { label: "Dark"; active: app.themeMode === "dark" }
+                                        ModeChip { label: "System"; active: app.themeMode === "system"; onClicked: app.applyThemeMode("system") }
+                                        ModeChip { label: "Light"; active: app.themeMode === "light"; onClicked: app.applyThemeMode("light") }
+                                        ModeChip { label: "Dark"; active: app.themeMode === "dark"; onClicked: app.applyThemeMode("dark") }
                                     }
                                     Text { text: "LIGHT THEME"; color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-micro", 9); font.letterSpacing: 1; Layout.topMargin: n("space-2", 8) }
                                     Repeater {
@@ -1380,6 +1452,81 @@ ApplicationWindow {
                                         }
                                     }
                                     Text { visible: root.rules.length === 0; text: "No rules yet. Create one below."; color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-small", 12) }
+                                    Text { text: "NEW RULE"; color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-micro", 9); font.letterSpacing: 1; Layout.topMargin: n("space-2", 8) }
+                                    RowLayout {
+                                        Layout.fillWidth: true
+                                        spacing: n("space-2", 8)
+                                        SettingsField { id: ruleName; Layout.fillWidth: true; placeholder: "Rule name" }
+                                        ModeChip { label: "All"; active: root.ruleMatchAll; onClicked: root.ruleMatchAll = true }
+                                        ModeChip { label: "Any"; active: !root.ruleMatchAll; onClicked: root.ruleMatchAll = false }
+                                    }
+                                    Text { text: "Conditions"; color: c("text-2", "#dbebe7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-small", 12); font.weight: n("font-weight-medium", 500) }
+                                    Repeater {
+                                        model: conditionModel
+                                        delegate: RowLayout {
+                                            Layout.fillWidth: true
+                                            spacing: n("space-2", 8)
+                                            SettingsField {
+                                                Layout.preferredWidth: 120
+                                                placeholder: "field"
+                                                Component.onCompleted: text = model.field
+                                                onEdited: function(value) { conditionModel.setProperty(index, "field", value) }
+                                            }
+                                            SettingsField {
+                                                Layout.preferredWidth: 140
+                                                placeholder: "operator"
+                                                Component.onCompleted: text = model.op
+                                                onEdited: function(value) { conditionModel.setProperty(index, "op", value) }
+                                            }
+                                            SettingsField {
+                                                Layout.fillWidth: true
+                                                placeholder: "value"
+                                                Component.onCompleted: text = model.value
+                                                onEdited: function(value) { conditionModel.setProperty(index, "value", value) }
+                                            }
+                                            LinkText { text: "Remove"; action: function() { conditionModel.remove(index) } }
+                                        }
+                                    }
+                                    RowLayout {
+                                        Layout.fillWidth: true
+                                        LinkText { text: "Add condition"; action: function() { conditionModel.append({ field: "subject", op: "contains", value: "" }) } }
+                                        Item { Layout.fillWidth: true }
+                                    }
+                                    Text { text: "ACTIONS"; color: c("text-2", "#dbebe7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-small", 12); font.weight: n("font-weight-medium", 500) }
+                                    Repeater {
+                                        model: actionModel
+                                        delegate: RowLayout {
+                                            Layout.fillWidth: true
+                                            spacing: n("space-2", 8)
+                                            SettingsField {
+                                                Layout.preferredWidth: 130
+                                                placeholder: "action"
+                                                Component.onCompleted: text = model.kind
+                                                onEdited: function(value) { actionModel.setProperty(index, "kind", value) }
+                                            }
+                                            SettingsField {
+                                                Layout.fillWidth: true
+                                                placeholder: "target (mailbox token, address, label, template, date)"
+                                                Component.onCompleted: text = model.target
+                                                onEdited: function(value) { actionModel.setProperty(index, "target", value) }
+                                            }
+                                            LinkText { text: "Remove"; action: function() { actionModel.remove(index) } }
+                                        }
+                                    }
+                                    RowLayout {
+                                        Layout.fillWidth: true
+                                        LinkText { text: "Add action"; action: function() { actionModel.append({ kind: "move_to", target: "" }) } }
+                                        Item { Layout.fillWidth: true }
+                                        LinkText { text: "Create rule"; action: function() { root.createVisualRule() } }
+                                    }
+                                    Text {
+                                        text: "Fields: from, to, cc, bcc, subject, body, list_id, header, attachment_name, has_attachment, is_reply, is_forward, attachment_size, total_size, recipient_count, spam_score, date_received, dkim_result, spf_result, dmarc_result. Operators: is, is_not, contains, does_not_contain, starts_with, ends_with, matches_domain, does_not_match_domain, is_empty, matches_regex. Actions: move_to, apply_labels, mark_as, star, skip_inbox, delete, forward, auto_reply, pin, snooze, categorize, notify."
+                                        color: c("muted", "#a8ece7de")
+                                        font.family: c("font-family", "Inter")
+                                        font.pixelSize: n("font-size-micro", 9)
+                                        wrapMode: Text.WordWrap
+                                        Layout.fillWidth: true
+                                    }
                                     Text { text: "NEW RULE (FULL JSON)"; color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-micro", 9); font.letterSpacing: 1; Layout.topMargin: n("space-2", 8) }
                                     Rectangle {
                                         Layout.fillWidth: true

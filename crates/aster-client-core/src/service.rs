@@ -52,6 +52,7 @@ pub struct MessageDetail {
     pub message: MessageView,
     pub body: String,
     pub is_html: bool,
+    pub body_html: String,
     pub sender_unverified: bool,
     pub not_end_to_end_encrypted: bool,
     pub attachments_unverified: bool,
@@ -156,6 +157,8 @@ impl ClientRuntime {
             })
             .collect();
         let is_html = is_html(&msg);
+        let body = msg.body_text.clone().unwrap_or_default();
+        let body_html = safe_body_html(&body, is_html);
         let meta: serde_json::Value = msg
             .raw_headers
             .as_deref()
@@ -163,8 +166,9 @@ impl ClientRuntime {
             .unwrap_or(serde_json::Value::Null);
         Ok(MessageDetail {
             message: view_of(&msg),
-            body: msg.body_text.unwrap_or_default(),
+            body,
             is_html,
+            body_html,
             sender_unverified: aster_bridge_core::message_render::sender_unverified(&meta),
             not_end_to_end_encrypted: aster_bridge_core::message_render::not_end_to_end_encrypted(&meta),
             attachments_unverified: aster_bridge_core::message_render::attachments_unverified(&meta),
@@ -417,4 +421,58 @@ pub struct SendIdentityView {
     pub kind: String,
     pub display_name: Option<String>,
     pub is_default: bool,
+}
+
+
+fn safe_body_html(body: &str, is_html: bool) -> String {
+    if !is_html {
+        return format!(
+            "<pre style=\"white-space:pre-wrap;margin:0;font-family:Inter,system-ui,sans-serif;font-size:15px;line-height:1.5;color:inherit\">{}</pre>",
+            escape_html(body)
+        );
+    }
+    let mut builder = ammonia::Builder::default();
+    builder
+        .add_tags(&[
+            "a", "b", "blockquote", "br", "caption", "code", "col", "colgroup", "dd", "div",
+            "dl", "dt", "em", "figcaption", "figure", "font", "h1", "h2", "h3", "h4", "h5",
+            "h6", "hr", "i", "img", "li", "ol", "p", "pre", "s", "small", "span", "strong",
+            "sub", "sup", "table", "tbody", "td", "tfoot", "th", "thead", "tr", "u", "ul",
+        ])
+        .add_generic_attributes(&[
+            "href", "src", "alt", "title", "width", "height", "style", "class", "align",
+            "valign", "colspan", "rowspan", "dir", "lang", "border", "cellpadding",
+            "cellspacing", "bgcolor", "color", "face", "size",
+        ])
+        .add_url_schemes(&["http", "https", "mailto", "cid"]);
+    let cleaned = builder.clean(body).to_string();
+    format!(
+        "<style>\
+         html,body{{margin:0;padding:0;background:transparent;}}\
+         body{{font-family:Inter,system-ui,sans-serif;font-size:15px;line-height:1.5;color:#1c1b19;word-break:break-word;}}\
+         img{{max-width:100%;height:auto;}}\
+         img[src^=\"http\"]{{display:none !important;}}\
+         a{{color:#0b5fff;}}\
+         pre{{white-space:pre-wrap;overflow-wrap:anywhere;}}\
+         table{{border-collapse:collapse;max-width:100%;}}\
+         td,th{{padding:4px;}}\
+         blockquote{{margin:0 0 0 12px;padding-left:12px;border-left:2px solid #d0d0d0;color:#555;}}\
+         </style>{}",
+        cleaned
+    )
+}
+
+fn escape_html(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(ch),
+        }
+    }
+    out
 }
