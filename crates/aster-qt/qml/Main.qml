@@ -475,6 +475,7 @@ ApplicationWindow {
         implicitHeight: 32
         radius: n("radius-control", 8)
         color: active ? c("selected", "#3d2e323a") : (folderHover.hovered ? c("hover", "#2e2e323a") : "transparent")
+        Behavior on color { ColorAnimation { duration: n("motion-fast", 110) } }
         HoverHandler { id: folderHover }
         Rectangle {
             width: n("unread-bar-width", 3)
@@ -534,6 +535,7 @@ ApplicationWindow {
         radius: n("radius-control", 8)
         color: accent ? (iconHover.hovered ? Qt.lighter(c("accent-button", "#d98e5c"), 1.06) : c("accent-button", "#d98e5c"))
                       : (iconHover.hovered ? c("hover", "#2e2e323a") : "transparent")
+        Behavior on color { ColorAnimation { duration: n("motion-fast", 110) } }
         activeFocusOnTab: true
         Accessible.role: Accessible.Button
         Accessible.name: label
@@ -564,6 +566,7 @@ ApplicationWindow {
         property bool selected: item && root.detail.id === item.id
         implicitHeight: 88
         color: selected ? c("surface-strong", "#2e323a") : (rowHover.hovered ? c("hover", "#2e2e323a") : "transparent")
+        Behavior on color { ColorAnimation { duration: n("motion-fast", 110) } }
         HoverHandler { id: rowHover }
         Rectangle {
             width: n("unread-bar-width", 3)

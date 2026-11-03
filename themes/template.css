@@ -74,7 +74,7 @@
   /* Conversation thread line */
   --thread-line: #2e323a2e;
   /* Divider between message rows */
-  --message-divider: #343a44;
+  --message-divider: #30363f;
   /* Quoted reply text */
   --quoted-text: #ece7dea8;
   /* HTML mail body background */
@@ -170,9 +170,9 @@
   /* Buttons and inputs */
   --radius-control: 8px;
   /* Cards */
-  --radius-card: 14px;
+  --radius-card: 16px;
   /* Panels and dialogs */
-  --radius-panel: 16px;
+  --radius-panel: 18px;
   /* Menus and popovers */
   --radius-menu: 10px;
   /* Pills and toggles */
@@ -202,7 +202,7 @@
   /* Status bar height */
   --statusbar-height: 30px;
   /* Expanded sidebar width */
-  --sidebar-width: 256px;
+  --sidebar-width: 240px;
   /* Message list width */
   --list-width: 380px;
   /* Reader content width */
@@ -216,7 +216,7 @@
   /* Composer window height */
   --composer-height: 560px;
   /* Message row height */
-  --message-row-height: 82px;
+  --message-row-height: 96px;
   /* Message row padding */
   --message-row-padding: 10px;
   /* Thread indentation */
