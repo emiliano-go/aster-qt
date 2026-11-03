@@ -791,7 +791,7 @@ fn safe_body_html(body: &str, is_html: bool) -> String {
     let inlined = css_inline::inline(body).unwrap_or_else(|_| body.to_string());
     let cleaned = builder.clean(&inlined).to_string();
     format!(
-        "<style>\
+        "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; img-src cid: data:; style-src 'unsafe-inline'; font-src data:; script-src 'none'; frame-src 'none'; object-src 'none'; connect-src 'none'; form-action 'none'; base-uri 'none'\"><style>\
          html,body{{margin:0;padding:0;background:transparent;}}\
          body{{font-family:Inter,system-ui,sans-serif;font-size:15px;line-height:1.5;color:#1c1b19;word-break:break-word;padding:16px;}}\
          img{{max-width:100%;height:auto;}}\

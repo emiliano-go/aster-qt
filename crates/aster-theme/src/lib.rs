@@ -369,6 +369,22 @@ impl ThemeEntry {
     }
 }
 
+/// Tokens keyed by both the Rust name and the CSS property name.
+/// QML uses the CSS names, the engine uses the Rust names.
+pub fn qml_tokens(entry: &ThemeEntry) -> Map<String, Value> {
+    let mut out = Map::new();
+    for spec in specs() {
+        if let Some(value) = entry.tokens.get(spec.key) {
+            out.insert(spec.key.to_string(), value.clone());
+            out.insert(
+                spec.css.trim_start_matches("--").to_string(),
+                value.clone(),
+            );
+        }
+    }
+    out
+}
+
 pub fn parse_css_theme(text: &str, fallback_id: &str) -> Result<ThemeEntry> {
     let clean = strip_comments(text);
     let mut declarations: BTreeMap<String, String> = BTreeMap::new();
@@ -629,6 +645,14 @@ mod tests {
         assert_eq!(theme.tokens["bg"], "#ffffff");
         assert_eq!(theme.tokens["space3"], 12.0);
         assert_eq!(theme.tokens["motionFast"], 110.0);
+    }
+
+    #[test]
+    fn qml_tokens_include_css_aliases() {
+        let theme = builtin_entries().into_iter().next().unwrap();
+        let tokens = qml_tokens(&theme);
+        assert_eq!(tokens.get("text2"), tokens.get("text-2"));
+        assert_eq!(tokens.get("fontSizeBody"), tokens.get("font-size-body"));
     }
 
     #[test]

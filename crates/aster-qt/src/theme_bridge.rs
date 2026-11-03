@@ -17,7 +17,7 @@ pub fn tokens_json(dir: &Path, id: &str) -> Option<String> {
     aster_theme::all_themes(dir)
         .into_iter()
         .find(|theme| theme.id == id)
-        .and_then(|theme| serde_json::to_string(&theme.tokens).ok())
+        .and_then(|theme| serde_json::to_string(&aster_theme::qml_tokens(&theme)).ok())
 }
 
 pub fn theme_exists(dir: &Path, id: &str) -> bool {

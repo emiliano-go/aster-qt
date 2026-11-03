@@ -1334,14 +1334,19 @@ ApplicationWindow {
                                 Connections {
                                     target: root
                                     function onDetailChanged() {
+                                        mailReload.restart();
+                                    }
+                                }
+                                Timer {
+                                    id: mailReload
+                                    interval: 60
+                                    onTriggered: {
                                         if (root.detail.body_html)
                                             mailView.loadHtml(root.detail.body_html, "about:blank");
                                     }
                                 }
-                                Component.onCompleted: {
-                                    if (root.detail.body_html)
-                                        mailView.loadHtml(root.detail.body_html, "about:blank");
-                                }
+                                Component.onCompleted: mailReload.restart()
+                                onVisibleChanged: if (visible) mailReload.restart()
                             }
 
                             Text {
