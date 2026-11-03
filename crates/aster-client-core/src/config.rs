@@ -57,3 +57,21 @@ fn home_dir() -> PathBuf {
 pub fn ensure_dir(path: &Path) -> Result<(), String> {
     std::fs::create_dir_all(path).map_err(|e| format!("create {}: {}", path.display(), e))
 }
+
+
+/// True when the data directory sits inside a git worktree. Personal data must
+/// never be committed, so the app warns loudly in that case.
+pub fn inside_git_worktree(path: &Path) -> bool {
+    let mut cursor = path
+        .canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf());
+    loop {
+        if cursor.join(".git").exists() {
+            return true;
+        }
+        match cursor.parent() {
+            Some(parent) if parent != cursor => cursor = parent.to_path_buf(),
+            _ => return false,
+        }
+    }
+}

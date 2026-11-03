@@ -6,3 +6,15 @@
 
 # Qt QML language server
 crates/aster-qt/.qmlls.ini
+
+# Local personal data and key material
+settings.json
+mcp.json
+*.asc
+*.gpg
+*.key
+*.pem
+*.p12
+*.pfx
+.gnupg/
+private-keys-v1.d/

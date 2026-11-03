@@ -144,6 +144,29 @@ The bridge reads `mcp.json` and proxies MCP JSON-RPC to the running app. Tools c
 
 Permanent delete is intentionally gated. The MCP tool opens a confirmation dialog in the Aster Qt window, and deletion only proceeds after the user types `delete` and confirms. If the app is not running, MCP is unavailable.
 
+## Local data and secrets
+
+This repository contains the application only. Personal data stays in the local data directory.
+
+Never commit:
+
+- `settings.json`
+- `mcp.json`
+- GPG key material or `*.asc` exports
+- anything from `~/.gnupg`
+
+The repository has a pre-commit secret scan plus a GitHub Actions check. To enable the local hook:
+
+```bash
+scripts/install-git-hooks.sh
+```
+
+Run the scan manually at any time:
+
+```bash
+python3 scripts/secret_scan.py --all
+```
+
 ## Security
 
 - Mail is decrypted locally by the bridge core and stored in a SQLCipher database.

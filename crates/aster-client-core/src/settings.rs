@@ -50,7 +50,13 @@ pub fn load(data_dir: &Path) -> Value {
 pub fn save(data_dir: &Path, value: &Value) -> Result<(), String> {
     let path = data_dir.join("settings.json");
     let text = serde_json::to_string_pretty(value).map_err(|e| e.to_string())?;
-    std::fs::write(&path, text).map_err(|e| format!("write {}: {}", path.display(), e))
+    std::fs::write(&path, text).map_err(|e| format!("write {}: {}", path.display(), e))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
 }
 
 pub fn apply_patch(data_dir: &Path, patch: &Value) -> Result<Value, String> {

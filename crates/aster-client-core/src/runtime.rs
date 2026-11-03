@@ -76,6 +76,12 @@ impl ClientRuntime {
 
     pub async fn start_with(config: ClientConfig, opts: RuntimeOptions) -> ClientResult<Self> {
         config.prepare().map_err(ClientError::Storage)?;
+        if crate::config::inside_git_worktree(&config.data_dir) {
+            tracing::warn!(
+                "data directory {} is inside a git worktree; personal data must never be committed",
+                config.data_dir.display()
+            );
+        }
         let lock = acquire_lock(&config.lock_path())?;
 
         secrets::set_data_dir_override(Some(config.data_dir.clone()));
