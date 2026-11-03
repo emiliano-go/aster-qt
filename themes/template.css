@@ -90,9 +90,9 @@
   /* Message body font family */
   --font-mail: Inter;
   /* Micro text */
-  --font-size-micro: 9px;
+  --font-size-micro: 11px;
   /* Caption text */
-  --font-size-caption: 10px;
+  --font-size-caption: 11px;
   /* Small text */
   --font-size-small: 12px;
   /* Body text */
@@ -152,33 +152,33 @@
   /* Compact gap */
   --space-compact: 6px;
   /* Hairline radius */
-  --radius-line: 1px;
+  --radius-line: 0px;
   /* Hairline corner */
-  --radius-hairline: 2px;
+  --radius-hairline: 1px;
   /* Small corner */
-  --radius-small: 3px;
+  --radius-small: 1px;
   /* Micro corner */
-  --radius-micro: 4px;
+  --radius-micro: 2px;
   /* Dot corner */
-  --radius-dot: 5px;
+  --radius-dot: 2px;
   /* Loose corner */
-  --radius-loose: 7px;
+  --radius-loose: 3px;
   /* Badge corner */
-  --radius-badge: 9px;
+  --radius-badge: 3px;
   /* Wide corner */
-  --radius-wide: 11px;
+  --radius-wide: 4px;
   /* Buttons and inputs */
-  --radius-control: 8px;
+  --radius-control: 2px;
   /* Cards */
-  --radius-card: 16px;
+  --radius-card: 6px;
   /* Panels and dialogs */
-  --radius-panel: 18px;
+  --radius-panel: 8px;
   /* Menus and popovers */
-  --radius-menu: 10px;
+  --radius-menu: 4px;
   /* Pills and toggles */
   --radius-pill: 999px;
   /* Keyboard keycaps */
-  --radius-keycap: 6px;
+  --radius-keycap: 3px;
   /* Default border width */
   --border-width: 1;
   /* Emphasized border width */
@@ -186,7 +186,7 @@
   /* Focus border width */
   --border-width-focus: 1.5;
   /* Small icon */
-  --icon-small: 14px;
+  --icon-small: 16px;
   /* Default icon */
   --icon-body: 16px;
   /* Large icon */
@@ -206,7 +206,7 @@
   /* Message list width */
   --list-width: 380px;
   /* Reader content width */
-  --reader-width: 720px;
+  --reader-width: 960px;
   /* Settings navigation width */
   --settings-nav-width: 220px;
   /* Default dialog width */
@@ -222,7 +222,7 @@
   /* Thread indentation */
   --thread-indent: 18px;
   /* HTML mail max width */
-  --html-mail-max-width: 720px;
+  --html-mail-max-width: 940px;
   /* Trust banner height */
   --trust-banner-height: 34px;
   /* Unread bar width */

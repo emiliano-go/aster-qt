@@ -12,10 +12,10 @@
 - Mail is decrypted by the bridge core and stored in a SQLCipher database.
 - The app does not open IMAP, SMTP, JMAP, POP3, or CardDAV listeners.
 - HTML mail is sanitized with ammonia after CSS inlining.
-- HTML mail runs in WebEngine with JavaScript, plugins, local storage, remote URL access, and image auto load disabled.
-- A Content Security Policy blocks scripts, frames, objects, connections, and remote images.
-- Remote images are hidden to avoid tracking pixels and broken image placeholders.
-- Links open in the system browser; the embedded view ignores navigation.
+- HTML mail is reduced to a Qt rich-text subset; scripts, frames, objects, and images are removed.
+- No browser engine, JavaScript runtime, or remote resource loader is used to render mail.
+- Remote images are removed to avoid tracking pixels and broken image placeholders.
+- Links open in the system browser; no navigation happens inside the app.
 - MCP binds to 127.0.0.1 only, uses a random port, and requires a per start bearer token stored in a 0600 file.
 - MCP calls are written to `mcp-audit.log`.
 - MCP send is disabled unless enabled in Settings.

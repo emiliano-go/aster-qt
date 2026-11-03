@@ -49,20 +49,20 @@ The app owns one account, one database, and one process lock. Settings live in o
 ## Requirements
 
 - Rust 1.85 or newer
-- Qt 6 with Quick, QuickControls2, and WebEngineQuick development files
+- Qt 6 with Quick and QuickControls2 development files
 - OpenSSL development files
 - CMake and a C++ compiler
 
 On Arch Linux:
 
 ```bash
-sudo pacman -S --needed rust cmake ninja qt6-base qt6-declarative qt6-webengine openssl
+sudo pacman -S --needed rust cmake ninja qt6-base qt6-declarative openssl
 ```
 
 On Debian or Ubuntu:
 
 ```bash
-sudo apt install rustc cargo cmake ninja-build qt6-base-dev qt6-declarative-dev qt6-webengine-dev libssl-dev
+sudo apt install rustc cargo cmake ninja-build qt6-base-dev qt6-declarative-dev libssl-dev
 ```
 
 ## Build

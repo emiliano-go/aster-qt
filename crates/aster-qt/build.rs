@@ -11,7 +11,6 @@ fn main() {
     CxxQtBuilder::new_qml_module(QmlModule::new("AsterQt").qml_files(qml_files))
         .qt_module("Quick")
         .qt_module("QuickControls2")
-        .qt_module("WebEngineQuick")
         .files(["src/bridge.rs"])
         .build();
 }

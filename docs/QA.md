@@ -13,9 +13,9 @@
 
 - Device sign in completes and real mail syncs.
 - Message list renders real mail and thread bundles.
-- Thread count badge and sibling pills work.
+- Thread count badge and conversation stepper work.
 - Mailing lists appear in the sidebar and filter the list.
-- HTML mail renders through WebEngine with inlined CSS.
+- HTML mail renders through Qt rich text with inlined CSS; text stays selectable and links open externally.
 - Reader close and reopen work.
 - Settings opens, tabs switch, appearance persists.
 - Custom CSS theme applies across the UI.

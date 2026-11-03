@@ -45,6 +45,7 @@ pub mod qobject {
         #[qproperty(QString, contacts_json, cxx_name = "contactsJson")]
         #[qproperty(QString, thread_json, cxx_name = "threadJson")]
         #[qproperty(QString, lists_json, cxx_name = "listsJson")]
+        #[qproperty(QString, outbox_json, cxx_name = "outboxJson")]
         #[qproperty(QString, folder_id, cxx_name = "folderId")]
         #[qproperty(bool, loading, cxx_name = "loading")]
         #[qproperty(bool, ready, cxx_name = "ready")]
@@ -74,8 +75,36 @@ pub mod qobject {
         fn select_message(self: &Self, id: &QString);
 
         #[qinvokable]
+        #[cxx_name = "setStarred"]
+        fn set_starred(self: &Self, id: &QString, starred: bool);
+
+        #[qinvokable]
+        #[cxx_name = "setRead"]
+        fn set_read(self: &Self, id: &QString, read: bool);
+
+        #[qinvokable]
+        #[cxx_name = "archiveMessage"]
+        fn archive_message(self: &Self, id: &QString);
+
+        #[qinvokable]
+        #[cxx_name = "trashMessage"]
+        fn trash_message(self: &Self, id: &QString);
+
+        #[qinvokable]
+        #[cxx_name = "moveMessage"]
+        fn move_message(self: &Self, id: &QString, folder: &QString);
+
+        #[qinvokable]
         #[cxx_name = "loadSettingsData"]
         fn load_settings_data(self: &Self);
+
+        #[qinvokable]
+        #[cxx_name = "loadOutbox"]
+        fn load_outbox(self: &Self);
+
+        #[qinvokable]
+        #[cxx_name = "retryOutbox"]
+        fn retry_outbox(self: &Self, id: i64);
 
         #[qinvokable]
         #[cxx_name = "createRuleJson"]
@@ -101,11 +130,13 @@ pub mod qobject {
         #[cxx_name = "sendMessage"]
         fn send_message(
             self: &Self,
+            from: &QString,
             to: &QString,
             cc: &QString,
             bcc: &QString,
             subject: &QString,
             markdown: &QString,
+            attachments_json: &QString,
         );
 
         #[qinvokable]
@@ -160,18 +191,26 @@ pub(crate) enum Command {
     Refresh,
     OpenMailbox(String),
     Select(String),
+    SetStarred(String, bool),
+    SetRead(String, bool),
+    MoveMessage(String, String),
+    TrashMessage(String),
     LoadSettingsData,
+    LoadOutbox,
+    RetryOutbox(i64),
     CreateRule(String),
     DeleteRule(String),
     RunRule(String),
     RouteAlias(String, String),
     CreateMailbox(String),
     SendMessage {
+        from: String,
         to: String,
         cc: String,
         bcc: String,
         subject: String,
         markdown: String,
+        attachments: String,
     },
     Rpc {
         tool: String,
@@ -207,6 +246,7 @@ pub struct AppControllerRust {
     contacts_json: QString,
     thread_json: QString,
     lists_json: QString,
+    outbox_json: QString,
     folder_id: QString,
     loading: bool,
     ready: bool,
@@ -251,6 +291,7 @@ impl Default for AppControllerRust {
             contacts_json: "[]".into(),
             thread_json: "[]".into(),
             lists_json: "[]".into(),
+            outbox_json: "[]".into(),
             folder_id: "inbox".into(),
             loading: true,
             ready: false,
@@ -318,6 +359,7 @@ impl qobject::AppController {
             rt.block_on(snapshot(&runtime, &folder, selected.as_deref(), &qt));
             selected = first_id(&runtime, &folder);
             rt.block_on(snapshot(&runtime, &folder, selected.as_deref(), &qt));
+            rt.block_on(push_settings_data(&runtime, &qt));
 
             while let Ok(command) = rx.recv() {
                 let mut snapshot_needed = true;
@@ -328,8 +370,56 @@ impl qobject::AppController {
                         selected = first_id(&runtime, &folder);
                     }
                     Command::Select(id) => selected = Some(id),
+                    Command::SetStarred(id, starred) => {
+                        let result = rt.block_on(async {
+                            runtime
+                                .set_starred(std::slice::from_ref(&id), starred)
+                                .await
+                                .map_err(|e| e.to_string())
+                        });
+                        notify_result(&qt, result, if starred { "Message starred" } else { "Message unstarred" });
+                    }
+                    Command::SetRead(id, read) => {
+                        let result = rt.block_on(async {
+                            runtime
+                                .set_read(std::slice::from_ref(&id), read)
+                                .await
+                                .map_err(|e| e.to_string())
+                        });
+                        notify_result(&qt, result, if read { "Marked read" } else { "Marked unread" });
+                    }
+                    Command::MoveMessage(id, folder) => {
+                        let result = rt.block_on(async {
+                            runtime
+                                .move_messages(std::slice::from_ref(&id), &folder)
+                                .await
+                                .map_err(|e| e.to_string())
+                        });
+                        notify_result(&qt, result, "Message moved");
+                    }
+                    Command::TrashMessage(id) => {
+                        let result = rt.block_on(async {
+                            runtime
+                                .trash_messages(std::slice::from_ref(&id))
+                                .await
+                                .map_err(|e| e.to_string())
+                        });
+                        notify_result(&qt, result, "Message moved to Trash");
+                    }
                     Command::LoadSettingsData => {
                         rt.block_on(push_settings_data(&runtime, &qt));
+                        snapshot_needed = false;
+                    }
+                    Command::LoadOutbox => {
+                        rt.block_on(push_outbox_data(&runtime, &qt));
+                        snapshot_needed = false;
+                    }
+                    Command::RetryOutbox(id) => {
+                        let result = rt.block_on(async {
+                            runtime.retry_outbox_message(id).await.map_err(|e| e.to_string())
+                        });
+                        notify_result(&qt, result, "Outbox retry queued");
+                        rt.block_on(push_outbox_data(&runtime, &qt));
                         snapshot_needed = false;
                     }
                     Command::CreateRule(body) => {
@@ -389,11 +479,13 @@ impl qobject::AppController {
                         rt.block_on(push_settings_data(&runtime, &qt));
                     }
                     Command::SendMessage {
+                        from,
                         to,
                         cc,
                         bcc,
                         subject,
                         markdown,
+                        attachments,
                     } => {
                         let result = rt.block_on(async {
                             let parse = |value: String| -> Vec<String> {
@@ -404,14 +496,22 @@ impl qobject::AppController {
                                     .map(str::to_string)
                                     .collect()
                             };
+                            let from = from.trim();
+                            let attachments: Vec<std::path::PathBuf> =
+                                serde_json::from_str::<Vec<String>>(&attachments)
+                                    .unwrap_or_default()
+                                    .into_iter()
+                                    .map(std::path::PathBuf::from)
+                                    .collect();
                             runtime
-                                .send_markdown(
-                                    None,
+                                .send_markdown_with_attachments(
+                                    if from.is_empty() { None } else { Some(from) },
                                     &parse(to),
                                     &parse(cc),
                                     &parse(bcc),
                                     &subject,
                                     &markdown,
+                                    &attachments,
                                 )
                                 .await
                                 .map(|_| ())
@@ -505,9 +605,51 @@ impl qobject::AppController {
         }
     }
 
+    pub fn set_starred(self: &Self, id: &QString, starred: bool) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Command::SetStarred(id.to_string(), starred));
+        }
+    }
+
+    pub fn set_read(self: &Self, id: &QString, read: bool) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Command::SetRead(id.to_string(), read));
+        }
+    }
+
+    pub fn archive_message(self: &Self, id: &QString) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Command::MoveMessage(id.to_string(), "archive".to_string()));
+        }
+    }
+
+    pub fn trash_message(self: &Self, id: &QString) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Command::TrashMessage(id.to_string()));
+        }
+    }
+
+    pub fn move_message(self: &Self, id: &QString, folder: &QString) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Command::MoveMessage(id.to_string(), folder.to_string()));
+        }
+    }
+
     pub fn load_settings_data(self: &Self) {
         if let Some(tx) = &self.tx {
             let _ = tx.send(Command::LoadSettingsData);
+        }
+    }
+
+    pub fn load_outbox(self: &Self) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Command::LoadOutbox);
+        }
+    }
+
+    pub fn retry_outbox(self: &Self, id: i64) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Command::RetryOutbox(id));
         }
     }
 
@@ -546,19 +688,23 @@ impl qobject::AppController {
 
     pub fn send_message(
         self: &Self,
+        from: &QString,
         to: &QString,
         cc: &QString,
         bcc: &QString,
         subject: &QString,
         markdown: &QString,
+        attachments_json: &QString,
     ) {
         if let Some(tx) = &self.tx {
             let _ = tx.send(Command::SendMessage {
+                from: from.to_string(),
                 to: to.to_string(),
                 cc: cc.to_string(),
                 bcc: bcc.to_string(),
                 subject: subject.to_string(),
                 markdown: markdown.to_string(),
+                attachments: attachments_json.to_string(),
             });
         }
     }
@@ -788,6 +934,19 @@ async fn snapshot(
     });
 }
 
+
+async fn push_outbox_data(
+    runtime: &ClientRuntime,
+    qt: &cxx_qt::CxxQtThread<qobject::AppController>,
+) {
+    let outbox = runtime
+        .outbox_messages()
+        .map(|rows| serde_json::to_string(&rows).unwrap_or_else(|_| "[]".into()))
+        .unwrap_or_else(|_| "[]".into());
+    let _ = qt.queue(move |mut q| {
+        q.as_mut().set_outbox_json(outbox.into());
+    });
+}
 
 async fn push_settings_data(
     runtime: &ClientRuntime,

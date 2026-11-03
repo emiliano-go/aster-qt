@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 use aster_bridge_core::dav::store::{ContactsStore, DeleteOutcome, Preconditions, PutOutcome};
+use std::path::PathBuf;
 use aster_bridge_core::db::CachedMessage;
 use mail_builder::headers::address::Address;
 use mail_builder::MessageBuilder;
@@ -274,6 +275,20 @@ impl ClientRuntime {
         subject: &str,
         markdown: &str,
     ) -> ClientResult<i64> {
+        self.send_markdown_with_attachments(from, to, cc, bcc, subject, markdown, &[])
+            .await
+    }
+
+    pub async fn send_markdown_with_attachments(
+        &self,
+        from: Option<&str>,
+        to: &[String],
+        cc: &[String],
+        bcc: &[String],
+        subject: &str,
+        markdown: &str,
+        attachments: &[PathBuf],
+    ) -> ClientResult<i64> {
         if to.is_empty() && cc.is_empty() && bcc.is_empty() {
             return Err(ClientError::Protocol("add at least one recipient".into()));
         }
@@ -307,6 +322,15 @@ impl ClientRuntime {
             ));
         }
         builder = builder.text_body(plain).html_body(html);
+        for path in attachments {
+            let name = path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .ok_or_else(|| ClientError::Protocol(format!("invalid attachment path: {}", path.display())))?;
+            let data = std::fs::read(path)
+                .map_err(|err| ClientError::Protocol(format!("read {}: {}", path.display(), err)))?;
+            builder = builder.attachment(attachment_content_type(name), name, data);
+        }
         let raw = builder
             .write_to_vec()
             .map_err(|e| ClientError::Protocol(format!("build message: {e}")))?;
@@ -767,6 +791,69 @@ pub struct SendIdentityView {
 }
 
 
+#[derive(Debug, Clone, Serialize)]
+pub struct OutboxView {
+    pub id: i64,
+    pub envelope_from: String,
+    pub envelope_to: String,
+    pub queued_at: i64,
+    pub attempts: i64,
+    pub last_error: Option<String>,
+    pub status: String,
+}
+
+impl ClientRuntime {
+    pub fn outbox_messages(&self) -> ClientResult<Vec<OutboxView>> {
+        let rows = self
+            .db()
+            .outbox_list_pending()
+            .map_err(ClientError::Storage)?;
+        Ok(rows
+            .into_iter()
+            .map(|row| OutboxView {
+                id: row.id,
+                envelope_from: row.envelope_from,
+                envelope_to: row.envelope_to,
+                queued_at: row.queued_at,
+                attempts: row.attempts,
+                last_error: row.last_error,
+                status: row.status,
+            })
+            .collect())
+    }
+
+    pub async fn retry_outbox_message(&self, id: i64) -> ClientResult<()> {
+        self.retry_send(id).await
+    }
+}
+
+fn attachment_content_type(name: &str) -> &'static str {
+    let lower = name.to_ascii_lowercase();
+    let ext = lower.rsplit('.').next().unwrap_or("");
+    match ext {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "pdf" => "application/pdf",
+        "txt" | "log" | "md" => "text/plain",
+        "html" | "htm" => "text/html",
+        "csv" => "text/csv",
+        "json" => "application/json",
+        "zip" => "application/zip",
+        "gz" | "tgz" => "application/gzip",
+        "tar" => "application/x-tar",
+        "mp3" => "audio/mpeg",
+        "mp4" => "video/mp4",
+        "doc" => "application/msword",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xls" => "application/vnd.ms-excel",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        _ => "application/octet-stream",
+    }
+}
+
 fn safe_body_html(body: &str, is_html: bool) -> String {
     if !is_html {
         return format!(
@@ -779,31 +866,17 @@ fn safe_body_html(body: &str, is_html: bool) -> String {
         .add_tags(&[
             "a", "b", "blockquote", "br", "caption", "code", "col", "colgroup", "dd", "div",
             "dl", "dt", "em", "figcaption", "figure", "font", "h1", "h2", "h3", "h4", "h5",
-            "h6", "hr", "i", "img", "li", "ol", "p", "pre", "s", "small", "span", "strong",
+            "h6", "hr", "i", "li", "ol", "p", "pre", "s", "small", "span", "strong",
             "sub", "sup", "table", "tbody", "td", "tfoot", "th", "thead", "tr", "u", "ul",
         ])
         .add_generic_attributes(&[
-            "href", "src", "alt", "title", "width", "height", "style", "class", "align",
+            "href", "alt", "title", "width", "height", "style", "class", "align",
             "valign", "colspan", "rowspan", "dir", "lang", "border", "cellpadding",
             "cellspacing", "bgcolor", "color", "face", "size",
         ])
-        .add_url_schemes(&["http", "https", "mailto", "cid"]);
+        .add_url_schemes(&["http", "https", "mailto"]);
     let inlined = css_inline::inline(body).unwrap_or_else(|_| body.to_string());
-    let cleaned = builder.clean(&inlined).to_string();
-    format!(
-        "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; img-src cid: data:; style-src 'unsafe-inline'; font-src data:; script-src 'none'; frame-src 'none'; object-src 'none'; connect-src 'none'; form-action 'none'; base-uri 'none'\"><style>\
-         html,body{{margin:0;padding:0;background:transparent;}}\
-         body{{font-family:Inter,system-ui,sans-serif;font-size:15px;line-height:1.5;color:#1c1b19;word-break:break-word;padding:16px;}}\
-         img{{max-width:100%;height:auto;}}\
-         img[src^=\"http\"]{{display:none !important;}}\
-         a{{color:#0b5fff;}}\
-         pre{{white-space:pre-wrap;overflow-wrap:anywhere;}}\
-         table{{border-collapse:collapse;max-width:100%;}}\
-         td,th{{padding:4px;}}\
-         blockquote{{margin:0 0 0 12px;padding-left:12px;border-left:2px solid #d0d0d0;color:#555;}}\
-         </style>{}",
-        cleaned
-    )
+    builder.clean(&inlined).to_string()
 }
 
 fn escape_html(text: &str) -> String {
