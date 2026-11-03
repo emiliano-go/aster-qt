@@ -32,4 +32,5 @@
 - Offline startup, session expiry, plan failure, and revoked device.
 - Rule create, delete, run, and failure paths from the visual builder.
 - MCP send with approval disabled and enabled.
+- Aster key imported into the real system gpg-agent and listed with `gpg --list-secret-keys`.
 - Light, dark, and custom themes across all dialogs.
