@@ -24,7 +24,7 @@
 
 ## Known gaps
 
-- Private PGP key export is not exposed in the app or MCP yet. It requires password and TOTP re-authentication and is deliberately withheld until that flow is implemented correctly.
+- Private PGP key export is not exposed in the app or MCP yet. It requires password and TOTP re-authentication. The preferred design is to keep private key operations in the system gpg-agent and never export the key at all.
 - MCP tokens are not rotated while the app runs. They rotate on restart.
 - Audit logs are local and not signed.
 - No independent security audit has been performed.

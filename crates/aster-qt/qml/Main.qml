@@ -125,6 +125,11 @@ ApplicationWindow {
     readonly property var contacts: parse(app.contactsJson, [])
     readonly property var threadMessages: parse(app.threadJson, [])
     readonly property var mailingLists: parse(app.listsJson, [])
+    readonly property var activeList: {
+        for (var i = 0; i < mailingLists.length; i++)
+            if (mailingLists[i].list_id === root.listFilter) return mailingLists[i];
+        return null;
+    }
     property string listFilter: ""
     readonly property var themes: parse(app.themesJson, [])
     readonly property var lightThemes: themes.filter(function(t) { return t.light === true; })
@@ -1041,20 +1046,30 @@ ApplicationWindow {
                             ColumnLayout {
                                 spacing: 1
                                 Text {
-                                    text: root.folderLabel(app.folderId)
+                                    text: root.listFilter && root.activeList ? root.activeList.name : root.folderLabel(app.folderId)
                                     color: c("text", "#ece7de")
                                     font.family: c("font-family", "Inter")
                                     font.pixelSize: n("font-size-title", 16)
                                     font.weight: n("font-weight-semibold", 600)
+                                    elide: Text.ElideRight
                                 }
                                 Text {
-                                    text: root.visibleMessages.length + " messages"
+                                    text: root.listFilter && root.activeList
+                                          ? root.activeList.list_id + " · " + root.visibleMessages.length + " messages"
+                                          : root.visibleMessages.length + " messages"
                                     color: c("muted", "#a8ece7de")
                                     font.family: c("font-family", "Inter")
                                     font.pixelSize: n("font-size-micro", 9)
+                                    elide: Text.ElideRight
+                                    Layout.fillWidth: true
                                 }
                             }
                             Item { Layout.fillWidth: true }
+                            LinkText {
+                                visible: root.listFilter.length > 0
+                                text: "All mail"
+                                action: function() { root.listFilter = "" }
+                            }
                             Rectangle {
                                 implicitWidth: 28; implicitHeight: 28
                                 radius: n("radius-control", 8)
@@ -1270,6 +1285,14 @@ ApplicationWindow {
                                 }
                             }
 
+                            Text {
+                                visible: root.threadSiblings.length > 1
+                                text: "THREAD · " + root.threadSiblings.length + " MESSAGES"
+                                color: c("muted", "#a8ece7de")
+                                font.family: c("font-family", "Inter")
+                                font.pixelSize: n("font-size-micro", 9)
+                                font.letterSpacing: 1
+                            }
                             RowLayout {
                                 Layout.fillWidth: true
                                 visible: root.threadSiblings.length > 1
@@ -1931,6 +1954,14 @@ ApplicationWindow {
                                                 Item { Layout.fillWidth: true }
                                             }
                                         }
+                                    }
+                                    Text {
+                                        text: "Private key export is pending. Using the system gpg-agent for private key operations is the preferred safe path."
+                                        color: c("muted", "#a8ece7de")
+                                        font.family: c("font-family", "Inter")
+                                        font.pixelSize: n("font-size-micro", 9)
+                                        wrapMode: Text.WordWrap
+                                        Layout.fillWidth: true
                                     }
                                     RowLayout {
                                         Layout.fillWidth: true
