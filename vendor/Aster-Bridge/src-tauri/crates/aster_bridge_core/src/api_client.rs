@@ -2015,6 +2015,144 @@ impl ApiClient {
         resp.json().await.map_err(BridgeError::from)
     }
 
+    pub async fn get_pgp_key(&self, access_token: &str) -> Result<serde_json::Value> {
+        let resp = self
+            .client
+            .get(format!("{}/crypto/v1/encryption/pgp-key", self.base_url))
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn get_encryption_salt(&self, access_token: &str) -> Result<serde_json::Value> {
+        let resp = self
+            .client
+            .get(format!("{}/crypto/v1/encryption/salt", self.base_url))
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn export_pgp_secret(
+        &self,
+        access_token: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let resp = self
+            .client
+            .post(format!("{}/crypto/v1/keys/pgp/export", self.base_url))
+            .bearer_auth(access_token)
+            .json(body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn publish_wkd(&self, access_token: &str) -> Result<serde_json::Value> {
+        let resp = self
+            .client
+            .post(format!("{}/crypto/v1/keys/publish/wkd", self.base_url))
+            .bearer_auth(access_token)
+            .json(&serde_json::json!({}))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn unpublish_wkd(&self, access_token: &str) -> Result<serde_json::Value> {
+        let resp = self
+            .client
+            .delete(format!("{}/crypto/v1/keys/publish/wkd", self.base_url))
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn wkd_status(&self, access_token: &str) -> Result<serde_json::Value> {
+        let resp = self
+            .client
+            .get(format!("{}/crypto/v1/keys/publish/wkd/status", self.base_url))
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn publish_keyserver(
+        &self,
+        access_token: &str,
+        addresses: &[String],
+    ) -> Result<serde_json::Value> {
+        let body = if addresses.is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::json!({ "addresses": addresses })
+        };
+        let resp = self
+            .client
+            .post(format!("{}/crypto/v1/keys/publish/keyserver", self.base_url))
+            .bearer_auth(access_token)
+            .json(&body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn keyserver_status(&self, access_token: &str) -> Result<serde_json::Value> {
+        let resp = self
+            .client
+            .get(format!("{}/crypto/v1/keys/publish/keyserver/status", self.base_url))
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn republish_pgp(
+        &self,
+        access_token: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let resp = self
+            .client
+            .post(format!("{}/crypto/v1/keys/pgp/republish", self.base_url))
+            .bearer_auth(access_token)
+            .json(body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+        resp.json().await.map_err(BridgeError::from)
+    }
+
     pub async fn list_aliases_page(
         &self,
         access_token: &str,

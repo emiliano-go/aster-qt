@@ -80,6 +80,8 @@ ApplicationWindow {
     readonly property var rulesData: parse(app.rulesJson, ({}))
     readonly property var rules: rulesData.rules || []
     readonly property var identities: parse(app.identitiesJson, [])
+    readonly property var pgp: parse(app.pgpJson, ({}))
+    readonly property var contacts: parse(app.contactsJson, [])
     readonly property var themes: parse(app.themesJson, [])
     readonly property var lightThemes: themes.filter(function(t) { return t.light === true; })
     readonly property var darkThemes: themes.filter(function(t) { return t.light !== true; })
@@ -1179,6 +1181,11 @@ ApplicationWindow {
                                                 font.pixelSize: n("font-size-micro", 9)
                                             }
                                         }
+                                        MouseArea {
+                                            anchors.fill: parent
+                                            cursorShape: Qt.PointingHandCursor
+                                            onClicked: app.saveAttachment(root.detail.id, modelData.seq)
+                                        }
                                     }
                                 }
                             }
@@ -1308,6 +1315,7 @@ ApplicationWindow {
                         NavSettingsRow { label: "Mail"; tab: "mail"; icon: "inbox"; Layout.fillWidth: true }
                         NavSettingsRow { label: "Rules & filters"; tab: "rules"; icon: "rule"; Layout.fillWidth: true }
                         NavSettingsRow { label: "Aliases & mailboxes"; tab: "aliases"; icon: "folder"; Layout.fillWidth: true }
+                        NavSettingsRow { label: "Contacts"; tab: "contacts"; icon: "inbox"; Layout.fillWidth: true }
                         NavSettingsRow { label: "Security & PGP"; tab: "security"; icon: "shield"; Layout.fillWidth: true }
                         NavSettingsRow { label: "MCP"; tab: "mcp"; icon: "send"; Layout.fillWidth: true }
                         NavSettingsRow { label: "Diagnostics"; tab: "diagnostics"; icon: "settings"; Layout.fillWidth: true }
@@ -1333,7 +1341,7 @@ ApplicationWindow {
                             Layout.leftMargin: n("space-4", 16)
                             Layout.rightMargin: n("space-4", 16)
                             Text {
-                                text: ({ appearance: "Appearance", mail: "Mail", rules: "Rules & filters", aliases: "Aliases & mailboxes", security: "Security & PGP", mcp: "MCP", diagnostics: "Diagnostics" })[root.settingsTab] || "Settings"
+                                text: ({ appearance: "Appearance", mail: "Mail", rules: "Rules & filters", aliases: "Aliases & mailboxes", contacts: "Contacts", security: "Security & PGP", mcp: "MCP", diagnostics: "Diagnostics" })[root.settingsTab] || "Settings"
                                 color: c("text", "#ece7de")
                                 font.family: c("font-family", "Inter")
                                 font.pixelSize: n("font-size-title", 16)
@@ -1628,13 +1636,99 @@ ApplicationWindow {
                                     Text { visible: root.customFolders.length === 0; text: "No custom mailboxes yet."; color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-micro", 9) }
                                 }
 
+                                // Contacts
+                                ColumnLayout {
+                                    Layout.fillWidth: true
+                                    visible: root.settingsTab === "contacts"
+                                    spacing: n("space-3", 12)
+                                    SettingsTitle { text: "Contacts" }
+                                    SettingsSubtitle { text: "Create or update a contact from a vCard, then sync happens through the Aster encrypted contact store." }
+                                    RowLayout {
+                                        Layout.fillWidth: true
+                                        spacing: n("space-2", 8)
+                                        SettingsField { id: contactUid; Layout.preferredWidth: 180; placeholder: "uid" }
+                                        LinkText { text: "Save vCard"; action: function() { app.saveContact(contactUid.text, contactVcard.text) } }
+                                        Item { Layout.fillWidth: true }
+                                    }
+                                    Rectangle {
+                                        Layout.fillWidth: true
+                                        Layout.preferredHeight: 120
+                                        radius: n("radius-control", 8)
+                                        color: c("input", "#221b1e23")
+                                        border.width: n("border-width", 1)
+                                        border.color: c("border", "#171b1e23")
+                                        TextArea {
+                                            id: contactVcard
+                                            anchors.fill: parent
+                                            anchors.margins: n("space-2", 8)
+                                            color: c("text", "#ece7de")
+                                            placeholderText: "BEGIN:VCARD\nVERSION:3.0\nFN:Name\nEMAIL:name@example.com\nEND:VCARD"
+                                            placeholderTextColor: c("muted", "#a8ece7de")
+                                            wrapMode: TextArea.Wrap
+                                            background: null
+                                            font.family: c("font-mono", "JetBrains Mono")
+                                            font.pixelSize: n("font-size-micro", 9)
+                                        }
+                                    }
+                                    Repeater {
+                                        model: root.contacts
+                                        delegate: Rectangle {
+                                            Layout.fillWidth: true
+                                            implicitHeight: contactRow.implicitHeight + n("space-3", 12) * 2
+                                            radius: n("radius-control", 8)
+                                            color: c("card", "#23262c")
+                                            border.width: n("border-width", 1)
+                                            border.color: c("border", "#171b1e23")
+                                            RowLayout {
+                                                id: contactRow
+                                                anchors.fill: parent
+                                                anchors.margins: n("space-3", 12)
+                                                spacing: n("space-2", 8)
+                                                ColumnLayout {
+                                                    spacing: 2
+                                                    Layout.fillWidth: true
+                                                    Text { text: modelData.uid; color: c("text", "#ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-small", 12); font.weight: n("font-weight-medium", 500) }
+                                                    Text { text: (modelData.vcard || "").substring(0, 120); color: c("muted", "#a8ece7de"); font.family: c("font-mono", "JetBrains Mono"); font.pixelSize: n("font-size-micro", 9); elide: Text.ElideRight; Layout.fillWidth: true }
+                                                }
+                                                LinkText { text: "Delete"; action: function() { app.deleteContact(modelData.uid) } }
+                                            }
+                                        }
+                                    }
+                                    Text { visible: root.contacts.length === 0; text: "No contacts loaded."; color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-micro", 9) }
+                                }
+
                                 // Security
                                 ColumnLayout {
                                     Layout.fillWidth: true
                                     visible: root.settingsTab === "security"
                                     spacing: n("space-3", 12)
                                     SettingsTitle { text: "Security & PGP" }
-                                    SettingsSubtitle { text: "Encryption preferences. Key export, keyservers, WKD, and key rotation are wired through the Aster PGP API in the next milestone." }
+                                    SettingsSubtitle { text: "Account key, keyserver publication, and encryption preferences." }
+                                    Rectangle {
+                                        Layout.fillWidth: true
+                                        implicitHeight: pgpCol.implicitHeight + n("space-3", 12) * 2
+                                        radius: n("radius-control", 8)
+                                        color: c("card", "#23262c")
+                                        border.width: n("border-width", 1)
+                                        border.color: c("border", "#171b1e23")
+                                        ColumnLayout {
+                                            id: pgpCol
+                                            anchors.fill: parent
+                                            anchors.margins: n("space-3", 12)
+                                            spacing: 3
+                                            Text { text: root.pgp.fingerprint ? "PGP key" : "PGP key unavailable"; color: c("text", "#ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-small", 12); font.weight: n("font-weight-semibold", 600) }
+                                            Text { text: root.pgp.fingerprint || ""; color: c("muted", "#a8ece7de"); font.family: c("font-mono", "JetBrains Mono"); font.pixelSize: n("font-size-micro", 9); wrapMode: Text.WrapAnywhere; Layout.fillWidth: true }
+                                            Text { text: (root.pgp.algorithm || "") + " " + (root.pgp.key_size || "") + " · created " + (root.pgp.created_at || ""); color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-micro", 9); wrapMode: Text.WordWrap; Layout.fillWidth: true }
+                                            RowLayout {
+                                                Layout.fillWidth: true
+                                                spacing: n("space-3", 12)
+                                                LinkText { text: "Publish WKD"; action: function() { app.publishPgp("wkd") } }
+                                                LinkText { text: "Unpublish WKD"; action: function() { app.publishPgp("wkd-off") } }
+                                                LinkText { text: "Publish keyserver"; action: function() { app.publishPgp("keyserver") } }
+                                                Item { Layout.fillWidth: true }
+                                            }
+                                        }
+                                    }
                                     RowLayout {
                                         Layout.fillWidth: true
                                         ColumnLayout { spacing: 2; Layout.fillWidth: true

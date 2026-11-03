@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+use aster_bridge_core::dav::store::{ContactsStore, DeleteOutcome, Preconditions, PutOutcome};
 use aster_bridge_core::db::CachedMessage;
 use mail_builder::headers::address::Address;
 use mail_builder::MessageBuilder;
@@ -297,6 +298,132 @@ impl ClientRuntime {
         Ok(())
     }
 
+    pub async fn pgp_key(&self) -> ClientResult<serde_json::Value> {
+        let token = self.access_token().await;
+        self.client()
+            .get_pgp_key(&token)
+            .await
+            .map_err(ClientError::from_bridge)
+    }
+
+    pub async fn wkd_status(&self) -> ClientResult<serde_json::Value> {
+        let token = self.access_token().await;
+        self.client()
+            .wkd_status(&token)
+            .await
+            .map_err(ClientError::from_bridge)
+    }
+
+    pub async fn keyserver_status(&self) -> ClientResult<serde_json::Value> {
+        let token = self.access_token().await;
+        self.client()
+            .keyserver_status(&token)
+            .await
+            .map_err(ClientError::from_bridge)
+    }
+
+    pub async fn publish_wkd(&self) -> ClientResult<serde_json::Value> {
+        let token = self.access_token().await;
+        self.client()
+            .publish_wkd(&token)
+            .await
+            .map_err(ClientError::from_bridge)
+    }
+
+    pub async fn unpublish_wkd(&self) -> ClientResult<serde_json::Value> {
+        let token = self.access_token().await;
+        self.client()
+            .unpublish_wkd(&token)
+            .await
+            .map_err(ClientError::from_bridge)
+    }
+
+    pub async fn publish_keyserver(&self, addresses: &[String]) -> ClientResult<serde_json::Value> {
+        let token = self.access_token().await;
+        self.client()
+            .publish_keyserver(&token, addresses)
+            .await
+            .map_err(ClientError::from_bridge)
+    }
+
+    pub async fn contacts(&self) -> ClientResult<Vec<ContactView>> {
+        let store = ContactsStore::new(self.client().clone(), self.session().clone());
+        let entries = store.list().await.map_err(ClientError::from_bridge)?;
+        Ok(entries
+            .into_iter()
+            .map(|entry| ContactView {
+                uid: entry.uid,
+                contact_id: entry.contact_id,
+                etag: entry.etag,
+                vcard: entry.vcard,
+            })
+            .collect())
+    }
+
+    pub async fn save_contact(&self, uid: &str, vcard: &str) -> ClientResult<ContactView> {
+        let store = ContactsStore::new(self.client().clone(), self.session().clone());
+        match store
+            .put(uid, vcard, &Preconditions::default())
+            .await
+            .map_err(ClientError::from_bridge)?
+        {
+            PutOutcome::Stored(entry, _) => Ok(ContactView {
+                uid: entry.uid,
+                contact_id: entry.contact_id,
+                etag: entry.etag,
+                vcard: entry.vcard,
+            }),
+            PutOutcome::PreconditionFailed => {
+                Err(ClientError::Protocol("contact changed elsewhere".into()))
+            }
+        }
+    }
+
+    pub async fn delete_contact(&self, uid: &str) -> ClientResult<()> {
+        let store = ContactsStore::new(self.client().clone(), self.session().clone());
+        match store
+            .delete(uid, &Preconditions::default())
+            .await
+            .map_err(ClientError::from_bridge)?
+        {
+            DeleteOutcome::Deleted => Ok(()),
+            DeleteOutcome::NotFound => Err(ClientError::Protocol("contact not found".into())),
+            DeleteOutcome::PreconditionFailed => {
+                Err(ClientError::Protocol("contact changed elsewhere".into()))
+            }
+        }
+    }
+
+    pub fn save_attachment(&self, id: &str, seq: i64) -> ClientResult<std::path::PathBuf> {
+        let attachment = self
+            .db()
+            .get_message_attachments(id)
+            .map_err(ClientError::Storage)?
+            .into_iter()
+            .find(|item| item.seq == seq)
+            .ok_or_else(|| ClientError::Protocol(format!("attachment {id}:{seq} not found")))?;
+        let dir = downloads_dir();
+        std::fs::create_dir_all(&dir).map_err(|e| ClientError::Storage(e.to_string()))?;
+        let name = safe_filename(&attachment.name, seq);
+        let mut path = dir.join(&name);
+        let mut counter = 1;
+        while path.exists() {
+            let stem = std::path::Path::new(&name)
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or("attachment");
+            let ext = std::path::Path::new(&name)
+                .extension()
+                .and_then(|value| value.to_str())
+                .map(|value| format!(".{value}"))
+                .unwrap_or_default();
+            path = dir.join(format!("{stem} ({counter}){ext}"));
+            counter += 1;
+        }
+        std::fs::write(&path, &attachment.data).map_err(|e| ClientError::Storage(e.to_string()))?;
+        Ok(path)
+    }
+
     pub async fn send_identities(&self) -> Vec<SendIdentityView> {
         let session = self.session().read().await;
         session
@@ -587,4 +714,50 @@ fn escape_html(text: &str) -> String {
         }
     }
     out
+}
+
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ContactView {
+    pub uid: String,
+    pub contact_id: String,
+    pub etag: String,
+    pub vcard: String,
+}
+
+fn downloads_dir() -> std::path::PathBuf {
+    match std::env::var_os("XDG_DOWNLOAD_DIR") {
+        Some(dir) => std::path::PathBuf::from(dir),
+        None => std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
+            .join("Downloads"),
+    }
+}
+
+fn safe_filename(name: &str, seq: i64) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|ch| match ch {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\0' => '_',
+            ch if ch.is_control() => '_',
+            ch => ch,
+        })
+        .collect();
+    let trimmed = cleaned.trim().trim_matches('.');
+    if trimmed.is_empty() {
+        format!("attachment-{seq}")
+    } else {
+        trimmed.chars().take(180).collect()
+    }
+}
+
+#[cfg(test)]
+mod attachment_tests {
+    use super::safe_filename;
+
+    #[test]
+    fn filenames_are_sanitized() {
+        assert_eq!(safe_filename("../../etc/passwd", 1), "_.._etc_passwd");
+        assert_eq!(safe_filename("", 7), "attachment-7");
+        assert!(!safe_filename("a/b\\c:d", 1).contains('/'));
+    }
 }

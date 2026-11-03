@@ -41,6 +41,8 @@ pub mod qobject {
         #[qproperty(QString, rules_json, cxx_name = "rulesJson")]
         #[qproperty(QString, identities_json, cxx_name = "identitiesJson")]
         #[qproperty(QString, toast_text, cxx_name = "toastText")]
+        #[qproperty(QString, pgp_json, cxx_name = "pgpJson")]
+        #[qproperty(QString, contacts_json, cxx_name = "contactsJson")]
         #[qproperty(QString, folder_id, cxx_name = "folderId")]
         #[qproperty(bool, loading, cxx_name = "loading")]
         #[qproperty(bool, ready, cxx_name = "ready")]
@@ -105,6 +107,22 @@ pub mod qobject {
         );
 
         #[qinvokable]
+        #[cxx_name = "saveAttachment"]
+        fn save_attachment(self: &Self, id: &QString, seq: i64);
+
+        #[qinvokable]
+        #[cxx_name = "saveContact"]
+        fn save_contact(self: &Self, uid: &QString, vcard: &QString);
+
+        #[qinvokable]
+        #[cxx_name = "deleteContact"]
+        fn delete_contact(self: &Self, uid: &QString);
+
+        #[qinvokable]
+        #[cxx_name = "publishPgp"]
+        fn publish_pgp(self: &Self, kind: &QString);
+
+        #[qinvokable]
         #[cxx_name = "applySettings"]
         fn apply_settings(self: Pin<&mut Self>, patch: &QString);
 
@@ -158,6 +176,10 @@ pub(crate) enum Command {
         args: serde_json::Value,
         reply: std::sync::mpsc::Sender<Result<serde_json::Value, String>>,
     },
+    PgpPublish(String),
+    SaveContact { uid: String, vcard: String },
+    DeleteContact(String),
+    SaveAttachment { id: String, seq: i64 },
 }
 
 pub struct AppControllerRust {
@@ -179,6 +201,8 @@ pub struct AppControllerRust {
     rules_json: QString,
     identities_json: QString,
     toast_text: QString,
+    pgp_json: QString,
+    contacts_json: QString,
     folder_id: QString,
     loading: bool,
     ready: bool,
@@ -219,6 +243,8 @@ impl Default for AppControllerRust {
             rules_json: "{}".into(),
             identities_json: "[]".into(),
             toast_text: QString::default(),
+            pgp_json: "{}".into(),
+            contacts_json: "[]".into(),
             folder_id: "inbox".into(),
             loading: true,
             ready: false,
@@ -243,6 +269,7 @@ impl qobject::AppController {
         let qt = self.as_ref().qt_thread();
         let pending = self.pending_delete.clone();
         let mcp_dir = PathBuf::from(self.data_dir.to_string());
+        let rpc_dir = PathBuf::from(self.data_dir.to_string());
         crate::mcp::start(tx.clone(), mcp_dir);
 
         thread::spawn(move || {
@@ -387,11 +414,58 @@ impl qobject::AppController {
                         notify_result(&qt, result, "Message queued for sending");
                         snapshot_needed = false;
                     }
+                    Command::SaveContact { uid, vcard } => {
+                        let result = rt.block_on(async {
+                            runtime
+                                .save_contact(&uid, &vcard)
+                                .await
+                                .map(|_| ())
+                                .map_err(|e| e.to_string())
+                        });
+                        notify_result(&qt, result, "Contact saved");
+                        rt.block_on(push_settings_data(&runtime, &qt));
+                        snapshot_needed = false;
+                    }
+                    Command::SaveAttachment { id, seq } => {
+                        let result = runtime
+                            .save_attachment(&id, seq)
+                            .map(|path| path.to_string_lossy().to_string())
+                            .map_err(|e| e.to_string());
+                        let message = match &result {
+                            Ok(path) => format!("Saved to {path}"),
+                            Err(err) => err.clone(),
+                        };
+                        let _ = qt.queue(move |mut q| q.as_mut().set_toast_text(message.into()));
+                        snapshot_needed = false;
+                    }
+                    Command::DeleteContact(uid) => {
+                        let result = rt.block_on(async {
+                            runtime.delete_contact(&uid).await.map_err(|e| e.to_string())
+                        });
+                        notify_result(&qt, result, "Contact deleted");
+                        rt.block_on(push_settings_data(&runtime, &qt));
+                        snapshot_needed = false;
+                    }
+                    Command::PgpPublish(kind) => {
+                        let result = rt.block_on(async {
+                            let addresses: Vec<String> = Vec::new();
+                            match kind.as_str() {
+                                "wkd" => runtime.publish_wkd().await.map(|_| ()),
+                                "wkd-off" => runtime.unpublish_wkd().await.map(|_| ()),
+                                _ => runtime.publish_keyserver(&addresses).await.map(|_| ()),
+                            }
+                            .map_err(|e| e.to_string())
+                        });
+                        notify_result(&qt, result, "PGP publication updated");
+                        rt.block_on(push_settings_data(&runtime, &qt));
+                        snapshot_needed = false;
+                    }
                     Command::Rpc { tool, args, reply } => {
                         let result = rt.block_on(handle_rpc(
                             &runtime,
                             &pending,
                             &qt,
+                            &rpc_dir,
                             &tool,
                             &args,
                         ));
@@ -480,6 +554,36 @@ impl qobject::AppController {
                 subject: subject.to_string(),
                 markdown: markdown.to_string(),
             });
+        }
+    }
+
+    pub fn save_attachment(self: &Self, id: &QString, seq: i64) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Command::SaveAttachment {
+                id: id.to_string(),
+                seq,
+            });
+        }
+    }
+
+    pub fn save_contact(self: &Self, uid: &QString, vcard: &QString) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Command::SaveContact {
+                uid: uid.to_string(),
+                vcard: vcard.to_string(),
+            });
+        }
+    }
+
+    pub fn delete_contact(self: &Self, uid: &QString) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Command::DeleteContact(uid.to_string()));
+        }
+    }
+
+    pub fn publish_pgp(self: &Self, kind: &QString) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Command::PgpPublish(kind.to_string()));
         }
     }
 
@@ -678,9 +782,21 @@ async fn push_settings_data(
         .unwrap_or_else(|_| "{}".into());
     let identities = serde_json::to_string(&runtime.send_identities().await)
         .unwrap_or_else(|_| "[]".into());
+    let pgp = runtime
+        .pgp_key()
+        .await
+        .map(|value| value.to_string())
+        .unwrap_or_else(|_| "{}".into());
+    let contacts = runtime
+        .contacts()
+        .await
+        .map(|value| serde_json::to_string(&value).unwrap_or_else(|_| "[]".into()))
+        .unwrap_or_else(|_| "[]".into());
     let _ = qt.queue(move |mut q| {
         q.as_mut().set_rules_json(rules.into());
         q.as_mut().set_identities_json(identities.into());
+        q.as_mut().set_pgp_json(pgp.into());
+        q.as_mut().set_contacts_json(contacts.into());
     });
 }
 
@@ -700,6 +816,7 @@ async fn handle_rpc(
     runtime: &ClientRuntime,
     pending: &Arc<Mutex<Option<(String, std::sync::mpsc::Sender<bool>)>>>,
     qt: &cxx_qt::CxxQtThread<qobject::AppController>,
+    data_dir: &std::path::Path,
     tool: &str,
     args: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
@@ -876,6 +993,151 @@ async fn handle_rpc(
         "sync_now" => {
             runtime.sync_now().await.map_err(|e| e.to_string())?;
             Ok(serde_json::json!({ "ok": true }))
+        }
+        "contacts_list" => Ok(serde_json::to_value(
+            runtime.contacts().await.map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?),
+        "contacts_save" => {
+            let uid = args
+                .get("uid")
+                .and_then(|value| value.as_str())
+                .ok_or("uid is required")?;
+            let vcard = args
+                .get("vcard")
+                .and_then(|value| value.as_str())
+                .ok_or("vcard is required")?;
+            Ok(serde_json::to_value(
+                runtime
+                    .save_contact(uid, vcard)
+                    .await
+                    .map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?)
+        }
+        "contacts_delete" => {
+            let uid = args
+                .get("uid")
+                .and_then(|value| value.as_str())
+                .ok_or("uid is required")?;
+            runtime
+                .delete_contact(uid)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({ "ok": true }))
+        }
+        "attachment_list" => {
+            let id = args
+                .get("id")
+                .and_then(|value| value.as_str())
+                .ok_or("id is required")?;
+            Ok(serde_json::json!({
+                "attachments": runtime.message(id).map_err(|e| e.to_string())?.attachments
+            }))
+        }
+        "attachment_save" => {
+            let id = args
+                .get("id")
+                .and_then(|value| value.as_str())
+                .ok_or("id is required")?;
+            let seq = args
+                .get("seq")
+                .and_then(|value| value.as_i64())
+                .ok_or("seq is required")?;
+            Ok(serde_json::json!({
+                "path": runtime.save_attachment(id, seq).map_err(|e| e.to_string())?
+            }))
+        }
+        "drafts_list" => {
+            let limit = args
+                .get("limit")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(50) as usize;
+            Ok(serde_json::to_value(
+                runtime
+                    .messages("drafts", limit, 0)
+                    .map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?)
+        }
+        "pgp_key_info" => Ok(runtime.pgp_key().await.map_err(|e| e.to_string())?),
+        "pgp_status" => {
+            let wkd = runtime.wkd_status().await.unwrap_or_else(|_| serde_json::json!({}));
+            let keyserver = runtime
+                .keyserver_status()
+                .await
+                .unwrap_or_else(|_| serde_json::json!({}));
+            Ok(serde_json::json!({ "wkd": wkd, "keyserver": keyserver }))
+        }
+        "pgp_publish" => {
+            let kind = args
+                .get("kind")
+                .and_then(|value| value.as_str())
+                .unwrap_or("wkd");
+            if kind == "keyserver" {
+                let addresses: Vec<String> = args
+                    .get("addresses")
+                    .and_then(|value| value.as_array())
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|item| item.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Ok(runtime
+                    .publish_keyserver(&addresses)
+                    .await
+                    .map_err(|e| e.to_string())?)
+            } else {
+                Ok(runtime.publish_wkd().await.map_err(|e| e.to_string())?)
+            }
+        }
+        "mail_send" => {
+            let settings = app_settings::load(data_dir);
+            if !app_settings::boolean(&settings, &["mcp", "allow_send"], false) {
+                return Err("sending from MCP is disabled in Settings > MCP".into());
+            }
+            let to = args
+                .get("to")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            let cc = args
+                .get("cc")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            let bcc = args
+                .get("bcc")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            let subject = args
+                .get("subject")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            let markdown = args
+                .get("markdown")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            let id = runtime
+                .send_markdown(None, &to, &cc, &bcc, subject, markdown)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({ "outbox_id": id }))
         }
         _ => Err(format!("unknown tool: {tool}")),
     }

@@ -46,12 +46,13 @@ pub fn start(tx: Sender<Command>, data_dir: PathBuf) {
         for request in server.incoming_requests() {
             let tx = tx.clone();
             let token = token.clone();
-            thread::spawn(move || handle(request, tx, token));
+            let audit_dir = data_dir.clone();
+            thread::spawn(move || handle(request, tx, token, audit_dir));
         }
     });
 }
 
-fn handle(mut request: Request, tx: Sender<Command>, token: String) {
+fn handle(mut request: Request, tx: Sender<Command>, token: String, audit_dir: PathBuf) {
     if request.method() != &Method::Post || request.url() != "/mcp" {
         let _ = request.respond(Response::from_string("not found").with_status_code(404));
         return;
@@ -107,6 +108,9 @@ fn handle(mut request: Request, tx: Sender<Command>, token: String) {
             "error": { "code": -32603, "message": err }
         }),
     };
+    if method == "tools/call" {
+        audit(&audit_dir, &message, &response);
+    }
     let _ = request.respond(json_response(response));
 }
 
@@ -169,6 +173,50 @@ fn tools() -> Value {
         { "name": "rules_delete", "description": "Delete a mail rule.", "inputSchema": { "type": "object", "properties": { "id": { "type": "string" } }, "required": ["id"] } },
         { "name": "mailbox_create", "description": "Create a custom mailbox.", "inputSchema": { "type": "object", "properties": { "name": { "type": "string" } }, "required": ["name"] } },
         { "name": "alias_route", "description": "Create a mailbox and a rule that routes an alias into it.", "inputSchema": { "type": "object", "properties": { "alias": { "type": "string" }, "mailbox": { "type": "string" } }, "required": ["alias", "mailbox"] } },
-        { "name": "sync_now", "description": "Trigger a sync pass.", "inputSchema": { "type": "object", "properties": {} } }
+        { "name": "sync_now", "description": "Trigger a sync pass.", "inputSchema": { "type": "object", "properties": {} } },
+        { "name": "contacts_list", "description": "List contacts.", "inputSchema": { "type": "object", "properties": {} } },
+        { "name": "contacts_save", "description": "Create or update a contact from a vCard.", "inputSchema": { "type": "object", "properties": { "uid": { "type": "string" }, "vcard": { "type": "string" } }, "required": ["uid", "vcard"] } },
+        { "name": "contacts_delete", "description": "Delete a contact.", "inputSchema": { "type": "object", "properties": { "uid": { "type": "string" } }, "required": ["uid"] } },
+        { "name": "attachment_list", "description": "List attachments for a message.", "inputSchema": { "type": "object", "properties": { "id": { "type": "string" } }, "required": ["id"] } },
+        { "name": "attachment_save", "description": "Save an attachment to Downloads and return the path.", "inputSchema": { "type": "object", "properties": { "id": { "type": "string" }, "seq": { "type": "number" } }, "required": ["id", "seq"] } },
+        { "name": "drafts_list", "description": "List drafts.", "inputSchema": { "type": "object", "properties": { "limit": { "type": "number" } } } },
+        { "name": "mail_send", "description": "Send a Markdown message. Requires Send from MCP to be enabled in Settings.", "inputSchema": { "type": "object", "properties": { "to": { "type": "string" }, "cc": { "type": "string" }, "bcc": { "type": "string" }, "subject": { "type": "string" }, "markdown": { "type": "string" } }, "required": ["to", "subject", "markdown"] } },
+        { "name": "pgp_key_info", "description": "Return the account PGP key metadata and public key.", "inputSchema": { "type": "object", "properties": {} } },
+        { "name": "pgp_status", "description": "Return WKD and keyserver publication status.", "inputSchema": { "type": "object", "properties": {} } },
+        { "name": "pgp_publish", "description": "Publish the PGP key to WKD or a keyserver.", "inputSchema": { "type": "object", "properties": { "kind": { "type": "string" }, "addresses": { "type": "array", "items": { "type": "string" } } }, "required": ["kind"] } }
     ])
+}
+
+
+fn audit(dir: &std::path::Path, message: &Value, response: &Value) {
+    let tool = message
+        .pointer("/params/name")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown");
+    let args = message
+        .pointer("/params/arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let ok = response.get("error").is_none();
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_secs())
+        .unwrap_or(0);
+    let line = json!({
+        "ts": ts,
+        "tool": tool,
+        "args": args,
+        "ok": ok
+    });
+    if let Ok(text) = serde_json::to_string(&line) {
+        use std::io::Write as _;
+        let _ = std::fs::create_dir_all(dir);
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("mcp-audit.log"))
+        {
+            let _ = writeln!(file, "{text}");
+        }
+    }
 }
