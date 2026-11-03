@@ -1861,6 +1861,41 @@ impl ApiClient {
         resp.json().await.map_err(BridgeError::from)
     }
 
+    pub async fn snooze_mail(
+        &self,
+        access_token: &str,
+        item_ids: &[String],
+        snoozed_until: &str,
+    ) -> Result<()> {
+        let resp = self
+            .client
+            .post(format!("{}/mail/v1/snooze/bulk", self.base_url))
+            .bearer_auth(access_token)
+            .json(&serde_json::json!({
+                "mail_item_ids": item_ids,
+                "snoozed_until": snoozed_until
+            }))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+        Ok(())
+    }
+
+    pub async fn unsnooze_mail(&self, access_token: &str, item_id: &str) -> Result<()> {
+        let resp = self
+            .client
+            .delete(format!("{}/mail/v1/snooze/mail/{}", self.base_url, urlencoding_path(item_id)))
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+        Ok(())
+    }
+
     pub async fn list_mail_rules(&self, access_token: &str) -> Result<serde_json::Value> {
         let resp = self
             .client

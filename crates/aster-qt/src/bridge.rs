@@ -46,6 +46,7 @@ pub mod qobject {
         #[qproperty(QString, gpg_json, cxx_name = "gpgJson")]
         #[qproperty(QString, thread_json, cxx_name = "threadJson")]
         #[qproperty(QString, lists_json, cxx_name = "listsJson")]
+        #[qproperty(QString, tags_json, cxx_name = "tagsJson")]
         #[qproperty(QString, outbox_json, cxx_name = "outboxJson")]
         #[qproperty(QString, folder_id, cxx_name = "folderId")]
         #[qproperty(bool, loading, cxx_name = "loading")]
@@ -62,6 +63,30 @@ pub mod qobject {
         #[qinvokable]
         #[cxx_name = "resolveDelete"]
         fn resolve_delete(self: &Self, token: &QString, approved: bool);
+
+        #[qinvokable]
+        #[cxx_name = "createTag"]
+        fn create_tag(self: &Self, name: &QString);
+
+        #[qinvokable]
+        #[cxx_name = "deleteTag"]
+        fn delete_tag(self: &Self, token: &QString);
+
+        #[qinvokable]
+        #[cxx_name = "renameFolder"]
+        fn rename_folder(self: &Self, token: &QString, name: &QString);
+
+        #[qinvokable]
+        #[cxx_name = "deleteFolder"]
+        fn delete_folder(self: &Self, token: &QString);
+
+        #[qinvokable]
+        #[cxx_name = "batchAction"]
+        fn batch_action(self: &Self, action: &QString, ids: &QString);
+
+        #[qinvokable]
+        #[cxx_name = "notify"]
+        fn notify(self: &Self, title: &QString, body: &QString);
 
         #[qinvokable]
         #[cxx_name = "refreshMail"]
@@ -230,6 +255,11 @@ pub(crate) enum Command {
     SaveContact { uid: String, vcard: String },
     DeleteContact(String),
     ImportGpgKey,
+    BatchAction { action: String, ids: Vec<String> },
+    CreateTag(String),
+    DeleteTag(String),
+    RenameFolder { token: String, name: String },
+    DeleteFolder(String),
     SaveAttachment { id: String, seq: i64 },
 }
 
@@ -257,6 +287,7 @@ pub struct AppControllerRust {
     gpg_json: QString,
     thread_json: QString,
     lists_json: QString,
+    tags_json: QString,
     outbox_json: QString,
     folder_id: QString,
     loading: bool,
@@ -303,6 +334,7 @@ impl Default for AppControllerRust {
             gpg_json: "{}".into(),
             thread_json: "[]".into(),
             lists_json: "[]".into(),
+            tags_json: "[]".into(),
             outbox_json: "[]".into(),
             folder_id: "inbox".into(),
             loading: true,
@@ -381,7 +413,10 @@ impl qobject::AppController {
                         folder = next;
                         selected = first_id(&runtime, &folder);
                     }
-                    Command::Select(id) => selected = Some(id),
+                    Command::Select(id) => {
+                        let _ = rt.block_on(runtime.ensure_attachments(&id));
+                        selected = Some(id);
+                    }
                     Command::SetStarred(id, starred) => {
                         let result = rt.block_on(async {
                             runtime
@@ -554,6 +589,59 @@ impl qobject::AppController {
                             Err(err) => err.clone(),
                         };
                         let _ = qt.queue(move |mut q| q.as_mut().set_toast_text(message.into()));
+                        snapshot_needed = false;
+                    }
+                    Command::CreateTag(name) => {
+                        let result = rt.block_on(async {
+                            runtime.create_tag(&name).await.map(|_| ()).map_err(|e| e.to_string())
+                        });
+                        notify_result(&qt, result, "Tag created");
+                        rt.block_on(push_settings_data(&runtime, &qt));
+                        snapshot_needed = false;
+                    }
+                    Command::DeleteTag(token) => {
+                        let result = rt.block_on(async {
+                            runtime.delete_tag(&token).await.map_err(|e| e.to_string())
+                        });
+                        notify_result(&qt, result, "Tag deleted");
+                        rt.block_on(push_settings_data(&runtime, &qt));
+                        snapshot_needed = false;
+                    }
+                    Command::RenameFolder { token, name } => {
+                        let result = rt.block_on(async {
+                            runtime.rename_folder(&token, &name).await.map_err(|e| e.to_string())
+                        });
+                        notify_result(&qt, result, "Folder renamed");
+                        snapshot_needed = true;
+                    }
+                    Command::DeleteFolder(token) => {
+                        let result = rt.block_on(async {
+                            runtime.delete_folder(&token).await.map_err(|e| e.to_string())
+                        });
+                        notify_result(&qt, result, "Folder deleted");
+                        snapshot_needed = true;
+                    }
+                    Command::BatchAction { action, ids } => {
+                        let result = rt.block_on(async {
+                            match action.as_str() {
+                                "mark_read" => runtime.set_read(&ids, true).await,
+                                "mark_unread" => runtime.set_read(&ids, false).await,
+                                "star" => runtime.set_starred(&ids, true).await,
+                                "unstar" => runtime.set_starred(&ids, false).await,
+                                "archive" => runtime.move_messages(&ids, "archive").await,
+                                "trash" => runtime.trash_messages(&ids).await,
+                                "delete" => runtime.trash_messages(&ids).await,
+                                other if other.starts_with("move:") => {
+                                    runtime.move_messages(&ids, &other[5..]).await
+                                }
+                                _ => Err(aster_client_core::ClientError::Protocol(
+                                    format!("unknown batch action: {action}"),
+                                )),
+                            }
+                            .map_err(|e| e.to_string())
+                        });
+                        notify_result(&qt, result, "Batch action applied");
+                        rt.block_on(snapshot(&runtime, &folder, selected.as_deref(), &qt));
                         snapshot_needed = false;
                     }
                     Command::ImportGpgKey => {
@@ -739,6 +827,41 @@ impl qobject::AppController {
                 attachments: attachments_json.to_string(),
             });
         }
+    }
+
+    pub fn create_tag(self: &Self, name: &QString) {
+        if let Some(tx) = &self.tx { let _ = tx.send(Command::CreateTag(name.to_string())); }
+    }
+
+    pub fn delete_tag(self: &Self, token: &QString) {
+        if let Some(tx) = &self.tx { let _ = tx.send(Command::DeleteTag(token.to_string())); }
+    }
+
+    pub fn rename_folder(self: &Self, token: &QString, name: &QString) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Command::RenameFolder { token: token.to_string(), name: name.to_string() });
+        }
+    }
+
+    pub fn delete_folder(self: &Self, token: &QString) {
+        if let Some(tx) = &self.tx { let _ = tx.send(Command::DeleteFolder(token.to_string())); }
+    }
+
+    pub fn batch_action(self: &Self, action: &QString, ids: &QString) {
+        if let Some(tx) = &self.tx {
+            let ids: Vec<String> = serde_json::from_str(&ids.to_string()).unwrap_or_default();
+            let _ = tx.send(Command::BatchAction {
+                action: action.to_string(),
+                ids,
+            });
+        }
+    }
+
+    pub fn notify(self: &Self, title: &QString, body: &QString) {
+        let _ = std::process::Command::new("notify-send")
+            .arg(title.to_string())
+            .arg(body.to_string())
+            .spawn();
     }
 
     pub fn import_gpg_key(self: &Self) {
@@ -1014,12 +1137,17 @@ async fn push_settings_data(
         .map(|value| serde_json::to_string(&value).unwrap_or_else(|_| "[]".into()))
         .unwrap_or_else(|_| "[]".into());
     let gpg = serde_json::to_string(&runtime.gpg_status()).unwrap_or_else(|_| "{}".into());
+    let tags = runtime
+        .tags()
+        .map(|value| serde_json::to_string(&value).unwrap_or_else(|_| "[]".into()))
+        .unwrap_or_else(|_| "[]".into());
     let _ = qt.queue(move |mut q| {
         q.as_mut().set_rules_json(rules.into());
         q.as_mut().set_identities_json(identities.into());
         q.as_mut().set_pgp_json(pgp.into());
         q.as_mut().set_contacts_json(contacts.into());
         q.as_mut().set_gpg_json(gpg.into());
+        q.as_mut().set_tags_json(tags.into());
     });
 }
 
@@ -1232,6 +1360,121 @@ async fn handle_rpc(
                 .await
                 .map_err(|e| e.to_string())?;
             Ok(serde_json::json!({ "folder_token": token, "rule_id": rule_id }))
+        }
+        "tags_list" => Ok(serde_json::to_value(
+            runtime.tags().map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?),
+        "tag_create" => {
+            let name = args
+                .get("name")
+                .and_then(|value| value.as_str())
+                .ok_or("name is required")?;
+            Ok(serde_json::to_value(
+                runtime.create_tag(name).await.map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?)
+        }
+        "tag_delete" => {
+            let token = args
+                .get("tag_token")
+                .and_then(|value| value.as_str())
+                .ok_or("tag_token is required")?;
+            runtime.delete_tag(token).await.map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({ "ok": true }))
+        }
+        "tag_assign" => {
+            let token = args
+                .get("tag_token")
+                .and_then(|value| value.as_str())
+                .ok_or("tag_token is required")?;
+            runtime
+                .assign_tag(&ids(), token)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({ "ok": true }))
+        }
+        "tag_remove" => {
+            let token = args
+                .get("tag_token")
+                .and_then(|value| value.as_str())
+                .ok_or("tag_token is required")?;
+            runtime
+                .remove_tag(&ids(), token)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({ "ok": true }))
+        }
+        "folder_rename" => {
+            let token = args
+                .get("folder_token")
+                .and_then(|value| value.as_str())
+                .ok_or("folder_token is required")?;
+            let name = args
+                .get("name")
+                .and_then(|value| value.as_str())
+                .ok_or("name is required")?;
+            runtime
+                .rename_folder(token, name)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({ "ok": true }))
+        }
+        "folder_delete" => {
+            let token = args
+                .get("folder_token")
+                .and_then(|value| value.as_str())
+                .ok_or("folder_token is required")?;
+            runtime
+                .delete_folder(token)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({ "ok": true }))
+        }
+        "folder_move" => {
+            let token = args
+                .get("folder_token")
+                .and_then(|value| value.as_str())
+                .ok_or("folder_token is required")?;
+            let parent = args.get("parent_token").and_then(|value| value.as_str());
+            runtime
+                .move_folder(token, parent)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({ "ok": true }))
+        }
+        "mail_snooze" => {
+            let until = args
+                .get("until_iso8601")
+                .and_then(|value| value.as_str())
+                .ok_or("until_iso8601 is required")?;
+            runtime
+                .snooze_messages(&ids(), until)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({ "ok": true }))
+        }
+        "mail_unsnooze" => {
+            let id = args
+                .get("id")
+                .and_then(|value| value.as_str())
+                .ok_or("id is required")?;
+            runtime
+                .unsnooze_message(id)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({ "ok": true }))
+        }
+        "attachment_fetch" => {
+            let id = args
+                .get("id")
+                .and_then(|value| value.as_str())
+                .ok_or("id is required")?;
+            runtime
+                .ensure_attachments(id)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({ "ok": true }))
         }
         "sync_now" => {
             runtime.sync_now().await.map_err(|e| e.to_string())?;

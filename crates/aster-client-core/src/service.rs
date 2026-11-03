@@ -2,6 +2,7 @@
 use aster_bridge_core::dav::store::{ContactsStore, DeleteOutcome, Preconditions, PutOutcome};
 use std::path::PathBuf;
 use aster_bridge_core::db::CachedMessage;
+use base64::Engine as _;
 use mail_builder::headers::address::Address;
 use mail_builder::MessageBuilder;
 use serde::Serialize;
@@ -238,7 +239,25 @@ impl ClientRuntime {
             .collect();
         let is_html = is_html(&msg);
         let body = msg.body_text.clone().unwrap_or_default();
-        let body_html = safe_body_html(&body, is_html);
+        let mut body_html = safe_body_html(&body, is_html);
+        if body_html.contains("cid:") {
+            if let Ok(parts) = self.db().get_message_attachments(id) {
+                for part in parts {
+                    let Some(content_id) = part.content_id.as_deref() else {
+                        continue;
+                    };
+                    if part.data.is_empty() {
+                        continue;
+                    }
+                    let encoded = base64::engine::general_purpose::STANDARD.encode(&part.data);
+                    let data_url = format!("data:{};base64,{}", part.content_type, encoded);
+                    body_html = body_html.replace(
+                        &format!("cid:{}", content_id.trim_matches(['<', '>'])),
+                        &data_url,
+                    );
+                }
+            }
+        }
         let meta: serde_json::Value = msg
             .raw_headers
             .as_deref()
@@ -362,6 +381,145 @@ impl ClientRuntime {
             .await
             .map_err(|_| ClientError::Session("outbox worker is not running".into()))?;
         Ok(id)
+    }
+
+    pub fn tags(&self) -> ClientResult<Vec<TagView>> {
+        let tags = self.db().list_custom_tags().map_err(ClientError::Storage)?;
+        Ok(tags
+            .into_iter()
+            .map(|tag| TagView {
+                tag_token: tag.tag_token,
+                name: tag.name,
+                keyword: tag.keyword,
+                position: tag.position,
+            })
+            .collect())
+    }
+
+    pub async fn create_tag(&self, name: &str) -> ClientResult<TagView> {
+        let (token, identity_key) = self.auth_material().await;
+        let tag = aster_bridge_core::tag_ops::create_label(
+            self.db(),
+            self.client(),
+            &token,
+            identity_key.as_deref(),
+            name,
+        )
+        .await
+        .map_err(|err| ClientError::Protocol(format!("{err:?}")))?;
+        Ok(TagView {
+            tag_token: tag.tag_token,
+            name: tag.name,
+            keyword: tag.keyword,
+            position: tag.position,
+        })
+    }
+
+    pub async fn delete_tag(&self, tag_token: &str) -> ClientResult<()> {
+        let token = self.access_token().await;
+        let tags = self.db().list_custom_tags().map_err(ClientError::Storage)?;
+        let tag = tags
+            .into_iter()
+            .find(|tag| tag.tag_token == tag_token)
+            .ok_or_else(|| ClientError::Protocol("tag not found".into()))?;
+        self.client()
+            .delete_tag(&token, &tag.server_id)
+            .await
+            .map_err(ClientError::from_bridge)?;
+        self.db()
+            .delete_custom_tag(tag_token)
+            .map_err(ClientError::Storage)?;
+        Ok(())
+    }
+
+    pub async fn assign_tag(&self, ids: &[String], tag_token: &str) -> ClientResult<()> {
+        let token = self.access_token().await;
+        self.client()
+            .add_tag(&token, ids, tag_token)
+            .await
+            .map_err(ClientError::from_bridge)
+    }
+
+    pub async fn remove_tag(&self, ids: &[String], tag_token: &str) -> ClientResult<()> {
+        let token = self.access_token().await;
+        self.client()
+            .remove_tag(&token, ids, tag_token)
+            .await
+            .map_err(ClientError::from_bridge)
+    }
+
+    pub async fn rename_folder(&self, token: &str, name: &str) -> ClientResult<()> {
+        let (access, identity_key) = self.auth_material().await;
+        aster_bridge_core::folder_ops::update(
+            self.db(),
+            self.client(),
+            &access,
+            &identity_key.ok_or_else(|| ClientError::Session("folder keys are not unlocked".into()))?,
+            token,
+            Some(name),
+            None,
+        )
+        .await
+        .map_err(|err| ClientError::Protocol(format!("{err:?}")))
+    }
+
+    pub async fn delete_folder(&self, token: &str) -> ClientResult<()> {
+        let access = self.access_token().await;
+        aster_bridge_core::folder_ops::delete(self.db(), self.client(), &access, token)
+            .await
+            .map(|_| ())
+            .map_err(|err| ClientError::Protocol(format!("{err:?}")))
+    }
+
+    pub async fn move_folder(&self, token: &str, parent: Option<&str>) -> ClientResult<()> {
+        let (access, identity_key) = self.auth_material().await;
+        aster_bridge_core::folder_ops::update(
+            self.db(),
+            self.client(),
+            &access,
+            &identity_key.ok_or_else(|| ClientError::Session("folder keys are not unlocked".into()))?,
+            token,
+            None,
+            Some(parent),
+        )
+        .await
+        .map_err(|err| ClientError::Protocol(format!("{err:?}")))
+    }
+
+    pub async fn snooze_messages(&self, ids: &[String], until_iso8601: &str) -> ClientResult<()> {
+        let token = self.access_token().await;
+        self.client()
+            .snooze_mail(&token, ids, until_iso8601)
+            .await
+            .map_err(ClientError::from_bridge)
+    }
+
+    pub async fn unsnooze_message(&self, id: &str) -> ClientResult<()> {
+        let token = self.access_token().await;
+        self.client()
+            .unsnooze_mail(&token, id)
+            .await
+            .map_err(ClientError::from_bridge)
+    }
+
+    pub async fn ensure_attachments(&self, id: &str) -> ClientResult<()> {
+        let _ = aster_bridge_core::sync::poller::on_demand::ensure_attachments(
+            self.db(),
+            self.client(),
+            self.session(),
+            id,
+            None,
+        )
+        .await;
+        Ok(())
+    }
+
+    async fn auth_material(&self) -> (String, Option<String>) {
+        let session = self.session().read().await;
+        (
+            session.access_token.to_string(),
+            session.identity_key.clone(),
+        )
     }
 
     pub async fn move_messages(&self, ids: &[String], folder_token: &str) -> ClientResult<()> {
@@ -1021,4 +1179,13 @@ fn list_name_from_id(id: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TagView {
+    pub tag_token: String,
+    pub name: String,
+    pub keyword: Option<String>,
+    pub position: i64,
 }

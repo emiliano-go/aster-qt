@@ -160,6 +160,7 @@ ApplicationWindow {
     readonly property var pgp: parse(app.pgpJson, ({}))
     readonly property var gpg: parse(app.gpgJson, ({}))
     readonly property var contacts: parse(app.contactsJson, [])
+    readonly property var tags: parse(app.tagsJson, [])
     readonly property var threadMessages: parse(app.threadJson, [])
     readonly property var mailingLists: parse(app.listsJson, [])
     readonly property var outboxItems: parse(app.outboxJson, [])
@@ -173,6 +174,9 @@ ApplicationWindow {
     readonly property var lightThemes: themes.filter(function(t) { return t.light === true; })
     readonly property var darkThemes: themes.filter(function(t) { return t.light !== true; })
     property int currentIndex: 0
+    property bool selectionMode: false
+    property var selectedIds: []
+    property int lastUnread: -1
     property bool ruleMatchAll: true
 
     ListModel {
@@ -220,6 +224,30 @@ ApplicationWindow {
     }
 
     onSystemDarkChanged: app.applySystemDark(systemDark)
+    onUnreadTotalChanged: {
+        if (root.lastUnread >= 0 && root.unreadTotal > root.lastUnread)
+            app.notify("New mail", (root.unreadTotal - root.lastUnread) + " new message(s) in Aster");
+        root.lastUnread = root.unreadTotal;
+    }
+
+    function toggleSelected(id) {
+        var next = root.selectedIds.slice();
+        var index = next.indexOf(id);
+        if (index >= 0) next.splice(index, 1);
+        else next.push(id);
+        root.selectedIds = next;
+    }
+
+    function clearSelection() {
+        root.selectedIds = [];
+        root.selectionMode = false;
+    }
+
+    function batch(action) {
+        if (root.selectedIds.length === 0) return;
+        app.batchAction(action, JSON.stringify(root.selectedIds));
+        root.clearSelection();
+    }
     onIdentitiesChanged: {
         if (root.activeIdentity.length === 0)
             root.activeIdentity = root.defaultIdentityAddress();
@@ -858,6 +886,16 @@ ApplicationWindow {
             RowLayout {
                 Layout.fillWidth: true
                 spacing: n("space-2", 8)
+                Rectangle {
+                    visible: root.selectionMode
+                    width: 18; height: 18
+                    radius: n("radius-micro", 4)
+                    color: root.selectedIds.indexOf(row.item.id) >= 0 ? c("accent-button", "#d98e5c") : "transparent"
+                    border.width: n("border-width", 1)
+                    border.color: c("border-strong", "#292e323a")
+                    Icon { anchors.centerIn: parent; name: "check"; size: 12; color: c("accent-ink", "#171717"); visible: root.selectedIds.indexOf(row.item.id) >= 0 }
+                    MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.toggleSelected(row.item.id) }
+                }
                 Text {
                     text: row.item && row.item.sender ? row.item.sender : "Unknown sender"
                     color: c("text", "#ece7de")
@@ -930,6 +968,10 @@ ApplicationWindow {
             anchors.fill: parent
             cursorShape: Qt.PointingHandCursor
             onClicked: {
+                if (root.selectionMode) {
+                    root.toggleSelected(row.item.id);
+                    return;
+                }
                 root.currentIndex = index;
                 root.readerOpen = true;
                 root.threadListOpen = false;
@@ -1499,10 +1541,37 @@ ApplicationWindow {
                                 Icon { anchors.centerIn: parent; name: "inbox"; size: n("icon-small", 16); color: root.unreadOnly ? c("accent-text", "#e7a97f") : c("muted", "#a8ece7de") }
                                 MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.unreadOnly = !root.unreadOnly }
                             }
+                            IconButton {
+                                icon: "check"
+                                label: root.selectionMode ? "Cancel selection" : "Select messages"
+                                onClicked: {
+                                    root.selectionMode = !root.selectionMode;
+                                    if (!root.selectionMode) root.selectedIds = [];
+                                }
+                            }
                             IconButton { icon: "refresh"; label: "Refresh"; onClicked: app.refreshMail() }
                         }
                     }
 
+                    Rectangle {
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: root.selectionMode ? 36 : 0
+                        visible: root.selectionMode
+                        color: c("surface", "#1b1e23")
+                        RowLayout {
+                            anchors.fill: parent
+                            anchors.leftMargin: n("space-4", 16)
+                            anchors.rightMargin: n("space-4", 16)
+                            spacing: n("space-3", 12)
+                            Text { text: root.selectedIds.length + " selected"; color: c("text", "#ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-small", 12); Layout.fillWidth: true }
+                            LinkText { text: "Read"; action: function() { root.batch("mark_read") } }
+                            LinkText { text: "Unread"; action: function() { root.batch("mark_unread") } }
+                            LinkText { text: "Star"; action: function() { root.batch("star") } }
+                            LinkText { text: "Archive"; action: function() { root.batch("archive") } }
+                            LinkText { text: "Trash"; action: function() { root.batch("trash") } }
+                            LinkText { text: "Clear"; action: function() { root.clearSelection() } }
+                        }
+                    }
                     Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: c("border", "#171b1e23") }
 
                     Item {
@@ -2184,6 +2253,49 @@ ApplicationWindow {
                                     }
                                 }
 
+                                    Text { text: "SIGNATURE"; color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-micro", 9); font.letterSpacing: 1; Layout.topMargin: n("space-2", 8) }
+                                    Rectangle {
+                                        Layout.fillWidth: true
+                                        Layout.preferredHeight: 80
+                                        radius: n("radius-control", 8)
+                                        color: c("input", "#221b1e23")
+                                        border.width: n("border-width", 1)
+                                        border.color: c("border", "#171b1e23")
+                                        TextArea {
+                                            id: signatureField
+                                            anchors.fill: parent
+                                            anchors.margins: n("space-2", 8)
+                                            text: root.settings.compose ? (root.settings.compose.signature || "") : ""
+                                            color: c("text", "#ece7de")
+                                            wrapMode: TextArea.Wrap
+                                            background: null
+                                            font.family: c("font-mail", "Inter")
+                                            font.pixelSize: n("font-size-small", 12)
+                                        }
+                                    }
+                                    LinkText { text: "Save signature"; action: function() { app.applySettings(JSON.stringify({ compose: { signature: signatureField.text } })) } }
+                                    Text { text: "TEMPLATE"; color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-micro", 9); font.letterSpacing: 1; Layout.topMargin: n("space-2", 8) }
+                                    Rectangle {
+                                        Layout.fillWidth: true
+                                        Layout.preferredHeight: 80
+                                        radius: n("radius-control", 8)
+                                        color: c("input", "#221b1e23")
+                                        border.width: n("border-width", 1)
+                                        border.color: c("border", "#171b1e23")
+                                        TextArea {
+                                            id: templateField
+                                            anchors.fill: parent
+                                            anchors.margins: n("space-2", 8)
+                                            text: root.settings.compose ? (root.settings.compose.template || "") : ""
+                                            color: c("text", "#ece7de")
+                                            wrapMode: TextArea.Wrap
+                                            background: null
+                                            font.family: c("font-mail", "Inter")
+                                            font.pixelSize: n("font-size-small", 12)
+                                        }
+                                    }
+                                    LinkText { text: "Save template"; action: function() { app.applySettings(JSON.stringify({ compose: { template: templateField.text } })) } }
+
                                 // Rules
                                 ColumnLayout {
                                     Layout.fillWidth: true
@@ -2371,6 +2483,36 @@ ApplicationWindow {
                                             }
                                         }
                                     }
+                                    Text { text: "TAGS"; color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-micro", 9); font.letterSpacing: 1; Layout.topMargin: n("space-2", 8) }
+                                    RowLayout {
+                                        Layout.fillWidth: true
+                                        spacing: n("space-2", 8)
+                                        SettingsField { id: newTagName; Layout.fillWidth: true; placeholder: "New tag name" }
+                                        LinkText { text: "Create tag"; action: function() { app.createTag(newTagName.text) } }
+                                    }
+                                    Repeater {
+                                        model: root.tags
+                                        delegate: RowLayout {
+                                            Layout.fillWidth: true
+                                            spacing: n("space-2", 8)
+                                            Text { text: modelData.name; color: c("text-2", "#dbebe7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-small", 12); Layout.fillWidth: true }
+                                            LinkText { text: "Delete"; action: function() { app.deleteTag(modelData.tag_token) } }
+                                        }
+                                    }
+                                    Text { visible: root.tags.length === 0; text: "No tags yet."; color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-micro", 11) }
+                                    Text { text: "FOLDER MANAGEMENT"; color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-micro", 9); font.letterSpacing: 1; Layout.topMargin: n("space-2", 8) }
+                                    SettingsField { id: folderRenameName; Layout.fillWidth: true; placeholder: "New folder name" }
+                                    Repeater {
+                                        model: root.customFolders
+                                        delegate: RowLayout {
+                                            Layout.fillWidth: true
+                                            spacing: n("space-2", 8)
+                                            Text { text: modelData.name; color: c("text-2", "#dbebe7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-small", 12); Layout.fillWidth: true }
+                                            LinkText { text: "Rename"; action: function() { app.renameFolder(modelData.token, folderRenameName.text) } }
+                                            LinkText { text: "Delete"; action: function() { app.deleteFolder(modelData.token) } }
+                                        }
+                                    }
+                                    Text { visible: root.customFolders.length === 0; text: "No custom folders yet."; color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-micro", 11) }
                                     Text { text: "Mailbox tokens"; color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-micro", 11); font.weight: n("font-weight-medium", 500); Layout.topMargin: n("space-2", 8) }
                                     Repeater {
                                         model: root.customFolders
@@ -2792,12 +2934,31 @@ ApplicationWindow {
                     SettingsField { id: composeBcc; Layout.fillWidth: true; placeholder: "Bcc" }
                 }
                 SettingsField { id: composeSubject; Layout.fillWidth: true; placeholder: "Subject" }
-                Text {
-                    text: "Body · Markdown"
-                    color: c("muted", "#a8ece7de")
-                    font.family: c("font-family", "Inter")
-                    font.pixelSize: n("font-size-micro", 11)
-                    font.weight: n("font-weight-medium", 500)
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: n("space-3", 12)
+                    LinkText {
+                        text: "Insert signature"
+                        action: function() {
+                            var signature = root.settings.compose ? (root.settings.compose.signature || "") : "";
+                            if (signature.length > 0) composeBody.text += "\n\n" + signature;
+                        }
+                    }
+                    LinkText {
+                        text: "Insert template"
+                        action: function() {
+                            var template = root.settings.compose ? (root.settings.compose.template || "") : "";
+                            if (template.length > 0) composeBody.text = template + "\n\n" + composeBody.text;
+                        }
+                    }
+                    Item { Layout.fillWidth: true }
+                    Text {
+                        text: "Body · Markdown"
+                        color: c("muted", "#a8ece7de")
+                        font.family: c("font-family", "Inter")
+                        font.pixelSize: n("font-size-micro", 11)
+                        font.weight: n("font-weight-medium", 500)
+                    }
                 }
                 Rectangle {
                     Layout.fillWidth: true

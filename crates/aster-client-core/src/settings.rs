@@ -27,6 +27,10 @@ pub fn defaults() -> Value {
             "gpg_sign_outgoing": false,
             "gpg_key_fingerprint": ""
         },
+        "compose": {
+            "signature": "",
+            "template": ""
+        },
         "mcp": {
             "enabled": false,
             "allow_send": false,

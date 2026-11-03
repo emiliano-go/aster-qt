@@ -193,6 +193,7 @@ dependencies = [
  "ammonia",
  "anyhow",
  "aster-bridge-core",
+ "base64 0.22.1",
  "chrono",
  "css-inline",
  "fs2",
