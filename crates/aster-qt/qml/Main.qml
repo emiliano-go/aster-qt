@@ -23,6 +23,47 @@ ApplicationWindow {
     function c(key, fallback) { return th[key] !== undefined ? th[key] : fallback }
     function n(key, fallback) { return th[key] !== undefined ? th[key] : fallback }
 
+    function normId(value) {
+        return (value || "").trim().replace(/^</, "").replace(/>$/, "");
+    }
+
+    function subjectKey(value) {
+        return (value || "").replace(/^((re|fwd|fw)\s*:\s*)+/i, "").trim().toLowerCase();
+    }
+
+    function threadKey(message) {
+        if (!message) return "";
+        var byId = {};
+        for (var i = 0; i < root.messages.length; i++) {
+            var candidate = root.messages[i];
+            if (candidate.message_id) byId[normId(candidate.message_id)] = candidate;
+        }
+        var current = message;
+        var depth = 0;
+        while (current && depth < 24) {
+            var parentId = normId(current.in_reply_to);
+            if (!parentId && current.references) {
+                var refs = current.references.split(/\s+/).filter(function(v) { return v.length > 0; });
+                if (refs.length > 0) parentId = normId(refs[refs.length - 1]);
+            }
+            var parent = parentId ? byId[parentId] : null;
+            if (!parent || parent === current) break;
+            current = parent;
+            depth += 1;
+        }
+        return (current && current.message_id) ? normId(current.message_id) : (subjectKey(message.subject) || message.id);
+    }
+
+    readonly property var threadSiblings: {
+        if (!root.detail || !root.detail.id) return [];
+        var key = threadKey(root.detail);
+        var out = [];
+        for (var i = 0; i < root.messages.length; i++) {
+            if (threadKey(root.messages[i]) === key) out.push(root.messages[i]);
+        }
+        return out;
+    }
+
     function parse(text, fallback) {
         try { return JSON.parse(text || "") } catch (e) { return fallback }
     }
@@ -82,6 +123,9 @@ ApplicationWindow {
     readonly property var identities: parse(app.identitiesJson, [])
     readonly property var pgp: parse(app.pgpJson, ({}))
     readonly property var contacts: parse(app.contactsJson, [])
+    readonly property var threadMessages: parse(app.threadJson, [])
+    readonly property var mailingLists: parse(app.listsJson, [])
+    property string listFilter: ""
     readonly property var themes: parse(app.themesJson, [])
     readonly property var lightThemes: themes.filter(function(t) { return t.light === true; })
     readonly property var darkThemes: themes.filter(function(t) { return t.light !== true; })
@@ -139,12 +183,31 @@ ApplicationWindow {
         var q = root.query.trim().toLowerCase();
         for (var i = 0; i < root.messages.length; i++) {
             var m = root.messages[i];
+            if (root.listFilter.length > 0 && m.list_id !== root.listFilter) continue;
             if (root.unreadOnly && m.is_read) continue;
             if (q.length > 0) {
                 var hay = (m.sender + " " + m.subject + " " + m.preview).toLowerCase();
                 if (hay.indexOf(q) === -1) continue;
             }
             out.push(m);
+        }
+        return out;
+    }
+
+    readonly property var groupedMessages: {
+        var out = [];
+        var seen = {};
+        for (var i = 0; i < root.visibleMessages.length; i++) {
+            var message = root.visibleMessages[i];
+            var key = root.threadKey(message);
+            if (seen[key] !== undefined) {
+                out[seen[key]].thread_count += 1;
+                continue;
+            }
+            var copy = Object.assign({}, message);
+            copy.thread_count = 1;
+            seen[key] = out.length;
+            out.push(copy);
         }
         return out;
     }
@@ -177,9 +240,9 @@ ApplicationWindow {
     }
 
     function selectAt(index) {
-        if (index < 0 || index >= root.visibleMessages.length) return;
+        if (index < 0 || index >= root.groupedMessages.length) return;
         root.currentIndex = index;
-        app.selectMessage(root.visibleMessages[index].id);
+        app.selectMessage(root.groupedMessages[index].id);
     }
 
     function openSettings(tab) {
@@ -192,7 +255,7 @@ ApplicationWindow {
     function move(delta) {
         var next = root.currentIndex + delta;
         if (next < 0) next = 0;
-        if (next >= root.visibleMessages.length) next = root.visibleMessages.length - 1;
+        if (next >= root.groupedMessages.length) next = root.groupedMessages.length - 1;
         root.selectAt(next);
     }
 
@@ -453,6 +516,7 @@ ApplicationWindow {
             cursorShape: Qt.PointingHandCursor
             onClicked: {
                 root.currentIndex = 0;
+                root.listFilter = "";
                 app.openMailbox(folderRow.folder.folder_label)
             }
         }
@@ -537,6 +601,14 @@ ApplicationWindow {
                     Layout.fillWidth: true
                 }
                 Text {
+                    visible: row.item && row.item.thread_count > 1
+                    text: row.item ? row.item.thread_count : ""
+                    color: c("accent-text", "#e7a97f")
+                    font.family: c("font-family", "Inter")
+                    font.pixelSize: n("font-size-micro", 9)
+                    font.weight: n("font-weight-semibold", 600)
+                }
+                Text {
                     text: row.item ? root.formatWhen(row.item.date) : ""
                     color: c("muted", "#a8ece7de")
                     font.family: c("font-family", "Inter")
@@ -562,6 +634,15 @@ ApplicationWindow {
                     font.pixelSize: n("font-size-small", 12)
                     elide: Text.ElideRight
                     Layout.fillWidth: true
+                }
+                Text {
+                    visible: row.item && (row.item.list_name || row.item.list_id)
+                    text: row.item ? (row.item.list_name || row.item.list_id) : ""
+                    color: c("muted", "#a8ece7de")
+                    font.family: c("font-family", "Inter")
+                    font.pixelSize: n("font-size-micro", 9)
+                    elide: Text.ElideRight
+                    Layout.maximumWidth: 120
                 }
                 Icon {
                     name: "attach"
@@ -819,6 +900,85 @@ ApplicationWindow {
                     }
 
                     Text {
+                        text: "MAILING LISTS"
+                        color: c("muted", "#a8ece7de")
+                        font.family: c("font-family", "Inter")
+                        font.pixelSize: n("font-size-micro", 9)
+                        font.letterSpacing: 1
+                        Layout.topMargin: n("space-3", 12)
+                        Layout.leftMargin: n("space-2", 8)
+                    }
+                    Rectangle {
+                        Layout.fillWidth: true
+                        implicitHeight: 28
+                        radius: n("radius-control", 8)
+                        color: root.listFilter === "" ? c("hover", "#2e2e323a") : "transparent"
+                        Text {
+                            anchors.verticalCenter: parent.verticalCenter
+                            anchors.left: parent.left
+                            anchors.leftMargin: n("space-3", 12)
+                            text: "All mail"
+                            color: c("text-2", "#dbebe7de")
+                            font.family: c("font-family", "Inter")
+                            font.pixelSize: n("font-size-small", 12)
+                        }
+                        MouseArea {
+                            anchors.fill: parent
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: root.listFilter = ""
+                        }
+                    }
+                    Repeater {
+                        model: root.mailingLists
+                        delegate: Rectangle {
+                            Layout.fillWidth: true
+                            implicitHeight: 28
+                            radius: n("radius-control", 8)
+                            color: root.listFilter === modelData.list_id ? c("selected", "#3d2e323a") : (listHover.hovered ? c("hover", "#2e2e323a") : "transparent")
+                            HoverHandler { id: listHover }
+                            RowLayout {
+                                anchors.fill: parent
+                                anchors.leftMargin: n("space-2", 8) + 4
+                                anchors.rightMargin: n("space-2", 8)
+                                spacing: n("space-2", 8)
+                                Icon { name: "tag"; size: n("icon-small", 14); color: c("muted", "#a8ece7de") }
+                                Text {
+                                    text: modelData.name
+                                    color: c("text-2", "#dbebe7de")
+                                    font.family: c("font-family", "Inter")
+                                    font.pixelSize: n("font-size-small", 12)
+                                    elide: Text.ElideRight
+                                    Layout.fillWidth: true
+                                }
+                                Text {
+                                    text: modelData.unread > 0 ? modelData.unread : ""
+                                    color: c("muted", "#a8ece7de")
+                                    font.family: c("font-family", "Inter")
+                                    font.pixelSize: n("font-size-micro", 9)
+                                }
+                            }
+                            MouseArea {
+                                anchors.fill: parent
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: {
+                                    root.listFilter = modelData.list_id;
+                                    app.openMailbox("inbox");
+                                }
+                            }
+                        }
+                    }
+                    Text {
+                        visible: root.mailingLists.length === 0
+                        text: "Mailing lists appear when List-Id headers are present."
+                        color: c("muted", "#a8ece7de")
+                        font.family: c("font-family", "Inter")
+                        font.pixelSize: n("font-size-micro", 9)
+                        wrapMode: Text.WordWrap
+                        Layout.fillWidth: true
+                        Layout.leftMargin: n("space-2", 8)
+                    }
+
+                    Text {
                         visible: root.customFolders.length === 0
                         text: "Create a mailbox to route mail here."
                         color: c("muted", "#a8ece7de")
@@ -928,7 +1088,7 @@ ApplicationWindow {
                         Layout.fillHeight: true
                         visible: !app.loading
                         clip: true
-                        model: root.visibleMessages
+                        model: root.groupedMessages
                         delegate: MessageRow {
                             width: ListView.view.width
                             item: modelData
@@ -939,7 +1099,7 @@ ApplicationWindow {
                     ColumnLayout {
                         Layout.fillWidth: true
                         Layout.fillHeight: true
-                        visible: !app.loading && root.visibleMessages.length === 0
+                        visible: !app.loading && root.groupedMessages.length === 0
                         spacing: n("space-3", 12)
                         Item { Layout.fillHeight: true }
                         Icon { name: "inbox"; size: 34; color: c("muted", "#a8ece7de"); Layout.alignment: Qt.AlignHCenter }
@@ -1066,6 +1226,15 @@ ApplicationWindow {
                                         Layout.fillWidth: true
                                     }
                                 }
+                                Text {
+                                    visible: root.detail.list_name || root.detail.list_id
+                                    text: root.detail.list_name || root.detail.list_id || ""
+                                    color: c("muted", "#a8ece7de")
+                                    font.family: c("font-family", "Inter")
+                                    font.pixelSize: n("font-size-micro", 9)
+                                    elide: Text.ElideRight
+                                    Layout.maximumWidth: 180
+                                }
                                 Rectangle {
                                     implicitWidth: trustRow.implicitWidth + n("space-3", 12) * 2
                                     implicitHeight: 26
@@ -1096,6 +1265,32 @@ ApplicationWindow {
                                         }
                                     }
                                 }
+                            }
+
+                            RowLayout {
+                                Layout.fillWidth: true
+                                visible: root.threadSiblings.length > 1
+                                spacing: n("space-2", 8)
+                                Repeater {
+                                    model: root.threadSiblings
+                                    delegate: Rectangle {
+                                        implicitWidth: threadPill.implicitWidth + n("space-3", 12) * 2
+                                        implicitHeight: 26
+                                        radius: n("radius-pill", 999)
+                                        color: modelData.id === root.detail.id ? c("selected", "#3d2e323a") : c("card", "#23262c")
+                                        border.width: n("border-width", 1)
+                                        border.color: c("border", "#171b1e23")
+                                        Row {
+                                            id: threadPill
+                                            anchors.centerIn: parent
+                                            spacing: 6
+                                            Text { text: (modelData.sender || "?").substring(0, 18); color: c("text-2", "#dbebe7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-micro", 9) }
+                                            Text { text: root.formatWhen(modelData.date); color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-micro", 9) }
+                                        }
+                                        MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: app.selectMessage(modelData.id) }
+                                    }
+                                }
+                                Item { Layout.fillWidth: true }
                             }
 
                             Rectangle {

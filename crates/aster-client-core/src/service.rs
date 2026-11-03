@@ -34,6 +34,11 @@ pub struct MessageView {
     pub is_read: bool,
     pub is_starred: bool,
     pub has_attachments: bool,
+    pub list_id: Option<String>,
+    pub list_name: Option<String>,
+    pub message_id: Option<String>,
+    pub in_reply_to: Option<String>,
+    pub references: Option<String>,
     pub thread_id: Option<String>,
     pub preview: String,
 }
@@ -136,6 +141,77 @@ impl ClientRuntime {
             .collect();
         ordered.truncate(limit);
         Ok(ordered)
+    }
+
+    pub fn mailing_lists(&self) -> ClientResult<Vec<MailingListView>> {
+        let mut seen: std::collections::HashMap<String, MailingListView> =
+            std::collections::HashMap::new();
+        let folders = self.mailboxes()?;
+        for folder in folders {
+            let rows = self
+                .db()
+                .list_cached_message_meta(&folder.folder_label)
+                .unwrap_or_default();
+            for row in rows {
+                let meta: serde_json::Value = row
+                    .raw_headers
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_str(raw).ok())
+                    .unwrap_or(serde_json::Value::Null);
+                let list_id = meta
+                    .get("list_id")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+                    .or_else(|| infer_list_id(row.recipients.as_deref()));
+                let Some(list_id) = list_id else {
+                    continue;
+                };
+                let name = meta
+                    .get("list_name")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| list_name_from_id(&list_id));
+                let entry = seen
+                    .entry(list_id.clone())
+                    .or_insert_with(|| MailingListView {
+                        list_id: list_id.clone(),
+                        name,
+                        total: 0,
+                        unread: 0,
+                    });
+                entry.total += 1;
+                if row.flags & FLAG_SEEN == 0 {
+                    entry.unread += 1;
+                }
+            }
+        }
+        let mut out = seen.into_values().collect::<Vec<_>>();
+        out.sort_by(|a, b| b.unread.cmp(&a.unread).then_with(|| a.name.cmp(&b.name)));
+        Ok(out)
+    }
+
+    pub fn thread_messages(&self, thread_id: &str, limit: usize) -> ClientResult<Vec<MessageView>> {
+        let ids = self
+            .db()
+            .with_conn(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT aster_id FROM message_cache WHERE thread_id = ?1 ORDER BY julianday(date) DESC LIMIT ?2",
+                )?;
+                let rows = stmt.query_map(rusqlite::params![thread_id, limit as i64], |row| {
+                    row.get::<_, String>(0)
+                })?;
+                rows.collect::<std::result::Result<Vec<_>, _>>()
+            })
+            .map_err(ClientError::Storage)?;
+        let mut map = self
+            .db()
+            .get_cached_messages(&ids, false)
+            .map_err(ClientError::Storage)?;
+        Ok(ids
+            .iter()
+            .filter_map(|id| map.remove(id))
+            .map(|msg| view_of(&msg))
+            .collect())
     }
 
     pub fn message(&self, id: &str) -> ClientResult<MessageDetail> {
@@ -591,6 +667,11 @@ impl ClientRuntime {
 }
 
 fn view_of(msg: &CachedMessage) -> MessageView {
+    let meta: serde_json::Value = msg
+        .raw_headers
+        .as_deref()
+        .and_then(|raw| serde_json::from_str(raw).ok())
+        .unwrap_or(serde_json::Value::Null);
     MessageView {
         id: msg.aster_id.clone(),
         folder: msg.folder.clone(),
@@ -603,6 +684,30 @@ fn view_of(msg: &CachedMessage) -> MessageView {
         is_read: msg.flags & FLAG_SEEN != 0,
         is_starred: msg.flags & FLAG_FLAGGED != 0,
         has_attachments: has_attachments(msg),
+        list_id: meta
+            .get("list_id")
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+            .or_else(|| infer_list_id(msg.recipients.as_deref())),
+        list_name: meta
+            .get("list_name")
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+            .or_else(|| {
+                infer_list_id(msg.recipients.as_deref()).map(|id| list_name_from_id(&id))
+            }),
+        message_id: meta
+            .get("message_id")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        in_reply_to: meta
+            .get("in_reply_to")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        references: meta
+            .get("references")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
         thread_id: msg.thread_id.clone(),
         preview: preview_of(msg.body_text.as_deref()),
     }
@@ -760,4 +865,59 @@ mod attachment_tests {
         assert_eq!(safe_filename("", 7), "attachment-7");
         assert!(!safe_filename("a/b\\c:d", 1).contains('/'));
     }
+}
+
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MailingListView {
+    pub list_id: String,
+    pub name: String,
+    pub total: u32,
+    pub unread: u32,
+}
+
+
+fn infer_list_id(recipients: Option<&str>) -> Option<String> {
+    let recipients = recipients?;
+    for part in recipients.split([',', ';']) {
+        let lower = part.to_lowercase();
+        let email = lower
+            .split('<')
+            .nth(1)
+            .and_then(|value| value.split('>').next())
+            .unwrap_or_else(|| lower.trim());
+        let email = email.trim();
+        if !email.contains('@') {
+            continue;
+        }
+        let domain = email.rsplit_once('@').map(|(_, domain)| domain).unwrap_or("");
+        let local = email.rsplit_once('@').map(|(local, _)| local).unwrap_or("");
+        if domain.contains("lists.")
+            || domain.contains("list.")
+            || domain.contains("googlegroups.com")
+            || domain.contains("groups.io")
+            || domain.contains("yahoogroups")
+            || local.contains("list")
+        {
+            return Some(email.to_string());
+        }
+    }
+    None
+}
+
+fn list_name_from_id(id: &str) -> String {
+    let local = id.rsplit_once('@').map(|(local, _)| local).unwrap_or(id);
+    local
+        .trim_matches('.')
+        .replace(['-', '_', '.'], " ")
+        .split_whitespace()
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }

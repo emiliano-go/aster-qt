@@ -22,6 +22,8 @@ Not finished yet: compose and send, contacts, PGP key management, MCP server, pa
 - CSS token themes with separate light and dark slots.
 - Central settings store in `<data>/settings.json`.
 - Keyboard navigation with j and k, compose shortcut, and settings shortcut.
+- Mailing list detection with a sidebar list filter.
+- Thread bundling with message counts and sibling navigation.
 
 ## Architecture
 

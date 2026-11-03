@@ -1223,6 +1223,8 @@ struct PreparedMessage {
     subject: Option<String>,
     sender: Option<String>,
     recipients: Option<String>,
+    list_id: Option<String>,
+    list_name: Option<String>,
     date: Option<String>,
     body_text: Option<String>,
     is_html: bool,
@@ -1244,6 +1246,21 @@ enum Prepared {
 
 pub(crate) const RATCHET_PLACEHOLDER: &str = "[This message is end-to-end encrypted with Aster's double-ratchet protocol. \
      Open it in the Aster web or mobile app to decrypt.]";
+
+fn parse_list_id(value: &str) -> (Option<String>, Option<String>) {
+    let trimmed = value.trim();
+    if let Some(open) = trimmed.find('<') {
+        if let Some(close) = trimmed[open..].find('>') {
+            let name = trimmed[..open].trim().trim_matches('"').to_string();
+            let id = trimmed[open + 1..open + close].trim().to_string();
+            return (
+                (!id.is_empty()).then_some(id),
+                (!name.is_empty()).then_some(name),
+            );
+        }
+    }
+    ((!trimmed.is_empty()).then_some(trimmed.to_string()), None)
+}
 
 fn prepare_mail_item(
     db: &Database,
@@ -1418,11 +1435,16 @@ fn prepare_mail_item(
         .or_else(|| envelope_header(&parsed, "in-reply-to"));
     let references = json_str(&parsed, "references")
         .or_else(|| envelope_header(&parsed, "references"));
+    let (list_id, list_name) = envelope_header(&parsed, "list-id")
+        .map(|value| parse_list_id(&value))
+        .unwrap_or((None, None));
     let addresses = EnvelopeAddresses::from_envelope(&parsed);
     Prepared::Ready(PreparedMessage {
         subject,
         sender,
         recipients,
+        list_id,
+        list_name,
         date,
         body_text,
         is_html,
@@ -1526,6 +1548,12 @@ fn commit_prepared(
         raw_headers_map.insert("references".to_string(), serde_json::json!(value));
     }
     prepared.addresses.write_to(&mut raw_headers_map);
+    if let Some(ref value) = prepared.list_id {
+        raw_headers_map.insert("list_id".to_string(), serde_json::json!(value));
+    }
+    if let Some(ref value) = prepared.list_name {
+        raw_headers_map.insert("list_name".to_string(), serde_json::json!(value));
+    }
     if prepared.unencrypted {
         raw_headers_map.insert(
             crate::message_render::NOT_END_TO_END_ENCRYPTED_FLAG.to_string(),

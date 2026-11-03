@@ -43,6 +43,8 @@ pub mod qobject {
         #[qproperty(QString, toast_text, cxx_name = "toastText")]
         #[qproperty(QString, pgp_json, cxx_name = "pgpJson")]
         #[qproperty(QString, contacts_json, cxx_name = "contactsJson")]
+        #[qproperty(QString, thread_json, cxx_name = "threadJson")]
+        #[qproperty(QString, lists_json, cxx_name = "listsJson")]
         #[qproperty(QString, folder_id, cxx_name = "folderId")]
         #[qproperty(bool, loading, cxx_name = "loading")]
         #[qproperty(bool, ready, cxx_name = "ready")]
@@ -203,6 +205,8 @@ pub struct AppControllerRust {
     toast_text: QString,
     pgp_json: QString,
     contacts_json: QString,
+    thread_json: QString,
+    lists_json: QString,
     folder_id: QString,
     loading: bool,
     ready: bool,
@@ -245,6 +249,8 @@ impl Default for AppControllerRust {
             toast_text: QString::default(),
             pgp_json: "{}".into(),
             contacts_json: "[]".into(),
+            thread_json: "[]".into(),
+            lists_json: "[]".into(),
             folder_id: "inbox".into(),
             loading: true,
             ready: false,
@@ -746,10 +752,20 @@ async fn snapshot(
         .messages(folder, 100, 0)
         .map(|rows| serde_json::to_string(&rows).unwrap_or_else(|_| "[]".into()))
         .unwrap_or_else(|_| "[]".into());
-    let detail = selected
-        .and_then(|id| runtime.message(id).ok())
+    let detail_value = selected.and_then(|id| runtime.message(id).ok());
+    let thread = detail_value
+        .as_ref()
+        .and_then(|detail| detail.message.thread_id.clone())
+        .and_then(|thread_id| runtime.thread_messages(&thread_id, 50).ok())
+        .map(|rows| serde_json::to_string(&rows).unwrap_or_else(|_| "[]".into()))
+        .unwrap_or_else(|| "[]".into());
+    let detail = detail_value
         .and_then(|detail| serde_json::to_string(&detail).ok())
         .unwrap_or_else(|| "{}".into());
+    let lists = runtime
+        .mailing_lists()
+        .map(|rows| serde_json::to_string(&rows).unwrap_or_else(|_| "[]".into()))
+        .unwrap_or_else(|_| "[]".into());
     let status = runtime.status().await;
 
     let folder = folder.to_string();
@@ -758,6 +774,8 @@ async fn snapshot(
         q.as_mut().set_mailboxes_json(mailboxes.into());
         q.as_mut().set_messages_json(messages.into());
         q.as_mut().set_selected_json(detail.into());
+        q.as_mut().set_thread_json(thread.into());
+        q.as_mut().set_lists_json(lists.into());
         q.as_mut().set_folder_id(folder.into());
         q.as_mut().set_loading(false);
         q.as_mut().set_ready(true);
@@ -866,6 +884,26 @@ async fn handle_rpc(
                 .unwrap_or(50) as usize;
             Ok(serde_json::to_value(
                 runtime.search(query, limit).map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?)
+        }
+        "mailing_lists_list" => Ok(serde_json::to_value(
+            runtime.mailing_lists().map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?),
+        "thread_get" => {
+            let thread_id = args
+                .get("thread_id")
+                .and_then(|value| value.as_str())
+                .ok_or("thread_id is required")?;
+            let limit = args
+                .get("limit")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(50) as usize;
+            Ok(serde_json::to_value(
+                runtime
+                    .thread_messages(thread_id, limit)
+                    .map_err(|e| e.to_string())?,
             )
             .map_err(|e| e.to_string())?)
         }
