@@ -1,0 +1,638 @@
+//
+// Aster Communications Inc.
+//
+// Copyright (c) 2026 Aster Communications Inc.
+//
+// This file is part of this project.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+//
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::ServerConfig;
+
+pub type TlsResult<T> = std::result::Result<T, String>;
+
+pub fn cert_pem_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("tls.crt")
+}
+
+pub fn key_pem_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("tls.key")
+}
+
+const RENEW_BEFORE_EXPIRY_DAYS: u64 = 30;
+
+const REQUIRE_SERVER_AUTH_USAGE: bool = cfg!(target_os = "macos");
+
+const EXTENDED_KEY_USAGE_OID: &str = "2.5.29.37";
+const SERVER_AUTH_OID: &str = "1.3.6.1.5.5.7.3.1";
+
+pub fn ensure_cert(
+    data_dir: &Path,
+) -> TlsResult<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+    ensure_cert_with_policy(data_dir, REQUIRE_SERVER_AUTH_USAGE)
+}
+
+fn ensure_cert_with_policy(
+    data_dir: &Path,
+    require_server_auth_usage: bool,
+) -> TlsResult<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+    let cert_path = cert_pem_path(data_dir);
+    let key_path = key_pem_path(data_dir);
+
+    if cert_path.exists() && key_path.exists() {
+        if let Ok((certs, key)) = load_existing(&cert_path, &key_path) {
+            let expiring = expires_within_days(certs[0].as_ref(), RENEW_BEFORE_EXPIRY_DAYS);
+            let unusable_for_server_auth =
+                require_server_auth_usage && !allows_server_auth(certs[0].as_ref());
+            if !expiring && !unusable_for_server_auth {
+                return Ok((certs, key));
+            }
+            if expiring {
+                tracing::info!(
+                    "TLS cert expires within {} days; regenerating",
+                    RENEW_BEFORE_EXPIRY_DAYS
+                );
+            } else {
+                tracing::info!(
+                    "TLS cert has no serverAuth extended key usage, which macOS mail clients reject; regenerating"
+                );
+            }
+        } else {
+            tracing::warn!("existing TLS material failed to parse; regenerating");
+        }
+    }
+
+    generate_and_persist(&cert_path, &key_path)
+}
+
+fn load_existing(
+    cert_path: &Path,
+    key_path: &Path,
+) -> TlsResult<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+    let cert_bytes = std::fs::read(cert_path).map_err(|e| e.to_string())?;
+    let key_bytes = std::fs::read(key_path).map_err(|e| e.to_string())?;
+
+    let mut cert_reader = std::io::BufReader::new(&cert_bytes[..]);
+    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
+        .collect::<std::io::Result<Vec<_>>>()
+        .map_err(|e| e.to_string())?;
+    if certs.is_empty() {
+        return Err("no certificates parsed from tls.crt".to_string());
+    }
+
+    let mut key_reader = std::io::BufReader::new(&key_bytes[..]);
+    let key = rustls_pemfile::private_key(&mut key_reader)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "no private key parsed from tls.key".to_string())?;
+
+    Ok((certs, key))
+}
+
+fn generate_and_persist(
+    cert_path: &Path,
+    key_path: &Path,
+) -> TlsResult<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+    use rcgen::{
+        CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, KeyPair,
+        KeyUsagePurpose, SanType,
+    };
+    use time::OffsetDateTime;
+
+    let mut params = CertificateParams::new(vec![
+        "127.0.0.1".to_string(),
+        "localhost".to_string(),
+        "bridge.local".to_string(),
+    ])
+    .map_err(|e| e.to_string())?;
+
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, "Aster Bridge");
+    dn.push(DnType::OrganizationName, "Aster Communications Inc.");
+    params.distinguished_name = dn;
+
+    params.subject_alt_names = vec![
+        SanType::IpAddress(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1))),
+        SanType::IpAddress(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)),
+        SanType::DnsName("localhost".to_string().try_into().map_err(|e: rcgen::Error| e.to_string())?),
+        SanType::DnsName("bridge.local".to_string().try_into().map_err(|e: rcgen::Error| e.to_string())?),
+    ];
+
+    params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+
+    let now = OffsetDateTime::now_utc();
+    params.not_before = now - time::Duration::days(1);
+    params.not_after = now + time::Duration::days(365 * 2);
+
+    let key_pair = KeyPair::generate().map_err(|e| e.to_string())?;
+    let cert = params.self_signed(&key_pair).map_err(|e| e.to_string())?;
+
+    let cert_pem = cert.pem();
+    let key_pem = key_pair.serialize_pem();
+
+    if let Some(parent) = cert_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    persist_pair(cert_path, cert_pem.as_bytes(), key_path, key_pem.as_bytes())?;
+
+    let cert_der: CertificateDer<'static> = cert.der().clone();
+    let key_der: PrivateKeyDer<'static> = PrivateKeyDer::try_from(key_pair.serialize_der())
+        .map_err(|e| e.to_string())?;
+
+    Ok((vec![cert_der], key_der))
+}
+
+fn persist_pair(cert_path: &Path, cert_pem: &[u8], key_path: &Path, key_pem: &[u8]) -> TlsResult<()> {
+    use std::io::Write;
+    let cert_tmp = crate::atomic_file::temp_path_beside(cert_path);
+    let key_tmp = crate::atomic_file::temp_path_beside(key_path);
+    let written = (|| -> TlsResult<()> {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&cert_tmp)
+            .map_err(|e| e.to_string())?;
+        f.write_all(cert_pem).map_err(|e| e.to_string())?;
+        f.sync_all().map_err(|e| e.to_string())?;
+        write_key_restricted(&key_tmp, key_pem)
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&cert_tmp);
+        let _ = std::fs::remove_file(&key_tmp);
+        return Err(e);
+    }
+    if let Err(e) = crate::atomic_file::replace(&key_tmp, key_path) {
+        let _ = std::fs::remove_file(&cert_tmp);
+        return Err(e);
+    }
+    crate::atomic_file::replace(&cert_tmp, cert_path)?;
+    crate::atomic_file::sync_parent_dir(cert_path);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_key_restricted(path: &Path, bytes: &[u8]) -> TlsResult<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| e.to_string())?;
+    f.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| e.to_string())?;
+    use std::io::Write;
+    f.write_all(bytes).map_err(|e| e.to_string())?;
+    f.sync_all().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn write_key_restricted(path: &Path, bytes: &[u8]) -> TlsResult<()> {
+    use std::io::Write;
+    use std::os::windows::process::CommandExt;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .map_err(|e| e.to_string())?;
+
+    let p = path.to_string_lossy();
+    let user = whoami::fallible::username().unwrap_or_else(|_| {
+        std::env::var("USERNAME").unwrap_or_else(|_| "SYSTEM".to_string())
+    });
+    let acl_ok = match crate::system_tools::icacls_command()
+        .args([p.as_ref(), "/inheritance:r", "/grant:r", &format!("{}:(F)", user)])
+        .creation_flags(0x0800_0000)
+        .output()
+    {
+        Ok(out) if out.status.success() => true,
+        Ok(out) => {
+            tracing::warn!(
+                "icacls failed to restrict TLS key permissions: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+            false
+        }
+        Err(e) => {
+            tracing::warn!("icacls invocation failed for TLS key: {}", e);
+            false
+        }
+    };
+    if !acl_ok {
+        tracing::warn!("TLS private key {} may be readable under inherited ACLs", p);
+    }
+
+    f.write_all(bytes).map_err(|e| e.to_string())?;
+    f.sync_all().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn write_key_restricted(path: &Path, bytes: &[u8]) -> TlsResult<()> {
+    std::fs::write(path, bytes).map_err(|e| e.to_string())
+}
+
+pub fn server_config(
+    certs: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+) -> TlsResult<Arc<ServerConfig>> {
+    let provider = rustls::crypto::ring::default_provider();
+    let config = ServerConfig::builder_with_provider(Arc::new(provider))
+        .with_safe_default_protocol_versions()
+        .map_err(|e| e.to_string())?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| e.to_string())?;
+    Ok(Arc::new(config))
+}
+
+pub fn install_default_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
+fn expires_within_days(cert_der: &[u8], days: u64) -> bool {
+    let Some(not_after) = cert_not_after(cert_der) else { return true };
+    let horizon = std::time::SystemTime::now() + std::time::Duration::from_secs(days * 86400);
+    not_after <= horizon
+}
+
+fn cert_not_after(cert_der: &[u8]) -> Option<std::time::SystemTime> {
+    use der::asn1::{AnyRef, GeneralizedTime, UtcTime};
+    use der::{Decode, SliceReader, Tag, Tagged};
+
+    let cert = AnyRef::from_der(cert_der).ok()?;
+    let tbs = AnyRef::decode(&mut SliceReader::new(cert.value()).ok()?).ok()?;
+    let mut fields = SliceReader::new(tbs.value()).ok()?;
+    if AnyRef::decode(&mut fields).ok()?.tag().is_context_specific() {
+        AnyRef::decode(&mut fields).ok()?;
+    }
+    AnyRef::decode(&mut fields).ok()?;
+    AnyRef::decode(&mut fields).ok()?;
+    let validity = AnyRef::decode(&mut fields).ok()?;
+    let mut times = SliceReader::new(validity.value()).ok()?;
+    AnyRef::decode(&mut times).ok()?;
+    let not_after = AnyRef::decode(&mut times).ok()?;
+    let since_epoch = match not_after.tag() {
+        Tag::UtcTime => UtcTime::try_from(not_after).ok()?.to_unix_duration(),
+        Tag::GeneralizedTime => GeneralizedTime::try_from(not_after).ok()?.to_unix_duration(),
+        _ => return None,
+    };
+    Some(std::time::UNIX_EPOCH + since_epoch)
+}
+
+fn allows_server_auth(cert_der: &[u8]) -> bool {
+    cert_extended_key_usages(cert_der)
+        .map(|usages| usages.iter().any(|oid| oid == SERVER_AUTH_OID))
+        .unwrap_or(false)
+}
+
+fn cert_extended_key_usages(cert_der: &[u8]) -> Option<Vec<String>> {
+    use der::asn1::{AnyRef, ObjectIdentifier, OctetStringRef};
+    use der::{Decode, Reader, SliceReader, Tag, TagNumber, Tagged};
+
+    let cert = AnyRef::from_der(cert_der).ok()?;
+    let tbs = AnyRef::decode(&mut SliceReader::new(cert.value()).ok()?).ok()?;
+    let mut fields = SliceReader::new(tbs.value()).ok()?;
+    let extensions_tag = Tag::ContextSpecific {
+        constructed: true,
+        number: TagNumber::N3,
+    };
+    let extensions = loop {
+        if fields.is_finished() {
+            return Some(Vec::new());
+        }
+        let field = AnyRef::decode(&mut fields).ok()?;
+        if field.tag() == extensions_tag {
+            break field;
+        }
+    };
+    let list = AnyRef::from_der(extensions.value()).ok()?;
+    let mut entries = SliceReader::new(list.value()).ok()?;
+    while !entries.is_finished() {
+        let entry = AnyRef::decode(&mut entries).ok()?;
+        let mut parts = SliceReader::new(entry.value()).ok()?;
+        let oid = ObjectIdentifier::decode(&mut parts).ok()?;
+        if oid.to_string() != EXTENDED_KEY_USAGE_OID {
+            continue;
+        }
+        let mut value = AnyRef::decode(&mut parts).ok()?;
+        if value.tag() == Tag::Boolean {
+            value = AnyRef::decode(&mut parts).ok()?;
+        }
+        let octets = OctetStringRef::try_from(value).ok()?;
+        let purposes = AnyRef::from_der(octets.as_bytes()).ok()?;
+        let mut reader = SliceReader::new(purposes.value()).ok()?;
+        let mut usages = Vec::new();
+        while !reader.is_finished() {
+            usages.push(ObjectIdentifier::decode(&mut reader).ok()?.to_string());
+        }
+        return Some(usages);
+    }
+    Some(Vec::new())
+}
+
+pub fn cert_fingerprint_sha256(data_dir: &Path) -> Option<String> {
+    let path = cert_pem_path(data_dir);
+    let bytes = std::fs::read(&path).ok()?;
+    let mut reader = std::io::BufReader::new(&bytes[..]);
+    let certs: Vec<CertificateDer<'static>> =
+        rustls_pemfile::certs(&mut reader).collect::<std::io::Result<Vec<_>>>().ok()?;
+    let first = certs.into_iter().next()?;
+    Some(fingerprint_hex_colon(first.as_ref()))
+}
+
+fn fingerprint_hex_colon(der: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(der);
+    let digest = h.finalize();
+    digest
+        .iter()
+        .map(|b| format!("{:02X}", b))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+pub const TLS_HANDSHAKE_TIMEOUT_SECS: u64 = 15;
+
+pub async fn accept_with_timeout<S>(
+    acceptor: &tokio_rustls::TlsAcceptor,
+    stream: S,
+    protocol: &str,
+) -> Option<tokio_rustls::server::TlsStream<S>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let limit = std::time::Duration::from_secs(TLS_HANDSHAKE_TIMEOUT_SECS);
+    accept_within(acceptor, stream, protocol, limit).await
+}
+
+pub async fn accept_within<S>(
+    acceptor: &tokio_rustls::TlsAcceptor,
+    stream: S,
+    protocol: &str,
+    limit: std::time::Duration,
+) -> Option<tokio_rustls::server::TlsStream<S>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    match tokio::time::timeout(limit, acceptor.accept(stream)).await {
+        Ok(Ok(stream)) => Some(stream),
+        Ok(Err(e)) => {
+            tracing::warn!("{} TLS handshake failed: {}", protocol, e);
+            None
+        }
+        Err(_) => {
+            tracing::warn!(
+                "{} TLS handshake timed out after {}s and the connection was closed; a client configured without encryption on an encrypted-only port looks exactly like this",
+                protocol,
+                limit.as_secs()
+            );
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ensure_cert_generates_and_reuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let (certs1, _key1) = ensure_cert(dir.path()).unwrap();
+        assert!(!certs1.is_empty());
+        assert!(cert_pem_path(dir.path()).exists());
+        assert!(key_pem_path(dir.path()).exists());
+
+        let (certs2, _key2) = ensure_cert(dir.path()).unwrap();
+        assert_eq!(certs1[0].as_ref(), certs2[0].as_ref());
+    }
+
+    fn write_cert_valid_for(dir: &Path, days: i64) -> Vec<u8> {
+        let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        let now = time::OffsetDateTime::now_utc();
+        params.not_before = now - time::Duration::days(1);
+        params.not_after = now + time::Duration::days(days);
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key_pair).unwrap();
+        std::fs::write(cert_pem_path(dir), cert.pem()).unwrap();
+        std::fs::write(key_pem_path(dir), key_pair.serialize_pem()).unwrap();
+        cert.der().to_vec()
+    }
+
+    #[test]
+    fn reads_not_after_from_the_certificate() {
+        let dir = tempfile::tempdir().unwrap();
+        let der = write_cert_valid_for(dir.path(), 100);
+        let not_after = cert_not_after(&der).expect("notAfter must parse");
+        let left = not_after
+            .duration_since(std::time::SystemTime::now())
+            .unwrap()
+            .as_secs();
+        assert!((99 * 86400..=100 * 86400).contains(&left), "left={}", left);
+        assert!(!expires_within_days(&der, 30));
+        assert!(expires_within_days(&der, 120));
+        assert!(expires_within_days(b"not a certificate", 30));
+    }
+
+    #[test]
+    fn a_certificate_close_to_expiry_is_renewed() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = write_cert_valid_for(dir.path(), 10);
+        let (certs, _key) = ensure_cert(dir.path()).unwrap();
+        assert_ne!(certs[0].as_ref(), &old[..]);
+        assert!(!expires_within_days(certs[0].as_ref(), RENEW_BEFORE_EXPIRY_DAYS));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(key_pem_path(dir.path())).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+
+    #[test]
+    fn file_times_do_not_force_a_renewal() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = write_cert_valid_for(dir.path(), 400);
+        let file = std::fs::File::options()
+            .write(true)
+            .open(cert_pem_path(dir.path()))
+            .unwrap();
+        let future = std::time::SystemTime::now() + std::time::Duration::from_secs(86400 * 30);
+        file.set_modified(future).unwrap();
+        drop(file);
+        let (certs, _key) = ensure_cert(dir.path()).unwrap();
+        assert_eq!(certs[0].as_ref(), &current[..]);
+
+        let file = std::fs::File::options()
+            .write(true)
+            .open(cert_pem_path(dir.path()))
+            .unwrap();
+        file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(86400))
+            .unwrap();
+        drop(file);
+        let (certs, _key) = ensure_cert(dir.path()).unwrap();
+        assert_eq!(certs[0].as_ref(), &current[..]);
+    }
+
+    #[test]
+    fn regenerating_replaces_both_files_without_leaving_temp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(cert_pem_path(dir.path()), b"not a certificate").unwrap();
+        std::fs::write(key_pem_path(dir.path()), b"not a key").unwrap();
+        let (certs, key) = ensure_cert(dir.path()).unwrap();
+
+        let (stored_certs, stored_key) =
+            load_existing(&cert_pem_path(dir.path()), &key_pem_path(dir.path())).unwrap();
+        assert_eq!(stored_certs[0].as_ref(), certs[0].as_ref());
+        assert_eq!(stored_key.secret_der(), key.secret_der());
+        server_config(stored_certs, stored_key).expect("the stored pair must belong together");
+
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(names.is_empty(), "temp files left behind: {:?}", names);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(key_pem_path(dir.path())).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_plaintext_client_on_a_tls_port_is_closed_instead_of_left_hanging() {
+        use tokio::io::AsyncReadExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (certs, key) = ensure_cert(dir.path()).unwrap();
+        let config = server_config(certs, key).unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(config);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            accept_within(
+                &acceptor,
+                stream,
+                "IMAPS",
+                std::time::Duration::from_millis(1500),
+            )
+            .await
+            .is_none()
+        });
+
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+
+        let mut buf = [0u8; 16];
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.read(&mut buf),
+        )
+        .await
+        .expect("the server must close the connection rather than leave the client waiting");
+
+        assert_eq!(
+            read.unwrap(),
+            0,
+            "a silent client on a TLS port must be disconnected, not held open"
+        );
+        assert!(server.await.unwrap(), "the handshake must report a timeout");
+    }
+
+    fn write_cert_without_server_auth(dir: &Path) -> Vec<u8> {
+        let params = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()]).unwrap();
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key_pair).unwrap();
+        std::fs::write(cert_pem_path(dir), cert.pem()).unwrap();
+        std::fs::write(key_pem_path(dir), key_pair.serialize_pem()).unwrap();
+        cert.der().to_vec()
+    }
+
+    #[test]
+    fn a_new_certificate_is_marked_for_server_authentication() {
+        let dir = tempfile::tempdir().unwrap();
+        let (certs, _key) = ensure_cert(dir.path()).unwrap();
+        let usages = cert_extended_key_usages(certs[0].as_ref()).unwrap();
+        assert_eq!(usages, vec![SERVER_AUTH_OID.to_string()]);
+        assert!(allows_server_auth(certs[0].as_ref()));
+    }
+
+    #[test]
+    fn a_certificate_without_extended_key_usage_is_not_server_auth() {
+        let dir = tempfile::tempdir().unwrap();
+        let der = write_cert_without_server_auth(dir.path());
+        assert_eq!(cert_extended_key_usages(&der), Some(Vec::new()));
+        assert!(!allows_server_auth(&der));
+        assert!(!allows_server_auth(b"not a certificate"));
+    }
+
+    #[test]
+    fn a_certificate_with_only_client_auth_is_not_server_auth() {
+        let mut params = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()]).unwrap();
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+        let cert = params.self_signed(&rcgen::KeyPair::generate().unwrap()).unwrap();
+        assert!(!allows_server_auth(cert.der()));
+    }
+
+    #[test]
+    fn a_certificate_without_server_auth_is_replaced_when_required() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = write_cert_without_server_auth(dir.path());
+        let (certs, key) = ensure_cert_with_policy(dir.path(), true).unwrap();
+        assert_ne!(certs[0].as_ref(), &old[..]);
+        assert!(allows_server_auth(certs[0].as_ref()));
+        server_config(certs.clone(), key).expect("the regenerated pair must belong together");
+
+        let (again, _key) = ensure_cert_with_policy(dir.path(), true).unwrap();
+        assert_eq!(again[0].as_ref(), certs[0].as_ref());
+    }
+
+    #[test]
+    fn a_certificate_without_server_auth_is_kept_when_not_required() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = write_cert_without_server_auth(dir.path());
+        let (certs, _key) = ensure_cert_with_policy(dir.path(), false).unwrap();
+        assert_eq!(certs[0].as_ref(), &old[..]);
+    }
+
+    #[test]
+    fn fingerprint_format_is_colon_hex_uppercase() {
+        let dir = tempfile::tempdir().unwrap();
+        let _ = ensure_cert(dir.path()).unwrap();
+        let fp = cert_fingerprint_sha256(dir.path()).unwrap();
+        let parts: Vec<&str> = fp.split(':').collect();
+        assert_eq!(parts.len(), 32);
+        for p in parts {
+            assert_eq!(p.len(), 2);
+            assert!(p.chars().all(|c| c.is_ascii_hexdigit() && (!c.is_alphabetic() || c.is_uppercase())));
+        }
+    }
+}

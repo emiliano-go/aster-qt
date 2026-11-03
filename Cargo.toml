@@ -1,0 +1,28 @@
+[workspace]
+members = [
+    "crates/aster-client-core",
+    "crates/aster-theme",
+    "crates/aster-qt",
+    "vendor/Aster-Bridge/src-tauri/crates/aster_bridge_core",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+
+[workspace.dependencies]
+aster-bridge-core = { path = "vendor/Aster-Bridge/src-tauri/crates/aster_bridge_core" }
+aster-client-core = { path = "crates/aster-client-core" }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+zeroize = { version = "1", features = ["derive"] }
+mail-parser = "0.9"
+whoami = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+tempfile = "3"

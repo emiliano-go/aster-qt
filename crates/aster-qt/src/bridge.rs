@@ -1,0 +1,586 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+use std::path::PathBuf;
+use std::pin::Pin;
+use std::sync::mpsc::{self, Sender};
+use std::thread;
+
+use aster_client_core::settings as app_settings;
+use aster_client_core::{ClientConfig, ClientRuntime, RuntimeOptions};
+use cxx_qt::{CxxQtType, Threading};
+use cxx_qt_lib::QString;
+use serde_json::json;
+
+use crate::theme_bridge;
+
+#[cxx_qt::bridge]
+pub mod qobject {
+    unsafe extern "C++" {
+        include!("cxx-qt-lib/qstring.h");
+        type QString = cxx_qt_lib::QString;
+    }
+
+    extern "RustQt" {
+        #[qobject]
+        #[qml_element]
+        #[qproperty(QString, tokens_json, cxx_name = "tokensJson")]
+        #[qproperty(QString, themes_json, cxx_name = "themesJson")]
+        #[qproperty(QString, theme_id, cxx_name = "themeId")]
+        #[qproperty(QString, theme_mode, cxx_name = "themeMode")]
+        #[qproperty(QString, light_theme, cxx_name = "lightTheme")]
+        #[qproperty(QString, dark_theme, cxx_name = "darkTheme")]
+        #[qproperty(bool, theme_light, cxx_name = "themeLight")]
+        #[qproperty(bool, system_dark, cxx_name = "systemDark")]
+        #[qproperty(QString, settings_json, cxx_name = "settingsJson")]
+        #[qproperty(QString, data_dir, cxx_name = "dataDir")]
+        #[qproperty(QString, account_email, cxx_name = "accountEmail")]
+        #[qproperty(QString, status_text, cxx_name = "statusText")]
+        #[qproperty(QString, mailboxes_json, cxx_name = "mailboxesJson")]
+        #[qproperty(QString, messages_json, cxx_name = "messagesJson")]
+        #[qproperty(QString, selected_json, cxx_name = "selectedJson")]
+        #[qproperty(QString, rules_json, cxx_name = "rulesJson")]
+        #[qproperty(QString, identities_json, cxx_name = "identitiesJson")]
+        #[qproperty(QString, toast_text, cxx_name = "toastText")]
+        #[qproperty(QString, folder_id, cxx_name = "folderId")]
+        #[qproperty(bool, loading, cxx_name = "loading")]
+        #[qproperty(bool, ready, cxx_name = "ready")]
+        type AppController = super::AppControllerRust;
+
+        #[qinvokable]
+        fn boot(self: Pin<&mut Self>);
+
+        #[qinvokable]
+        #[cxx_name = "refreshMail"]
+        fn refresh_mail(self: &Self);
+
+        #[qinvokable]
+        #[cxx_name = "openMailbox"]
+        fn open_mailbox(self: &Self, folder: &QString);
+
+        #[qinvokable]
+        #[cxx_name = "selectMessage"]
+        fn select_message(self: &Self, id: &QString);
+
+        #[qinvokable]
+        #[cxx_name = "loadSettingsData"]
+        fn load_settings_data(self: &Self);
+
+        #[qinvokable]
+        #[cxx_name = "createRuleJson"]
+        fn create_rule_json(self: &Self, body: &QString);
+
+        #[qinvokable]
+        #[cxx_name = "deleteRule"]
+        fn delete_rule(self: &Self, id: &QString);
+
+        #[qinvokable]
+        #[cxx_name = "runRule"]
+        fn run_rule(self: &Self, id: &QString);
+
+        #[qinvokable]
+        #[cxx_name = "routeAlias"]
+        fn route_alias(self: &Self, alias: &QString, mailbox: &QString);
+
+        #[qinvokable]
+        #[cxx_name = "createMailbox"]
+        fn create_mailbox(self: &Self, name: &QString);
+
+        #[qinvokable]
+        #[cxx_name = "applySettings"]
+        fn apply_settings(self: Pin<&mut Self>, patch: &QString);
+
+        #[qinvokable]
+        #[cxx_name = "setThemeSlot"]
+        fn set_theme_slot(self: Pin<&mut Self>, id: &QString, slot: &QString);
+
+        #[qinvokable]
+        #[cxx_name = "applyThemeMode"]
+        fn apply_theme_mode(self: Pin<&mut Self>, mode: &QString);
+
+        #[qinvokable]
+        #[cxx_name = "applySystemDark"]
+        fn apply_system_dark(self: Pin<&mut Self>, dark: bool);
+
+        #[qinvokable]
+        #[cxx_name = "refreshThemes"]
+        fn refresh_themes(self: Pin<&mut Self>);
+
+        #[qinvokable]
+        #[cxx_name = "openThemesFolder"]
+        fn open_themes_folder(self: &Self);
+
+        #[qinvokable]
+        #[cxx_name = "createThemeFromTemplate"]
+        fn create_theme_from_template(self: Pin<&mut Self>) -> QString;
+    }
+
+    impl cxx_qt::Threading for AppController {}
+}
+
+enum Command {
+    Refresh,
+    OpenMailbox(String),
+    Select(String),
+    LoadSettingsData,
+    CreateRule(String),
+    DeleteRule(String),
+    RunRule(String),
+    RouteAlias(String, String),
+    CreateMailbox(String),
+}
+
+pub struct AppControllerRust {
+    tokens_json: QString,
+    themes_json: QString,
+    theme_id: QString,
+    theme_mode: QString,
+    light_theme: QString,
+    dark_theme: QString,
+    theme_light: bool,
+    system_dark: bool,
+    settings_json: QString,
+    data_dir: QString,
+    account_email: QString,
+    status_text: QString,
+    mailboxes_json: QString,
+    messages_json: QString,
+    selected_json: QString,
+    rules_json: QString,
+    identities_json: QString,
+    toast_text: QString,
+    folder_id: QString,
+    loading: bool,
+    ready: bool,
+    started: bool,
+    tx: Option<Sender<Command>>,
+}
+
+impl Default for AppControllerRust {
+    fn default() -> Self {
+        let dir = theme_bridge::default_theme_dir();
+        let settings = app_settings::load(&dir);
+        let themes = theme_bridge::themes_json(&dir);
+        let mode = app_settings::string(&settings, &["appearance", "mode"], "system");
+        let light_theme = app_settings::string(&settings, &["appearance", "light"], "aster-light");
+        let dark_theme = app_settings::string(&settings, &["appearance", "dark"], "aster-dark");
+        let active = active_id(&mode, &light_theme, &dark_theme, false);
+        let tokens = theme_bridge::tokens_json(&dir, &active).unwrap_or_else(|| "{}".to_string());
+        let light = theme_bridge::theme_is_light(&dir, &active).unwrap_or(false);
+        Self {
+            tokens_json: tokens.into(),
+            themes_json: themes.into(),
+            theme_id: active.into(),
+            theme_mode: mode.into(),
+            light_theme: light_theme.into(),
+            dark_theme: dark_theme.into(),
+            theme_light: light,
+            system_dark: false,
+            settings_json: serde_json::to_string_pretty(&settings)
+                .unwrap_or_else(|_| "{}".into())
+                .into(),
+            data_dir: dir.to_string_lossy().to_string().into(),
+            account_email: QString::default(),
+            status_text: "Starting".into(),
+            mailboxes_json: "[]".into(),
+            messages_json: "[]".into(),
+            selected_json: "{}".into(),
+            rules_json: "{}".into(),
+            identities_json: "[]".into(),
+            toast_text: QString::default(),
+            folder_id: "inbox".into(),
+            loading: true,
+            ready: false,
+            started: false,
+            tx: None,
+        }
+    }
+}
+
+impl qobject::AppController {
+    pub fn boot(mut self: Pin<&mut Self>) {
+        if self.started {
+            return;
+        }
+        self.as_mut().rust_mut().started = true;
+        self.as_mut().set_loading(true);
+        self.as_mut().set_status_text("Opening your mailbox".into());
+
+        let (tx, rx) = mpsc::channel::<Command>();
+        self.as_mut().rust_mut().tx = Some(tx);
+        let qt = self.as_ref().qt_thread();
+
+        thread::spawn(move || {
+            let rt = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .worker_threads(3)
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(err) => {
+                    let message = format!("Could not start the mail engine: {err}");
+                    let _ = qt.queue(move |mut q| {
+                        q.as_mut().set_loading(false);
+                        q.as_mut().set_status_text(message.into());
+                    });
+                    return;
+                }
+            };
+
+            let mut runtime = match rt.block_on(ClientRuntime::start_with(
+                ClientConfig::default(),
+                RuntimeOptions {
+                    check_plan: false,
+                    start_workers: true,
+                },
+            )) {
+                Ok(rt) => rt,
+                Err(err) => {
+                    let message = format!("{err}");
+                    let _ = qt.queue(move |mut q| {
+                        q.as_mut().set_loading(false);
+                        q.as_mut().set_status_text(message.into());
+                    });
+                    return;
+                }
+            };
+
+            let mut folder = "inbox".to_string();
+            let mut selected: Option<String> = None;
+            rt.block_on(snapshot(&runtime, &folder, selected.as_deref(), &qt));
+            selected = first_id(&runtime, &folder);
+            rt.block_on(snapshot(&runtime, &folder, selected.as_deref(), &qt));
+
+            while let Ok(command) = rx.recv() {
+                let mut snapshot_needed = true;
+                match command {
+                    Command::Refresh => {}
+                    Command::OpenMailbox(next) => {
+                        folder = next;
+                        selected = first_id(&runtime, &folder);
+                    }
+                    Command::Select(id) => selected = Some(id),
+                    Command::LoadSettingsData => {
+                        rt.block_on(push_settings_data(&runtime, &qt));
+                        snapshot_needed = false;
+                    }
+                    Command::CreateRule(body) => {
+                        let result = rt.block_on(async {
+                            let value: serde_json::Value = serde_json::from_str(&body)
+                                .map_err(|e| format!("invalid rule JSON: {e}"))?;
+                            runtime
+                                .create_rule(value)
+                                .await
+                                .map(|_| ())
+                                .map_err(|e| e.to_string())
+                        });
+                        notify_result(&qt, result, "Rule created");
+                        rt.block_on(push_settings_data(&runtime, &qt));
+                        snapshot_needed = false;
+                    }
+                    Command::DeleteRule(id) => {
+                        let result = rt.block_on(async {
+                            runtime.delete_rule(&id).await.map_err(|e| e.to_string())
+                        });
+                        notify_result(&qt, result, "Rule deleted");
+                        rt.block_on(push_settings_data(&runtime, &qt));
+                        snapshot_needed = false;
+                    }
+                    Command::RunRule(id) => {
+                        let result = rt.block_on(async {
+                            runtime
+                                .run_rule_on_existing(&id, false)
+                                .await
+                                .map(|_| ())
+                                .map_err(|e| e.to_string())
+                        });
+                        notify_result(&qt, result, "Rule run started");
+                        rt.block_on(push_settings_data(&runtime, &qt));
+                        snapshot_needed = false;
+                    }
+                    Command::RouteAlias(alias, mailbox) => {
+                        let result = rt.block_on(async {
+                            runtime
+                                .route_alias_to_mailbox(&alias, &mailbox)
+                                .await
+                                .map(|_| ())
+                                .map_err(|e| e.to_string())
+                        });
+                        notify_result(&qt, result, "Alias mailbox created");
+                        rt.block_on(push_settings_data(&runtime, &qt));
+                    }
+                    Command::CreateMailbox(name) => {
+                        let result = rt.block_on(async {
+                            runtime
+                                .create_mailbox(&name)
+                                .await
+                                .map(|_| ())
+                                .map_err(|e| e.to_string())
+                        });
+                        notify_result(&qt, result, "Mailbox created");
+                        rt.block_on(push_settings_data(&runtime, &qt));
+                    }
+                }
+                if snapshot_needed {
+                    rt.block_on(snapshot(&runtime, &folder, selected.as_deref(), &qt));
+                }
+            }
+            rt.block_on(runtime.stop());
+        });
+    }
+
+    pub fn refresh_mail(self: &Self) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Command::Refresh);
+        }
+    }
+
+    pub fn open_mailbox(self: &Self, folder: &QString) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Command::OpenMailbox(folder.to_string()));
+        }
+    }
+
+    pub fn select_message(self: &Self, id: &QString) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Command::Select(id.to_string()));
+        }
+    }
+
+    pub fn load_settings_data(self: &Self) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Command::LoadSettingsData);
+        }
+    }
+
+    pub fn create_rule_json(self: &Self, body: &QString) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Command::CreateRule(body.to_string()));
+        }
+    }
+
+    pub fn delete_rule(self: &Self, id: &QString) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Command::DeleteRule(id.to_string()));
+        }
+    }
+
+    pub fn run_rule(self: &Self, id: &QString) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Command::RunRule(id.to_string()));
+        }
+    }
+
+    pub fn route_alias(self: &Self, alias: &QString, mailbox: &QString) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Command::RouteAlias(
+                alias.to_string(),
+                mailbox.to_string(),
+            ));
+        }
+    }
+
+    pub fn create_mailbox(self: &Self, name: &QString) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Command::CreateMailbox(name.to_string()));
+        }
+    }
+
+    pub fn set_theme_slot(mut self: Pin<&mut Self>, id: &QString, slot: &QString) {
+        let id = id.to_string();
+        if slot.to_string() == "light" {
+            self.as_mut().set_light_theme(id.into());
+        } else {
+            self.as_mut().set_dark_theme(id.into());
+        }
+        self.as_mut().persist_theme_settings();
+        self.as_mut().refresh_active_theme();
+    }
+
+    pub fn apply_theme_mode(mut self: Pin<&mut Self>, mode: &QString) {
+        let mode = match mode.to_string().as_str() {
+            "light" | "dark" => mode.to_string(),
+            _ => "system".to_string(),
+        };
+        self.as_mut().set_theme_mode(mode.into());
+        self.as_mut().persist_theme_settings();
+        self.as_mut().refresh_active_theme();
+    }
+
+    pub fn apply_system_dark(mut self: Pin<&mut Self>, dark: bool) {
+        self.as_mut().set_system_dark(dark);
+        if self.theme_mode.to_string() == "system" {
+            self.as_mut().refresh_active_theme();
+        }
+    }
+
+    pub fn refresh_themes(mut self: Pin<&mut Self>) {
+        let dir = PathBuf::from(self.data_dir.to_string());
+        let themes = theme_bridge::themes_json(&dir);
+        self.as_mut().set_themes_json(themes.into());
+        self.as_mut().refresh_active_theme();
+    }
+
+    pub fn open_themes_folder(self: &Self) {
+        let dir = PathBuf::from(self.data_dir.to_string()).join("themes");
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::process::Command::new("xdg-open").arg(&dir).spawn();
+    }
+
+    pub fn create_theme_from_template(mut self: Pin<&mut Self>) -> QString {
+        let dir = PathBuf::from(self.data_dir.to_string());
+        let path = theme_bridge::create_template_theme(&dir);
+        self.as_mut().refresh_themes();
+        path.unwrap_or_default().to_string_lossy().to_string().into()
+    }
+
+    fn persist_theme_settings(mut self: Pin<&mut Self>) {
+        let dir = PathBuf::from(self.data_dir.to_string());
+        let patch = json!({
+            "appearance": {
+                "mode": self.theme_mode.to_string(),
+                "light": self.light_theme.to_string(),
+                "dark": self.dark_theme.to_string(),
+            }
+        });
+        if let Ok(settings) = app_settings::apply_patch(&dir, &patch) {
+            self.as_mut().set_settings_json(
+                serde_json::to_string_pretty(&settings)
+                    .unwrap_or_else(|_| "{}".into())
+                    .into(),
+            );
+        }
+    }
+
+    pub fn apply_settings(mut self: Pin<&mut Self>, patch: &QString) {
+        let dir = PathBuf::from(self.data_dir.to_string());
+        let patch: serde_json::Value = match serde_json::from_str(&patch.to_string()) {
+            Ok(value) => value,
+            Err(_) => return,
+        };
+        if let Ok(settings) = app_settings::apply_patch(&dir, &patch) {
+            self.as_mut().set_settings_json(
+                serde_json::to_string_pretty(&settings)
+                    .unwrap_or_else(|_| "{}".into())
+                    .into(),
+            );
+            let mode = app_settings::string(&settings, &["appearance", "mode"], "system");
+            let light = app_settings::string(&settings, &["appearance", "light"], "aster-light");
+            let dark = app_settings::string(&settings, &["appearance", "dark"], "aster-dark");
+            self.as_mut().set_theme_mode(mode.into());
+            self.as_mut().set_light_theme(light.into());
+            self.as_mut().set_dark_theme(dark.into());
+            self.as_mut().refresh_active_theme();
+        }
+    }
+
+    fn refresh_active_theme(mut self: Pin<&mut Self>) {
+        let dir = PathBuf::from(self.data_dir.to_string());
+        let mut id = active_id(
+            &self.theme_mode.to_string(),
+            &self.light_theme.to_string(),
+            &self.dark_theme.to_string(),
+            self.system_dark,
+        );
+        if !theme_bridge::theme_exists(&dir, &id) {
+            id = if self.system_dark {
+                "aster-dark".to_string()
+            } else {
+                "aster-light".to_string()
+            };
+        }
+        let tokens = theme_bridge::tokens_json(&dir, &id).unwrap_or_else(|| "{}".to_string());
+        let light = theme_bridge::theme_is_light(&dir, &id).unwrap_or(false);
+        self.as_mut().set_theme_id(id.into());
+        self.as_mut().set_theme_light(light);
+        self.as_mut().set_tokens_json(tokens.into());
+    }
+}
+
+fn active_id(mode: &str, light: &str, dark: &str, system_dark: bool) -> String {
+    match mode {
+        "light" => light.to_string(),
+        "dark" => dark.to_string(),
+        _ => {
+            if system_dark {
+                dark.to_string()
+            } else {
+                light.to_string()
+            }
+        }
+    }
+}
+
+fn first_id(runtime: &ClientRuntime, folder: &str) -> Option<String> {
+    runtime
+        .messages(folder, 1, 0)
+        .ok()
+        .and_then(|mut rows| rows.pop())
+        .map(|msg| msg.id)
+}
+
+async fn snapshot(
+    runtime: &ClientRuntime,
+    folder: &str,
+    selected: Option<&str>,
+    qt: &cxx_qt::CxxQtThread<qobject::AppController>,
+) {
+    let mailboxes = runtime
+        .mailboxes()
+        .map(|rows| serde_json::to_string(&rows).unwrap_or_else(|_| "[]".into()))
+        .unwrap_or_else(|_| "[]".into());
+    let messages = runtime
+        .messages(folder, 100, 0)
+        .map(|rows| serde_json::to_string(&rows).unwrap_or_else(|_| "[]".into()))
+        .unwrap_or_else(|_| "[]".into());
+    let detail = selected
+        .and_then(|id| runtime.message(id).ok())
+        .and_then(|detail| serde_json::to_string(&detail).ok())
+        .unwrap_or_else(|| "{}".into());
+    let status = runtime.status().await;
+
+    let folder = folder.to_string();
+    let _ = qt.queue(move |mut q| {
+        q.as_mut().set_account_email(status.default_sender.into());
+        q.as_mut().set_mailboxes_json(mailboxes.into());
+        q.as_mut().set_messages_json(messages.into());
+        q.as_mut().set_selected_json(detail.into());
+        q.as_mut().set_folder_id(folder.into());
+        q.as_mut().set_loading(false);
+        q.as_mut().set_ready(true);
+        let label = if status.outbox_pending == 0 {
+            "Ready".to_string()
+        } else {
+            format!("{} queued in outbox", status.outbox_pending)
+        };
+        q.as_mut().set_status_text(label.into());
+    });
+}
+
+
+async fn push_settings_data(
+    runtime: &ClientRuntime,
+    qt: &cxx_qt::CxxQtThread<qobject::AppController>,
+) {
+    let rules = runtime
+        .rules()
+        .await
+        .map(|value| value.to_string())
+        .unwrap_or_else(|_| "{}".into());
+    let identities = serde_json::to_string(&runtime.send_identities().await)
+        .unwrap_or_else(|_| "[]".into());
+    let _ = qt.queue(move |mut q| {
+        q.as_mut().set_rules_json(rules.into());
+        q.as_mut().set_identities_json(identities.into());
+    });
+}
+
+fn notify_result(
+    qt: &cxx_qt::CxxQtThread<qobject::AppController>,
+    result: Result<(), String>,
+    success: &str,
+) {
+    let message = match result {
+        Ok(()) => success.to_string(),
+        Err(err) => err,
+    };
+    let _ = qt.queue(move |mut q| q.as_mut().set_toast_text(message.into()));
+}

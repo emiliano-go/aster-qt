@@ -1,0 +1,10244 @@
+//
+// Aster Communications Inc.
+//
+// Copyright (c) 2026 Aster Communications Inc.
+//
+// This file is part of this project.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+//
+use std::sync::Arc;
+use chrono::{Datelike, Timelike};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+
+use tokio::sync::{broadcast, RwLock};
+
+use crate::api_client::ApiClient;
+use crate::auth::app_passwords::AppPasswords;
+use crate::auth::session::Session;
+use crate::db::{CachedMessage, Database};
+use crate::error::Result;
+use crate::folder_ops::FolderOpError;
+use crate::jmap::state::StateChange;
+use crate::protocol_text::response_text;
+
+const IDLE_KEEPALIVE_SECS: u64 = 5 * 60;
+const GMAIL_ALL_MAIL: &str = "\\Allmail";
+
+fn gmail_label_for_folder(folder: &str) -> Option<&'static str> {
+    match folder {
+        "inbox" => Some("\\Inbox"),
+        "sent" => Some("\\Sent"),
+        "drafts" => Some("\\Drafts"),
+        "trash" => Some("\\Trash"),
+        "spam" => Some("\\Junk"),
+        "archive" => Some(GMAIL_ALL_MAIL),
+        _ => None,
+    }
+}
+
+fn gmail_msgid_from_aster(s: &str) -> u64 {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(s.as_bytes());
+    let d = h.finalize();
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&d[..8]);
+    u64::from_be_bytes(b) | 1
+}
+
+fn gmail_thrid_from_aster(thread_token: &str) -> u64 {
+    gmail_msgid_from_aster(thread_token)
+}
+
+fn utf7_encode_modified(s: &str) -> String {
+    let mut out = String::new();
+    let mut buf16: Vec<u16> = Vec::new();
+    let flush = |buf16: &mut Vec<u16>, out: &mut String| {
+        if buf16.is_empty() {
+            return;
+        }
+        let mut bytes: Vec<u8> = Vec::with_capacity(buf16.len() * 2);
+        for u in buf16.iter() {
+            bytes.extend_from_slice(&u.to_be_bytes());
+        }
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD_NO_PAD, &bytes);
+        let b64 = b64.replace('/', ",");
+        out.push('&');
+        out.push_str(&b64);
+        out.push('-');
+        buf16.clear();
+    };
+    for c in s.chars() {
+        let code = c as u32;
+        if c == '&' {
+            flush(&mut buf16, &mut out);
+            out.push_str("&-");
+        } else if (0x20..=0x7e).contains(&code) {
+            flush(&mut buf16, &mut out);
+            out.push(c);
+        } else {
+            let mut tmp = [0u16; 2];
+            let units = c.encode_utf16(&mut tmp);
+            buf16.extend_from_slice(units);
+        }
+    }
+    flush(&mut buf16, &mut out);
+    out
+}
+
+fn quote_or_atom_label(label: &str) -> String {
+    if label.starts_with('\\')
+        && label
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '\\')
+    {
+        label.to_string()
+    } else if label
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
+        && !label.is_empty()
+    {
+        label.to_string()
+    } else {
+        let encoded = utf7_encode_modified(label);
+        let escaped = encoded.replace('\\', "\\\\").replace('"', "\\\"");
+        format!("\"{}\"", escaped)
+    }
+}
+
+fn gmail_labels_for_message(msg: &CachedMessage) -> Vec<String> {
+    let mut labels: Vec<String> = Vec::new();
+    if let Some(sys) = gmail_label_for_folder(&msg.folder) {
+        labels.push(sys.to_string());
+    }
+    labels
+}
+
+const MAX_LINE_LENGTH: usize = 8192;
+const MAX_FAILED_AUTH: u32 = 5;
+const MAX_SEARCH_LITERALS: usize = 16;
+const SEARCH_LITERAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+async fn read_line_bounded<R>(
+    reader: &mut R,
+    out: &mut String,
+    cap: usize,
+) -> std::io::Result<usize>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    use tokio::io::AsyncBufReadExt;
+    out.clear();
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        let avail = reader.fill_buf().await?;
+        if avail.is_empty() {
+            break;
+        }
+        let (slice_end, done) = match avail.iter().position(|&b| b == b'\n') {
+            Some(i) => (i + 1, true),
+            None => (avail.len(), false),
+        };
+        let take_n = slice_end.min(cap.saturating_sub(buf.len()) + 1);
+        buf.extend_from_slice(&avail[..take_n]);
+        let consumed = take_n;
+        tokio::io::AsyncBufReadExt::consume(reader, consumed);
+        if buf.len() > cap {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "line too long",
+            ));
+        }
+        if done {
+            break;
+        }
+    }
+    *out = String::from_utf8_lossy(&buf).into_owned();
+    Ok(buf.len())
+}
+
+fn parse_imap_search_date(s: &str) -> Option<(i32, u32, u32)> {
+    let parts: Vec<&str> = s.split('-').collect();
+    if parts.len() != 3 { return None; }
+    let day: u32 = parts[0].parse().ok()?;
+    let month = match parts[1].to_ascii_uppercase().as_str() {
+        "JAN" => 1u32, "FEB" => 2, "MAR" => 3, "APR" => 4,
+        "MAY" => 5, "JUN" => 6, "JUL" => 7, "AUG" => 8,
+        "SEP" => 9, "OCT" => 10, "NOV" => 11, "DEC" => 12,
+        _ => return None,
+    };
+    let year: i32 = parts[2].parse().ok()?;
+    Some((year, month, day))
+}
+
+pub fn parse_datetime_lenient(s: &str) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    let t = s.trim();
+    if let Ok(d) = chrono::DateTime::parse_from_rfc3339(t) {
+        return Some(d);
+    }
+    if let Ok(d) = chrono::DateTime::parse_from_rfc2822(t) {
+        return Some(d);
+    }
+    let no_weekday = t.split_once(',').map(|(_, rest)| rest.trim()).unwrap_or(t);
+    for fmt in ["%d %b %Y %H:%M:%S %z", "%d %b %Y %H:%M %z"] {
+        if let Ok(d) = chrono::DateTime::parse_from_str(no_weekday, fmt) {
+            return Some(d);
+        }
+    }
+    None
+}
+
+fn parse_message_date_ymd(date_str: &str) -> Option<(i32, u32, u32)> {
+    let b = date_str.as_bytes();
+    if b.len() >= 10
+        && b[..10]
+            .iter()
+            .enumerate()
+            .all(|(i, c)| if i == 4 || i == 7 { true } else { c.is_ascii_digit() })
+    {
+        let year: i32 = std::str::from_utf8(&b[0..4]).ok()?.parse().ok()?;
+        let month: u32 = std::str::from_utf8(&b[5..7]).ok()?.parse().ok()?;
+        let day: u32 = std::str::from_utf8(&b[8..10]).ok()?.parse().ok()?;
+        return Some((year, month, day));
+    }
+    let d = parse_datetime_lenient(date_str)?;
+    let nd = d.date_naive();
+    Some((nd.year(), nd.month(), nd.day()))
+}
+
+fn sequence_set_contains(set: &str, n: u32, largest: u32) -> bool {
+    let bound = |v: &str| if v == "*" { Some(largest) } else { v.parse::<u32>().ok() };
+    for part in set.split(',') {
+        let part = part.trim();
+        if let Some((a, b)) = part.split_once(':') {
+            let (Some(lo), Some(hi)) = (bound(a), bound(b)) else { continue };
+            let (lo, hi) = if lo <= hi { (lo, hi) } else { (hi, lo) };
+            if n >= lo && n <= hi {
+                return true;
+            }
+        } else if bound(part) == Some(n) {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_sequence_set(token: &str) -> bool {
+    let is_number = |v: &str| {
+        v == "*" || (v.bytes().all(|b| b.is_ascii_digit()) && v.parse::<u32>().is_ok_and(|n| n > 0))
+    };
+    !token.is_empty()
+        && token.split(',').all(|part| match part.split_once(':') {
+            Some((a, b)) => is_number(a) && is_number(b),
+            None => is_number(part),
+        })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SearchPosition {
+    seq: u32,
+    last_seq: u32,
+    last_uid: u32,
+}
+
+impl SearchPosition {
+    #[cfg(test)]
+    fn in_folder(index: usize, messages: &[CachedMessage]) -> Self {
+        Self {
+            seq: (index + 1) as u32,
+            last_seq: messages.len() as u32,
+            last_uid: messages.iter().map(|m| m.imap_uid).max().unwrap_or(0),
+        }
+    }
+}
+
+fn tokenize_search_criteria(raw: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                if in_quotes {
+                    out.push(cur.clone());
+                    cur.clear();
+                    in_quotes = false;
+                } else {
+                    in_quotes = true;
+                }
+            }
+            '\\' if in_quotes => {
+                if let Some(n) = chars.next() {
+                    cur.push(n);
+                }
+            }
+            '(' | ')' if !in_quotes => {
+                if !cur.is_empty() {
+                    out.push(cur.clone());
+                    cur.clear();
+                }
+                out.push(c.to_string());
+            }
+            c if c.is_whitespace() && !in_quotes => {
+                if !cur.is_empty() {
+                    out.push(cur.clone());
+                    cur.clear();
+                }
+            }
+            _ => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+fn cached_header_value(msg: &CachedMessage, field: &str) -> Option<String> {
+    let meta = || -> serde_json::Value {
+        msg.raw_headers
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or(serde_json::Value::Null)
+    };
+    let meta_string = |key: &str| {
+        meta()
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty())
+    };
+
+    match field {
+        "subject" => msg.subject.clone(),
+        "from" | "sender" => msg.sender.clone(),
+        "to" => msg.recipients.clone(),
+        "date" => msg.date.clone(),
+        "cc" => crate::address::meta_address_text(&meta(), "cc"),
+        "bcc" => crate::address::meta_address_text(&meta(), "bcc"),
+        "reply-to" => crate::address::meta_address_text(&meta(), "reply_to"),
+        "message-id" => meta_string("message_id"),
+        "in-reply-to" => meta_string("in_reply_to"),
+        "references" => meta_string("references"),
+        _ => None,
+    }
+}
+
+fn header_search_matches(msg: &CachedMessage, field: &str, pattern: &str) -> bool {
+    let wanted = pattern.trim().trim_matches('"');
+    match cached_header_value(msg, field) {
+        Some(value) => {
+            wanted.is_empty() || value.to_uppercase().contains(&wanted.to_uppercase())
+        }
+        None => false,
+    }
+}
+
+/// Whether a command line is `SEARCH` or `UID SEARCH`, the commands whose
+/// string arguments may arrive as literals.
+fn is_search_command(line: &str) -> bool {
+    let mut words = line.split_whitespace().skip(1);
+    match words.next().map(|w| w.to_ascii_uppercase()) {
+        Some(cmd) if cmd == "SEARCH" => true,
+        Some(cmd) if cmd == "UID" => words
+            .next()
+            .is_some_and(|w| w.eq_ignore_ascii_case("SEARCH")),
+        _ => false,
+    }
+}
+
+/// A line ending in a literal marker, `{n}` or `{n+}`: the text before it,
+/// the literal's length, and whether it is non-synchronizing.
+fn trailing_literal(line: &str) -> Option<(&str, usize, bool)> {
+    let inner = line.strip_suffix('}')?;
+    let open = inner.rfind('{')?;
+    let spec = &inner[open + 1..];
+    let (digits, non_sync) = match spec.strip_suffix('+') {
+        Some(digits) => (digits, true),
+        None => (spec, false),
+    };
+    if digits.is_empty() || digits.len() > 10 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let len = digits.parse::<usize>().ok()?;
+    Some((&line[..open], len, non_sync))
+}
+
+fn quote_search_string(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len() + 2);
+    out.push('"');
+    for c in raw.chars() {
+        if c == '"' || c == '\\' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
+}
+
+/// What to log for a criterion the matcher does not know. Search strings are
+/// mail content, so only sequence sets and criterion-shaped atoms are logged
+/// as written; anything else is reported by its length.
+fn loggable_criterion(token: &str) -> String {
+    let is_sequence_set = !token.is_empty()
+        && token.bytes().all(|b| b.is_ascii_digit() || matches!(b, b':' | b',' | b'*'));
+    let is_criterion_name = (1..=24).contains(&token.len())
+        && token.bytes().all(|b| b.is_ascii_uppercase() || b == b'-')
+        && (token.starts_with("X-") || KNOWN_UNSUPPORTED_CRITERIA.contains(&token));
+    if is_sequence_set || is_criterion_name {
+        token.to_string()
+    } else {
+        format!("<{} byte token>", token.len())
+    }
+}
+
+const KNOWN_UNSUPPORTED_CRITERIA: &[&str] = &[
+    "MODSEQ", "OLDER", "YOUNGER", "SAVEDBEFORE", "SAVEDON", "SAVEDSINCE", "SAVEDATESUPPORTED",
+    "FUZZY", "EMAILID", "THREADID", "ANNOTATION", "FILTER",
+];
+
+fn search_response(hits: &[String]) -> String {
+    if hits.is_empty() {
+        "* SEARCH\r\n".to_string()
+    } else {
+        format!("* SEARCH {}\r\n", hits.join(" "))
+    }
+}
+
+/// Drop a leading `CHARSET <name>` (RFC 3501 §6.4.4). Search strings reach
+/// the matcher as UTF-8 text, so US-ASCII and UTF-8 are accepted; any other
+/// charset is refused so the client can report it.
+fn strip_search_charset(criteria_upper: &str) -> std::result::Result<&str, ()> {
+    let trimmed = criteria_upper.trim_start();
+    let Some(after) = trimmed.strip_prefix("CHARSET ") else {
+        return Ok(trimmed);
+    };
+    let after = after.trim_start();
+    let (charset, rest) = match after.strip_prefix('"') {
+        Some(quoted) => quoted.split_once('"').ok_or(())?,
+        None => after.split_once(' ').unwrap_or((after, "")),
+    };
+    match charset {
+        "UTF-8" | "US-ASCII" => Ok(rest.trim_start()),
+        _ => Err(()),
+    }
+}
+
+#[cfg(test)]
+fn search_matches(msg: &CachedMessage, criteria_upper: &str) -> bool {
+    let position = SearchPosition { seq: 1, last_seq: 1, last_uid: msg.imap_uid };
+    search_matches_noting(msg, position, &[], criteria_upper, &mut None).unwrap()
+}
+
+/// Like `search_matches`, against the message's stored keywords, and records
+/// the first criterion it does not support, so the command can log it once
+/// rather than once per message.
+fn search_matches_noting(
+    msg: &CachedMessage,
+    position: SearchPosition,
+    keywords: &[String],
+    criteria_upper: &str,
+    unsupported: &mut Option<String>,
+) -> std::result::Result<bool, SearchTooDeep> {
+    let parts: Vec<String> = tokenize_search_criteria(criteria_upper);
+    let mut idx = 0;
+    let mut matched = true;
+    while idx < parts.len() {
+        if !search_eval(msg, position, keywords, &parts, &mut idx, 1, unsupported)? {
+            matched = false;
+        }
+    }
+    Ok(matched)
+}
+
+fn search_needs_body(criteria_upper: &str) -> bool {
+    tokenize_search_criteria(criteria_upper)
+        .iter()
+        .any(|t| t == "BODY" || t == "TEXT")
+}
+
+const MAX_SEARCH_NESTING: usize = 256;
+
+#[derive(Debug, PartialEq)]
+struct SearchTooDeep;
+
+fn search_eval(
+    msg: &CachedMessage,
+    position: SearchPosition,
+    keywords: &[String],
+    parts: &[String],
+    idx: &mut usize,
+    depth: usize,
+    unsupported: &mut Option<String>,
+) -> std::result::Result<bool, SearchTooDeep> {
+    if depth > MAX_SEARCH_NESTING {
+        return Err(SearchTooDeep);
+    }
+    if *idx >= parts.len() { return Ok(true); }
+    Ok(match parts[*idx].as_str() {
+        "(" => {
+            *idx += 1;
+            let mut result = true;
+            while *idx < parts.len() && parts[*idx] != ")" {
+                if !search_eval(msg, position, keywords, parts, idx, depth + 1, unsupported)? {
+                    result = false;
+                }
+            }
+            if *idx < parts.len() {
+                *idx += 1;
+            }
+            result
+        }
+        ")" => { *idx += 1; true }
+        "ALL" => { *idx += 1; true }
+        "UNSEEN" => { *idx += 1; (msg.flags & 1) == 0 }
+        "SEEN" => { *idx += 1; (msg.flags & 1) != 0 }
+        "ANSWERED" => { *idx += 1; (msg.flags & 2) != 0 }
+        "UNANSWERED" => { *idx += 1; (msg.flags & 2) == 0 }
+        "FLAGGED" => { *idx += 1; (msg.flags & 4) != 0 }
+        "UNFLAGGED" => { *idx += 1; (msg.flags & 4) == 0 }
+        "DELETED" => { *idx += 1; (msg.flags & 8) != 0 }
+        "UNDELETED" => { *idx += 1; (msg.flags & 8) == 0 }
+        "DRAFT" => { *idx += 1; (msg.flags & 16) != 0 }
+        "UNDRAFT" => { *idx += 1; (msg.flags & 16) == 0 }
+        "NOT" => {
+            *idx += 1;
+            let v = search_eval(msg, position, keywords, parts, idx, depth + 1, unsupported)?;
+            !v
+        }
+        "OR" => {
+            *idx += 1;
+            let a = search_eval(msg, position, keywords, parts, idx, depth + 1, unsupported)?;
+            let b = search_eval(msg, position, keywords, parts, idx, depth + 1, unsupported)?;
+            a || b
+        }
+        "FROM" => {
+            *idx += 1;
+            let pat = if *idx < parts.len() { let p = parts[*idx].as_str(); *idx += 1; p } else { "" };
+            msg.sender.as_deref().unwrap_or("").to_uppercase().contains(&pat.to_uppercase())
+        }
+        "TO" => {
+            *idx += 1;
+            let pat = if *idx < parts.len() { let p = parts[*idx].as_str(); *idx += 1; p } else { "" };
+            msg.recipients.as_deref().unwrap_or("").to_uppercase().contains(&pat.to_uppercase())
+        }
+        "SUBJECT" => {
+            *idx += 1;
+            let pat = if *idx < parts.len() { let p = parts[*idx].as_str(); *idx += 1; p } else { "" };
+            msg.subject.as_deref().unwrap_or("").to_uppercase().contains(&pat.trim_matches('"').to_uppercase())
+        }
+        "LARGER" => {
+            *idx += 1;
+            let n: i64 = if *idx < parts.len() { let p = parts[*idx].parse().unwrap_or(0); *idx += 1; p } else { 0 };
+            msg.size > n
+        }
+        "SMALLER" => {
+            *idx += 1;
+            let n: i64 = if *idx < parts.len() { let p = parts[*idx].parse().unwrap_or(i64::MAX); *idx += 1; p } else { i64::MAX };
+            msg.size < n
+        }
+        "BEFORE" | "SENTBEFORE" => {
+            *idx += 1;
+            let date_arg = if *idx < parts.len() { let p = parts[*idx].as_str(); *idx += 1; p } else { "" };
+            match (parse_imap_search_date(date_arg), msg.date.as_deref().and_then(parse_message_date_ymd)) {
+                (Some(search), Some(msg_d)) => msg_d < search,
+                _ => false,
+            }
+        }
+        "SINCE" | "SENTSINCE" => {
+            *idx += 1;
+            let date_arg = if *idx < parts.len() { let p = parts[*idx].as_str(); *idx += 1; p } else { "" };
+            match (parse_imap_search_date(date_arg), msg.date.as_deref().and_then(parse_message_date_ymd)) {
+                (Some(search), Some(msg_d)) => msg_d >= search,
+                _ => false,
+            }
+        }
+        "ON" | "SENTON" => {
+            *idx += 1;
+            let date_arg = if *idx < parts.len() { let p = parts[*idx].as_str(); *idx += 1; p } else { "" };
+            match (parse_imap_search_date(date_arg), msg.date.as_deref().and_then(parse_message_date_ymd)) {
+                (Some(search), Some(msg_d)) => msg_d == search,
+                _ => false,
+            }
+        }
+        "BODY" => {
+            *idx += 1;
+            let pat = if *idx < parts.len() { let p = parts[*idx].as_str(); *idx += 1; p } else { "" };
+            let pat_lower = pat.trim_matches('"').to_lowercase();
+            if pat_lower.is_empty() { return Ok(true); }
+            msg.body_text.as_deref().unwrap_or("").to_lowercase().contains(&pat_lower)
+        }
+        "TEXT" => {
+            *idx += 1;
+            let pat = if *idx < parts.len() { let p = parts[*idx].as_str(); *idx += 1; p } else { "" };
+            let pat_lower = pat.trim_matches('"').to_lowercase();
+            if pat_lower.is_empty() { return Ok(true); }
+            let body_lower = msg.body_text.as_deref().unwrap_or("").to_lowercase();
+            let subj_lower = msg.subject.as_deref().unwrap_or("").to_lowercase();
+            body_lower.contains(&pat_lower) || subj_lower.contains(&pat_lower)
+        }
+        field_token @ ("CC" | "BCC") => {
+            let field = field_token.to_ascii_lowercase();
+            *idx += 1;
+            let pat = if *idx < parts.len() { let p = parts[*idx].as_str(); *idx += 1; p } else { "" };
+            header_search_matches(msg, &field, pat)
+        }
+        "KEYWORD" => {
+            *idx += 1;
+            let pat = if *idx < parts.len() { let p = parts[*idx].as_str(); *idx += 1; p } else { "" };
+            has_keyword(keywords, pat)
+        }
+        "UNKEYWORD" => {
+            *idx += 1;
+            let pat = if *idx < parts.len() { let p = parts[*idx].as_str(); *idx += 1; p } else { "" };
+            !has_keyword(keywords, pat)
+        }
+        "HEADER" => {
+            *idx += 1;
+            let field = if *idx < parts.len() { let p = parts[*idx].trim_matches('"').to_ascii_lowercase(); *idx += 1; p } else { String::new() };
+            let pat = if *idx < parts.len() { let p = parts[*idx].as_str(); *idx += 1; p } else { "" };
+            header_search_matches(msg, &field, pat)
+        }
+        "UID" => {
+            *idx += 1;
+            if *idx < parts.len() {
+                let uid_set = &parts[*idx];
+                *idx += 1;
+                sequence_set_contains(uid_set, msg.imap_uid, position.last_uid)
+            } else {
+                false
+            }
+        }
+        "RECENT" | "NEW" => { *idx += 1; false }
+        "OLD" => { *idx += 1; true }
+        set if is_sequence_set(set) => {
+            *idx += 1;
+            sequence_set_contains(set, position.seq, position.last_seq)
+        }
+        unknown => {
+            if unsupported.is_none() {
+                *unsupported = Some(loggable_criterion(unknown));
+            }
+            *idx += 1;
+            false
+        }
+    })
+}
+
+fn uid_validity(db: &Database) -> std::result::Result<u64, String> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    if let Some(v) = db.get_sync_state("uid_validity")? {
+        if let Ok(n) = v.parse::<u64>() {
+            return Ok(n);
+        }
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(1);
+    db.set_sync_state("uid_validity", &now.to_string())?;
+    Ok(now)
+}
+
+fn append_completed(db: &Database, uid: impl std::fmt::Display) -> String {
+    match uid_validity(db) {
+        Ok(validity) => format!("[APPENDUID {} {}] APPEND completed", validity, uid),
+        Err(e) => {
+            tracing::warn!("UIDVALIDITY unavailable for APPENDUID: {}", e);
+            "APPEND completed".to_string()
+        }
+    }
+}
+
+/// Whether a STORE item is `FLAGS`, `+FLAGS` or `-FLAGS` (with or without
+/// `.SILENT`), the only items `parse_store_flags` understands. Anything else
+/// would be read as "replace the flags with none".
+fn is_store_flags_item(op_and_flags: &str) -> bool {
+    let item = op_and_flags
+        .split(|c: char| c.is_whitespace() || c == '(')
+        .next()
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    matches!(
+        item.trim_end_matches(".SILENT"),
+        "FLAGS" | "+FLAGS" | "-FLAGS"
+    )
+}
+
+/// Gmail labels have no Aster equivalent: a label STORE changes nothing and
+/// is answered with the labels the message already has.
+async fn ack_gm_labels_store(
+    writer: &mut (impl AsyncWrite + Unpin),
+    m: &CachedMessage,
+    seq: usize,
+    uid: Option<u32>,
+    upper_store: &str,
+    store_args: &str,
+) -> std::io::Result<()> {
+    tracing::info!(
+        target: "imap::gm_labels",
+        "gm-labels store not propagated to backend: aster_id={} op={} args={}",
+        m.aster_id,
+        if upper_store.contains("+X-GM-LABELS") { "add" }
+        else if upper_store.contains("-X-GM-LABELS") { "remove" }
+        else { "replace" },
+        store_args
+    );
+    if upper_store.contains(".SILENT") {
+        return Ok(());
+    }
+    let rendered: Vec<String> = gmail_labels_for_message(m)
+        .iter()
+        .map(|l| quote_or_atom_label(l))
+        .collect();
+    let uid_item = uid.map(|u| format!("UID {} ", u)).unwrap_or_default();
+    writer
+        .write_all(
+            format!("* {} FETCH ({}X-GM-LABELS ({}))\r\n", seq, uid_item, rendered.join(" "))
+                .as_bytes(),
+        )
+        .await
+}
+
+fn parse_store_flags(op_and_flags: &str) -> (i8, u32, bool) {
+    let upper = op_and_flags.to_ascii_uppercase();
+    let silent = upper.contains(".SILENT");
+    let op: i8 = if upper.contains("+FLAGS") {
+        1
+    } else if upper.contains("-FLAGS") {
+        -1
+    } else {
+        0
+    };
+    let flag_start = op_and_flags.find('(').map(|p| p + 1).unwrap_or(0);
+    let flag_end = op_and_flags.rfind(')').unwrap_or(op_and_flags.len());
+    let flag_str = if flag_start <= flag_end { &op_and_flags[flag_start..flag_end] } else { "" };
+    let mut mask: u32 = 0;
+    for token in flag_str.split_whitespace() {
+        mask |= match token.to_ascii_uppercase().trim_start_matches('\\') {
+            "SEEN" => 1,
+            "ANSWERED" => 2,
+            "FLAGGED" => 4,
+            "DELETED" => 8,
+            "DRAFT" => 16,
+            _ => 0,
+        };
+    }
+    (op, mask, silent)
+}
+
+fn apply_flags(current: u32, op: i8, mask: u32) -> u32 {
+    match op {
+        1 => current | mask,
+        -1 => current & !mask,
+        _ => mask,
+    }
+}
+
+fn flags_to_str(flags: u32, keywords: &[String]) -> String {
+    let mut list: Vec<&str> = Vec::new();
+    if flags & 1 != 0 { list.push("\\Seen"); }
+    if flags & 2 != 0 { list.push("\\Answered"); }
+    if flags & 4 != 0 { list.push("\\Flagged"); }
+    if flags & 8 != 0 { list.push("\\Deleted"); }
+    if flags & 16 != 0 { list.push("\\Draft"); }
+    list.extend(keywords.iter().map(String::as_str));
+    list.join(" ")
+}
+
+/*
+ * Keywords are user-defined flags: Thunderbird's tags are `$label1`..`$label5`
+ * or any name the user types, and other clients set `$Forwarded`, `$Junk`,
+ * `NonJunk`. SELECT advertises them with `\*` in PERMANENTFLAGS, so a client
+ * trusts the bridge to keep them; they are stored per message in the bridge
+ * database and returned wherever FLAGS are.
+ */
+const MAX_KEYWORDS_PER_MESSAGE: usize = 64;
+const MAX_KEYWORD_LEN: usize = 128;
+
+pub(crate) fn is_keyword(token: &str) -> bool {
+    !token.is_empty()
+        && token.len() <= MAX_KEYWORD_LEN
+        && token
+            .bytes()
+            .all(|b| b > 0x20 && b < 0x7f && !b"(){%*\"\\]".contains(&b))
+}
+
+fn has_keyword(keywords: &[String], wanted: &str) -> bool {
+    keywords.iter().any(|k| k.eq_ignore_ascii_case(wanted))
+}
+
+/// The keywords named in a `STORE ... FLAGS (...)` list (the system flags,
+/// which start with a backslash, are handled by `parse_store_flags`). None
+/// when the command stores something other than FLAGS.
+fn parse_store_keywords(op_and_flags: &str) -> Option<Vec<String>> {
+    let upper = op_and_flags.to_ascii_uppercase();
+    if !upper.contains("FLAGS") || upper.contains("X-GM-LABELS") {
+        return None;
+    }
+    let flag_start = op_and_flags.find('(').map(|p| p + 1).unwrap_or(0);
+    let flag_end = op_and_flags.rfind(')').unwrap_or(op_and_flags.len());
+    let flag_str = if flag_start <= flag_end { &op_and_flags[flag_start..flag_end] } else { "" };
+    let list: &str = if flag_start == 0 {
+        // Unparenthesised form: `+FLAGS $label1`.
+        flag_str.split_once(char::is_whitespace).map(|(_, rest)| rest).unwrap_or("")
+    } else {
+        flag_str
+    };
+    Some(
+        list.split_whitespace()
+            .filter(|t| !t.starts_with('\\') && is_keyword(t))
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+fn apply_keywords(current: &[String], op: i8, given: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = if op == 0 { Vec::new() } else { current.to_vec() };
+    if op == -1 {
+        out.retain(|k| !has_keyword(given, k));
+        return out;
+    }
+    for keyword in given {
+        if !has_keyword(&out, keyword) && out.len() < MAX_KEYWORDS_PER_MESSAGE {
+            out.push(keyword.clone());
+        }
+    }
+    out
+}
+
+fn store_message_keywords(
+    db: &crate::db::WriteBatch<'_>,
+    aster_id: &str,
+    current: &[String],
+    op: i8,
+    given: Option<&[String]>,
+    label_keywords: &[String],
+) {
+    let Some(given) = given else { return };
+    if op != 0 && given.is_empty() {
+        return;
+    }
+    let storable: Vec<String> = given
+        .iter()
+        .filter(|keyword| op == -1 || !has_keyword(label_keywords, keyword) || has_keyword(current, keyword))
+        .cloned()
+        .collect();
+    let updated = apply_keywords(current, op, &storable);
+    if updated != current {
+        if let Err(e) = db.set_message_keywords(aster_id, &updated) {
+            tracing::warn!("keyword store failed for {}: {}", aster_id, e);
+        }
+    }
+}
+
+#[derive(Default)]
+struct TagStoreResult {
+    label_keywords: Vec<String>,
+    failure: Option<&'static str>,
+}
+
+async fn store_tag_keywords(
+    db: &Database,
+    client: &ApiClient,
+    session: &Arc<RwLock<Session>>,
+    item_ids: &[String],
+    op: i8,
+    given: Option<&[String]>,
+) -> TagStoreResult {
+    let Some(given) = given else { return TagStoreResult::default() };
+    if op != 0 && given.is_empty() {
+        return TagStoreResult::default();
+    }
+    let keywords: Vec<String> = given
+        .iter()
+        .filter(|keyword| crate::tags::is_label_keyword(keyword))
+        .cloned()
+        .collect();
+    let (access_token, identity_key) = {
+        let s = session.read().await;
+        (s.access_token.to_string(), s.identity_key.clone())
+    };
+    let mut budget = crate::tag_ops::MAX_CREATED_PER_COMMAND;
+    let outcome = crate::tag_ops::apply_keywords(
+        db,
+        client,
+        &access_token,
+        identity_key.as_deref(),
+        item_ids,
+        op,
+        &keywords,
+        &mut budget,
+    )
+    .await;
+    if !outcome.changed.is_empty() {
+        let refs: Vec<&str> = outcome.changed.iter().map(|id| id.as_str()).collect();
+        let _ = db.jmap_record_updated_batch("Email", &refs);
+    }
+    if !outcome.failed.is_empty() {
+        tracing::warn!("label keyword store failed for {} keywords", outcome.failed.len());
+    }
+    let label_keywords: Vec<String> = keywords
+        .into_iter()
+        .filter(|keyword| !has_keyword(&outcome.unmapped, keyword))
+        .collect();
+    TagStoreResult {
+        label_keywords,
+        failure: outcome.error.as_ref().map(|e| e.imap_response()),
+    }
+}
+
+async fn store_append_keywords(
+    db: &Database,
+    client: &ApiClient,
+    session: &Arc<RwLock<Session>>,
+    aster_id: &str,
+    keywords: &[String],
+) -> Option<&'static str> {
+    if keywords.is_empty() {
+        return None;
+    }
+    let item_ids = [aster_id.to_string()];
+    let tag_store = store_tag_keywords(db, client, session, &item_ids, 1, Some(keywords)).await;
+    let current = db.message_keywords(aster_id).unwrap_or_default();
+    db.write_batch(|batch| {
+        store_message_keywords(
+            batch,
+            aster_id,
+            &current,
+            1,
+            Some(keywords),
+            &tag_store.label_keywords,
+        )
+    });
+    tag_store.failure
+}
+
+const MAX_APPEND_BYTES: usize = 40 * 1024 * 1024;
+const MAX_DRAINABLE_APPEND_BYTES: usize = 256 * 1024 * 1024;
+
+fn mailbox_directory(db: &Database) -> crate::folders::Directory {
+    crate::folders::Directory::build(&db.list_custom_folders().unwrap_or_default())
+}
+
+fn resolve_mailbox(db: &Database, raw: &str) -> Option<crate::folders::MailboxEntry> {
+    mailbox_directory(db)
+        .resolve(&crate::imap::mutf7::decode_lenient(raw))
+        .cloned()
+}
+
+fn is_safe_tag(tag: &str) -> bool {
+    !tag.is_empty() && !tag.chars().any(char::is_control)
+}
+
+fn quote_imap_string(value: &str) -> String {
+    format!(
+        "\"{}\"",
+        response_text(value).replace('\\', "\\\\").replace('"', "\\\"")
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ImapState {
+    NotAuthenticated,
+    Authenticated,
+    Selected,
+}
+
+struct ImapConnection {
+    state: ImapState,
+    selected_mailbox: Option<String>,
+    selected_folder: Option<String>,
+    uids: Vec<u32>,
+    read_only: bool,
+    copied_out: std::collections::HashSet<String>,
+}
+
+impl ImapConnection {
+    fn expunged(&mut self, uid: u32) -> Option<usize> {
+        let index = self.uids.iter().position(|u| *u == uid)?;
+        self.uids.remove(index);
+        Some(index + 1)
+    }
+}
+
+struct MailboxView<'a> {
+    messages: Vec<Option<&'a CachedMessage>>,
+    seq_by_uid: std::collections::HashMap<u32, usize>,
+    max_uid: u32,
+}
+
+impl<'a> MailboxView<'a> {
+    fn new(uids: &[u32], messages: &'a [CachedMessage]) -> Self {
+        let by_uid: std::collections::HashMap<u32, &CachedMessage> =
+            messages.iter().map(|m| (m.imap_uid, m)).collect();
+        Self {
+            messages: uids.iter().map(|uid| by_uid.get(uid).copied()).collect(),
+            seq_by_uid: uids.iter().enumerate().map(|(i, uid)| (*uid, i + 1)).collect(),
+            max_uid: uids.iter().copied().max().unwrap_or(0),
+        }
+    }
+
+    fn len(&self) -> u32 {
+        self.messages.len() as u32
+    }
+
+    fn by_seq(&self, seq: u32) -> Option<&'a CachedMessage> {
+        self.messages.get((seq as usize).checked_sub(1)?).copied().flatten()
+    }
+
+    fn by_uid(&self, uid: u32) -> Option<(usize, &'a CachedMessage)> {
+        let seq = *self.seq_by_uid.get(&uid)?;
+        Some((seq, self.by_seq(seq as u32)?))
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (usize, &'a CachedMessage)> + '_ {
+        self.messages.iter().enumerate().filter_map(|(i, m)| m.map(|m| (i + 1, m)))
+    }
+
+    fn position(&self, seq: usize) -> SearchPosition {
+        SearchPosition {
+            seq: seq as u32,
+            last_seq: self.len(),
+            last_uid: self.max_uid,
+        }
+    }
+}
+
+async fn report_mailbox_changes(
+    writer: &mut (impl AsyncWrite + Unpin),
+    conn: &mut ImapConnection,
+    current: &[u32],
+    expunge: bool,
+) -> std::io::Result<()> {
+    if expunge {
+        let present: std::collections::HashSet<u32> = current.iter().copied().collect();
+        let mut expunges = String::new();
+        let mut seq = 0usize;
+        let mut removed = 0usize;
+        conn.uids.retain(|uid| {
+            seq += 1;
+            if present.contains(uid) {
+                return true;
+            }
+            expunges.push_str(&format!("* {} EXPUNGE\r\n", seq - removed));
+            removed += 1;
+            false
+        });
+        if !expunges.is_empty() {
+            writer.write_all(expunges.as_bytes()).await?;
+        }
+    }
+    let known: std::collections::HashSet<u32> = conn.uids.iter().copied().collect();
+    let before = conn.uids.len();
+    conn.uids.extend(current.iter().copied().filter(|uid| !known.contains(uid)));
+    if conn.uids.len() != before {
+        writer
+            .write_all(format!("* {} EXISTS\r\n", conn.uids.len()).as_bytes())
+            .await?;
+    }
+    Ok(())
+}
+
+async fn sync_selected(
+    writer: &mut (impl AsyncWrite + Unpin),
+    db: &Database,
+    conn: &mut ImapConnection,
+    expunge: bool,
+) -> std::io::Result<()> {
+    sync_selected_meta(writer, db, conn, expunge).await.map(|_| ())
+}
+
+async fn sync_selected_meta(
+    writer: &mut (impl AsyncWrite + Unpin),
+    db: &Database,
+    conn: &mut ImapConnection,
+    expunge: bool,
+) -> std::io::Result<Option<Vec<CachedMessage>>> {
+    if conn.state != ImapState::Selected {
+        return Ok(None);
+    }
+    let Some(folder) = conn.selected_folder.as_deref() else {
+        return Ok(None);
+    };
+    let Ok(listing) = db.list_cached_message_meta(folder) else {
+        return Ok(None);
+    };
+    let current: Vec<u32> = listing.iter().map(|m| m.imap_uid).collect();
+    report_mailbox_changes(writer, conn, &current, expunge).await?;
+    Ok(Some(listing))
+}
+
+pub async fn run(
+    addr: &str,
+    session: Arc<RwLock<Session>>,
+    db: Arc<Database>,
+    client: Arc<ApiClient>,
+    passwords: Arc<AppPasswords>,
+    broadcaster: broadcast::Sender<StateChange>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+) -> Result<()> {
+    let listener = crate::port_picker::bind_loopback_listener(addr).await?;
+    tracing::info!("IMAP server listening on {} (STARTTLS={})", addr, tls_config.is_some());
+    serve(listener, session, db, client, passwords, broadcaster, tls_config).await
+}
+
+pub async fn serve(
+    listener: tokio::net::TcpListener,
+    session: Arc<RwLock<Session>>,
+    db: Arc<Database>,
+    client: Arc<ApiClient>,
+    passwords: Arc<AppPasswords>,
+    broadcaster: broadcast::Sender<StateChange>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+) -> Result<()> {
+    let mut acceptor = crate::accept::ResilientAcceptor::new("IMAP");
+    let shutdown = crate::shutdown::current();
+    loop {
+        let (stream, peer) = acceptor.accept(&listener).await;
+        if !peer.ip().is_loopback() {
+            tracing::warn!("IMAP rejected non-loopback peer {}", peer);
+            drop(stream);
+            continue;
+        }
+        let permit = match crate::conn_limit::try_acquire_connection(crate::conn_limit::Protocol::Imap) {
+            Some(p) => p,
+            None => {
+                tracing::warn!("IMAP connection limit reached, dropping {}", peer);
+                drop(stream);
+                continue;
+            }
+        };
+        tracing::debug!("IMAP connection from {}", peer);
+
+        let session = session.clone();
+        let client = client.clone();
+        let db = db.clone();
+        let passwords = passwords.clone();
+        let broadcaster = broadcaster.clone();
+        let tls_config = tls_config.clone();
+
+        shutdown.spawn(async move {
+            let _permit = permit;
+            if let Err(e) = run_session(
+                stream, session, db, client, passwords, broadcaster, tls_config,
+            )
+            .await
+            {
+                tracing::error!("IMAP connection error: {}", e);
+            }
+        });
+    }
+}
+
+pub async fn run_implicit_tls(
+    addr: &str,
+    session: Arc<RwLock<Session>>,
+    db: Arc<Database>,
+    client: Arc<ApiClient>,
+    passwords: Arc<AppPasswords>,
+    broadcaster: broadcast::Sender<StateChange>,
+    tls_config: Arc<rustls::ServerConfig>,
+) -> Result<()> {
+    let listener = crate::port_picker::bind_loopback_listener(addr).await?;
+    tracing::info!("IMAPS (implicit TLS) listening on {}", addr);
+
+    let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
+
+    let mut conn_acceptor = crate::accept::ResilientAcceptor::new("IMAPS");
+    let shutdown = crate::shutdown::current();
+    loop {
+        let (stream, peer) = conn_acceptor.accept(&listener).await;
+        if !peer.ip().is_loopback() {
+            tracing::warn!("IMAPS rejected non-loopback peer {}", peer);
+            drop(stream);
+            continue;
+        }
+        let permit = match crate::conn_limit::try_acquire_connection(crate::conn_limit::Protocol::Imap) {
+            Some(p) => p,
+            None => {
+                tracing::warn!("IMAPS connection limit reached, dropping {}", peer);
+                drop(stream);
+                continue;
+            }
+        };
+        let session = session.clone();
+        let client = client.clone();
+        let db = db.clone();
+        let passwords = passwords.clone();
+        let broadcaster = broadcaster.clone();
+        let acceptor = acceptor.clone();
+
+        shutdown.spawn(async move {
+            let _permit = permit;
+            let tls_stream = match crate::tls::accept_with_timeout(&acceptor, stream, "IMAPS").await {
+                Some(s) => s,
+                None => return,
+            };
+            if let Err(e) = run_session(
+                tls_stream, session, db, client, passwords, broadcaster, None,
+            )
+            .await
+            {
+                tracing::error!("IMAPS connection error: {}", e);
+            }
+        });
+    }
+}
+
+pub trait AsyncReadWrite: AsyncRead + AsyncWrite {}
+impl<T: AsyncRead + AsyncWrite + ?Sized> AsyncReadWrite for T {}
+
+async fn run_session_erased(
+    stream: Box<dyn AsyncReadWrite + Send + Unpin>,
+    session: Arc<RwLock<Session>>,
+    db: Arc<Database>,
+    client: Arc<ApiClient>,
+    passwords: Arc<AppPasswords>,
+    broadcaster: broadcast::Sender<StateChange>,
+    pre_auth: crate::conn_limit::PreAuthClock,
+) -> Result<()> {
+    run_session_inner(stream, session, db, client, passwords, broadcaster, None, pre_auth).await
+}
+
+async fn run_session<S>(
+    stream: S,
+    session: Arc<RwLock<Session>>,
+    db: Arc<Database>,
+    client: Arc<ApiClient>,
+    passwords: Arc<AppPasswords>,
+    broadcaster: broadcast::Sender<StateChange>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let pre_auth = crate::conn_limit::PreAuthClock::start();
+    let inner = run_session_inner(
+        stream,
+        session,
+        db,
+        client,
+        passwords,
+        broadcaster,
+        tls_config,
+        pre_auth.clone(),
+    );
+    match pre_auth.guard(inner).await {
+        Some(result) => result,
+        None => {
+            tracing::debug!("IMAP connection closed: no sign-in before the deadline");
+            Ok(())
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_session_inner<S>(
+    stream: S,
+    session: Arc<RwLock<Session>>,
+    db: Arc<Database>,
+    client: Arc<ApiClient>,
+    passwords: Arc<AppPasswords>,
+    broadcaster: broadcast::Sender<StateChange>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+    pre_auth: crate::conn_limit::PreAuthClock,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (read_half, write_half) = tokio::io::split(stream);
+    let mut writer = crate::imap::heartbeat::HeartbeatWriter::new(
+        write_half,
+        crate::imap::heartbeat::heartbeat_interval(),
+    );
+    let mut reader = BufReader::new(read_half);
+    let _ = client;
+    let starttls_capable = tls_config.is_some();
+    let greeting_cap = if starttls_capable {
+        format!("* OK [CAPABILITY IMAP4rev1 STARTTLS AUTH=PLAIN IDLE UIDPLUS MOVE UNSELECT CHILDREN NAMESPACE X-GM-EXT-1] Aster Bridge {} ready\r\n", env!("CARGO_PKG_VERSION"))
+    } else {
+        format!("* OK [CAPABILITY IMAP4rev1 AUTH=PLAIN IDLE UIDPLUS MOVE UNSELECT CHILDREN NAMESPACE X-GM-EXT-1] Aster Bridge {} ready\r\n", env!("CARGO_PKG_VERSION"))
+    };
+    writer.write_all(greeting_cap.as_bytes()).await?;
+
+    let mut conn = ImapConnection {
+        state: ImapState::NotAuthenticated,
+        selected_mailbox: None,
+        selected_folder: None,
+        uids: Vec::new(),
+        read_only: false,
+        copied_out: std::collections::HashSet::new(),
+    };
+
+    let mut line = String::new();
+    let mut failed_auth: u32 = 0;
+
+    loop {
+        if conn.state != ImapState::NotAuthenticated {
+            pre_auth.mark_signed_in();
+        }
+        writer.disarm();
+        writer.flush().await?;
+        line.clear();
+        let read = pre_auth
+            .bound_until_auth(
+                conn.state != ImapState::NotAuthenticated,
+                read_line_bounded(&mut reader, &mut line, MAX_LINE_LENGTH),
+            )
+            .await;
+        let Some(read) = read else {
+            writer.write_all(b"* BYE Autologout; idle for too long\r\n").await?;
+            break;
+        };
+        let n = match read {
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                writer.write_all(b"* BAD Line too long\r\n").await?;
+                break;
+            }
+            Err(e) => return Err(crate::error::BridgeError::Io(e)),
+        };
+        if n == 0 {
+            break;
+        }
+
+        if line.len() > MAX_LINE_LENGTH {
+            writer.write_all(b"* BAD Line too long\r\n").await?;
+            continue;
+        }
+
+        let mut trimmed = line.trim_end().to_string();
+        // SEARCH strings may arrive as literals (RFC 3501 §4.3): clients send
+        // non-ASCII terms that way. Read each one and splice it back into the
+        // line as a quoted string, so the criteria parse as usual.
+        if !matches!(conn.state, ImapState::NotAuthenticated) && is_search_command(&trimmed) {
+            // (message, whether the connection can go on)
+            let mut literal_error: Option<(&str, bool)> = None;
+            let mut literals = 0usize;
+            while let Some((head, len, non_sync)) = trailing_literal(&trimmed) {
+                literals += 1;
+                if literals > MAX_SEARCH_LITERALS || len > MAX_LINE_LENGTH.saturating_sub(head.len()) {
+                    // A synchronizing literal has not been sent yet, so the
+                    // client can carry on; a non-synchronizing one is already
+                    // on its way and cannot be told apart from commands.
+                    literal_error = Some(("SEARCH literal too large", !non_sync));
+                    break;
+                }
+                if !non_sync {
+                    writer.write_all(b"+ Ready for literal data\r\n").await?;
+                    writer.flush().await?;
+                }
+                let mut buf = vec![0u8; len];
+                let read = tokio::time::timeout(
+                    SEARCH_LITERAL_TIMEOUT,
+                    tokio::io::AsyncReadExt::read_exact(&mut reader, &mut buf),
+                )
+                .await;
+                if !matches!(read, Ok(Ok(_))) {
+                    literal_error = Some(("SEARCH read failed", false));
+                    break;
+                }
+                let head = head.to_string();
+                let rest = tokio::time::timeout(
+                    SEARCH_LITERAL_TIMEOUT,
+                    read_line_bounded(&mut reader, &mut line, MAX_LINE_LENGTH),
+                )
+                .await;
+                match rest {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) if e.kind() == std::io::ErrorKind::InvalidData => {
+                        literal_error = Some(("Line too long", false));
+                        break;
+                    }
+                    Ok(Err(e)) => return Err(crate::error::BridgeError::Io(e)),
+                    Err(_) => {
+                        literal_error = Some(("SEARCH read failed", false));
+                        break;
+                    }
+                }
+                trimmed = format!(
+                    "{}{}{}",
+                    head,
+                    quote_search_string(&String::from_utf8_lossy(&buf)),
+                    line.trim_end()
+                );
+            }
+            if let Some((msg, recoverable)) = literal_error {
+                let tag = trimmed
+                    .split(' ')
+                    .next()
+                    .filter(|t| is_safe_tag(t))
+                    .unwrap_or("*")
+                    .to_string();
+                write_bad(&mut writer, &tag, msg).await?;
+                if recoverable {
+                    continue;
+                }
+                break;
+            }
+        }
+        let parts: Vec<&str> = trimmed.splitn(3, ' ').collect();
+        if !is_safe_tag(parts[0]) {
+            writer.write_all(b"* BAD Invalid tag\r\n").await?;
+            continue;
+        }
+        if parts.len() < 2 {
+            writer.write_all(b"* BAD Invalid command\r\n").await?;
+            continue;
+        }
+
+        let tag = parts[0].to_string();
+        let command = parts[1].to_uppercase();
+        let carries_private_args = command.starts_with("LOGIN")
+            || command.starts_with("AUTH")
+            || command == "SEARCH"
+            || command == "ESEARCH"
+            || (command == "UID"
+                && parts
+                    .get(2)
+                    .map(|rest| rest.trim_start().to_uppercase().starts_with("SEARCH"))
+                    .unwrap_or(false));
+        if carries_private_args {
+            tracing::debug!("IMAP <- {} {} <redacted>", tag, command);
+        } else {
+            tracing::debug!("IMAP <- {}", trimmed);
+        }
+        writer.arm();
+        let args = if parts.len() > 2 {
+            parts[2].to_string()
+        } else {
+            String::new()
+        };
+
+        match command.as_str() {
+            "CAPABILITY" => {
+                let cap_line: &[u8] = if starttls_capable && conn.state == ImapState::NotAuthenticated {
+                    b"* CAPABILITY IMAP4rev1 STARTTLS AUTH=PLAIN IDLE UIDPLUS MOVE UNSELECT CHILDREN NAMESPACE X-GM-EXT-1\r\n"
+                } else {
+                    b"* CAPABILITY IMAP4rev1 AUTH=PLAIN LOGIN IDLE UIDPLUS MOVE UNSELECT CHILDREN NAMESPACE X-GM-EXT-1\r\n"
+                };
+                writer.write_all(cap_line).await?;
+                write_ok(&mut writer, &tag, "CAPABILITY completed").await?;
+            }
+            "STARTTLS" => {
+                let cfg = match tls_config.as_ref() {
+                    Some(c) if conn.state == ImapState::NotAuthenticated => c.clone(),
+                    Some(_) => {
+                        write_bad(&mut writer, &tag, "STARTTLS not allowed after authentication").await?;
+                        continue;
+                    }
+                    None => {
+                        write_bad(&mut writer, &tag, "STARTTLS not available").await?;
+                        continue;
+                    }
+                };
+                write_ok(&mut writer, &tag, "Begin TLS negotiation now").await?;
+                writer.flush().await?;
+                let upgraded_session = session.clone();
+                let upgraded_db = db.clone();
+                let upgraded_client = client.clone();
+                let upgraded_passwords = passwords.clone();
+                let upgraded_broadcaster = broadcaster.clone();
+                let reclaimed = writer.reclaim().await?;
+                let rejoined = tokio::io::join(reader.into_inner(), reclaimed);
+                let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
+                let Some(accepted) = pre_auth.bound(acceptor.accept(rejoined)).await else {
+                    return Ok(());
+                };
+                let tls_stream = accepted.map_err(std::io::Error::other)?;
+                let erased: Box<dyn AsyncReadWrite + Send + Unpin> = Box::new(tls_stream);
+                return Box::pin(run_session_erased(
+                    erased,
+                    upgraded_session,
+                    upgraded_db,
+                    upgraded_client,
+                    upgraded_passwords,
+                    upgraded_broadcaster,
+                    pre_auth.clone(),
+                ))
+                .await;
+            }
+            "NOOP" => {
+                sync_selected(&mut writer, &db, &mut conn, true).await?;
+                write_ok(&mut writer, &tag, "NOOP completed").await?;
+            }
+            "ID" => {
+                writer
+                    .write_all(b"* ID (\"name\" \"Aster Bridge\")\r\n")
+                    .await?;
+                write_ok(&mut writer, &tag, "ID completed").await?;
+            }
+            "CHECK" => {
+                require_selected!(conn, writer, tag);
+                sync_selected(&mut writer, &db, &mut conn, true).await?;
+                write_ok(&mut writer, &tag, "CHECK completed").await?;
+            }
+            "LOGOUT" => {
+                writer.write_all(b"* BYE Aster Bridge closing\r\n").await?;
+                write_ok(&mut writer, &tag, "LOGOUT completed").await?;
+                break;
+            }
+            "LOGIN" => {
+                if starttls_capable {
+                    crate::sign_in_notice::record_insecure("imap");
+                    write_no(&mut writer, &tag, &format!("[PRIVACYREQUIRED] {}", crate::sign_in_notice::TLS_REQUIRED_TEXT)).await?;
+                    continue;
+                }
+                let ok = handle_login(&mut writer, &session, &passwords, &mut conn, &tag, &args).await?;
+                if !ok {
+                    failed_auth = failed_auth.saturating_add(1);
+                    let backoff_ms = 200u64.saturating_mul(1u64 << failed_auth.min(5));
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                    if failed_auth >= MAX_FAILED_AUTH {
+                        writer
+                            .write_all(b"* BYE Too many failed attempts\r\n")
+                            .await?;
+                        break;
+                    }
+                }
+            }
+            "AUTHENTICATE" => {
+                if starttls_capable {
+                    crate::sign_in_notice::record_insecure("imap");
+                    write_no(&mut writer, &tag, &format!("[PRIVACYREQUIRED] {}", crate::sign_in_notice::TLS_REQUIRED_TEXT)).await?;
+                    continue;
+                }
+                let upper_args = args.to_ascii_uppercase();
+                let is_plain = upper_args == "PLAIN" || upper_args.starts_with("PLAIN ");
+                if is_plain {
+                    let inline_creds = args.split_once(' ').map(|x| x.1)
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty());
+                    let creds = match inline_creds {
+                        Some(s) => s,
+                        None => {
+                            writer.write_all(b"+ \r\n").await?;
+                            line.clear();
+                            let nb = pre_auth
+                                .bound(read_line_bounded(&mut reader, &mut line, MAX_LINE_LENGTH))
+                                .await
+                                .and_then(|r| r.ok())
+                                .unwrap_or(0);
+                            if nb == 0 {
+                                break;
+                            }
+                            if line.trim_end() == "*" {
+                                write_bad(&mut writer, &tag, "AUTHENTICATE aborted").await?;
+                                continue;
+                            }
+                            line.trim_end().to_string()
+                        }
+                    };
+
+                    let mut ok = false;
+                    if let Ok(decoded) = base64::Engine::decode(
+                        &base64::engine::general_purpose::STANDARD,
+                        &creds,
+                    ) {
+                        let null_parts: Vec<&[u8]> = decoded.splitn(3, |&b| b == 0).collect();
+                        if null_parts.len() >= 3 {
+                            let authcid = String::from_utf8_lossy(null_parts[1]);
+                            let password = String::from_utf8_lossy(null_parts[2]);
+                            let username_ok = {
+                                let s = session.read().await;
+                                !s.email.is_empty()
+                                    && (authcid.is_empty() || s.accepts_login_name(&authcid))
+                            };
+                            if username_ok {
+                                if let Some(pw_id) = passwords.verify_and_id_cached(&authcid, &password).await {
+                                    conn.state = ImapState::Authenticated;
+                                    passwords.record_use(&pw_id, Some("imap"));
+                                    crate::sign_in_notice::record_signed_in("imap");
+                                    crate::sync::poller::try_kick_sync();
+                                    write_ok(&mut writer, &tag, "AUTHENTICATE completed").await?;
+                                    ok = true;
+                                }
+                            }
+                        }
+                    }
+                    if !ok {
+                        failed_auth = failed_auth.saturating_add(1);
+                        let backoff_ms = 200u64.saturating_mul(1u64 << failed_auth.min(5));
+                        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                        write_no(&mut writer, &tag, &format!("[AUTHENTICATIONFAILED] {}", crate::sign_in_notice::BAD_CREDENTIALS_TEXT))
+                            .await?;
+                        if failed_auth >= MAX_FAILED_AUTH {
+                            writer
+                                .write_all(b"* BYE Too many failed attempts\r\n")
+                                .await?;
+                            break;
+                        }
+                    }
+                } else {
+                    write_bad(&mut writer, &tag, "Unsupported auth mechanism").await?;
+                }
+            }
+            "NAMESPACE" => {
+                require_auth!(conn, writer, tag);
+                writer
+                    .write_all(b"* NAMESPACE ((\"\" \"/\")) NIL NIL\r\n")
+                    .await?;
+                write_ok(&mut writer, &tag, "NAMESPACE completed").await?;
+            }
+            "LIST" => {
+                require_auth!(conn, writer, tag);
+                handle_list(&mut writer, &db, &tag, &args, "LIST").await?;
+            }
+            "LSUB" => {
+                require_auth!(conn, writer, tag);
+                handle_list(&mut writer, &db, &tag, &args, "LSUB").await?;
+            }
+            "SUBSCRIBE" | "UNSUBSCRIBE" => {
+                require_auth!(conn, writer, tag);
+                write_ok(&mut writer, &tag, "completed").await?;
+            }
+            "CREATE" | "DELETE" | "RENAME" => {
+                require_auth!(conn, writer, tag);
+                let outcome = match command.as_str() {
+                    "CREATE" => handle_create(&db, &client, &session, &args).await,
+                    "DELETE" => handle_delete(&db, &client, &session, &args).await,
+                    _ => handle_rename(&db, &client, &session, &args).await,
+                };
+                match outcome {
+                    Ok(changed) => {
+                        if changed {
+                            announce_mailbox_change(&db, &broadcaster);
+                            crate::sync::poller::try_kick_sync();
+                        }
+                        write_ok(&mut writer, &tag, &format!("{} completed", command)).await?;
+                    }
+                    Err(msg) => write_no(&mut writer, &tag, &msg).await?,
+                }
+            }
+            "SORT" | "THREAD" => {
+                require_auth!(conn, writer, tag);
+                write_no(&mut writer, &tag, "[CANNOT] server-side SORT/THREAD not supported").await?;
+            }
+            "SELECT" | "EXAMINE" => {
+                require_auth!(conn, writer, tag);
+                handle_select(
+                    &mut writer, &db, &mut conn, &tag, &args, &command,
+                )
+                .await?;
+            }
+            "FETCH" => {
+                require_selected!(conn, writer, tag);
+                handle_fetch(&mut writer, &db, &client, &session, &broadcaster, &conn, &tag, &args, false, None).await?;
+            }
+            "UID" => {
+                require_auth!(conn, writer, tag);
+                let uid_parts: Vec<&str> = args.splitn(2, ' ').collect();
+                if uid_parts.is_empty() {
+                    write_bad(&mut writer, &tag, "UID requires a subcommand").await?;
+                    continue;
+                }
+                let subcmd = uid_parts[0].to_uppercase();
+                let subargs = if uid_parts.len() > 1 {
+                    uid_parts[1]
+                } else {
+                    ""
+                };
+                let mut synced_meta = sync_selected_meta(&mut writer, &db, &mut conn, true).await?;
+
+                match subcmd.as_str() {
+                    "FETCH" => {
+                        if conn.state != ImapState::Selected {
+                            write_no(&mut writer, &tag, "No mailbox selected").await?;
+                            continue;
+                        }
+                        handle_fetch(&mut writer, &db, &client, &session, &broadcaster, &conn, &tag, subargs, true, synced_meta.take()).await?;
+                    }
+                    "SEARCH" => {
+                        if conn.state != ImapState::Selected {
+                            write_no(&mut writer, &tag, "No mailbox selected").await?;
+                            continue;
+                        }
+                        let folder = conn.selected_folder.as_deref().unwrap_or("inbox");
+                        let criteria_upper = subargs.trim().to_ascii_uppercase();
+                        let Ok(criteria) = strip_search_charset(&criteria_upper) else {
+                            write_no(&mut writer, &tag, "[BADCHARSET (US-ASCII UTF-8)] Unsupported charset").await?;
+                            continue;
+                        };
+                        let messages = if search_needs_body(criteria) {
+                            db.list_cached_messages(folder).unwrap_or_default()
+                        } else {
+                            synced_meta
+                                .take()
+                                .unwrap_or_else(|| db.list_cached_message_meta(folder).unwrap_or_default())
+                        };
+                        let folder_keywords = db.folder_keywords(folder).unwrap_or_default();
+                        let view = MailboxView::new(&conn.uids, &messages);
+                        let mut unsupported = None;
+                        let uids: std::result::Result<Vec<String>, SearchTooDeep> = view.iter()
+                            .filter_map(|(seq, m)| match search_matches_noting(
+                                m,
+                                view.position(seq),
+                                folder_keywords.get(&m.aster_id).map(Vec::as_slice).unwrap_or(&[]),
+                                criteria,
+                                &mut unsupported,
+                            ) {
+                                Ok(true) => Some(Ok(m.imap_uid.to_string())),
+                                Ok(false) => None,
+                                Err(e) => Some(Err(e)),
+                            })
+                            .collect();
+                        let Ok(uids) = uids else {
+                            write_bad(&mut writer, &tag, "SEARCH query nested too deeply").await?;
+                            continue;
+                        };
+                        if let Some(criterion) = unsupported {
+                            tracing::warn!("unsupported SEARCH criterion {}", criterion);
+                        }
+                        writer.write_all(search_response(&uids).as_bytes()).await?;
+                        write_ok(&mut writer, &tag, "UID SEARCH completed").await?;
+                    }
+                    "STORE" => {
+                        if conn.state != ImapState::Selected {
+                            write_no(&mut writer, &tag, "No mailbox selected").await?;
+                            continue;
+                        }
+                        if conn.read_only {
+                            write_no(&mut writer, &tag, "[READ-ONLY] Mailbox is read-only").await?;
+                            continue;
+                        }
+                        let set_end = subargs.find(' ').unwrap_or(subargs.len());
+                        let uid_set_spec = &subargs[..set_end];
+                        let op_and_flags = subargs[set_end..].trim();
+                        let folder = conn.selected_folder.as_deref().unwrap_or("inbox").to_string();
+                        let messages = synced_meta
+                            .take()
+                            .unwrap_or_else(|| db.list_cached_message_meta(&folder).unwrap_or_default());
+                        let view = MailboxView::new(&conn.uids, &messages);
+                        let uids = parse_set(uid_set_spec, view.max_uid);
+                        // Routed like STORE: an X-GM-LABELS item fell through
+                        // to the flag code, which cleared every flag of the
+                        // message and pushed "unread" to the server.
+                        let upper_store = op_and_flags.to_ascii_uppercase();
+                        if upper_store.contains("X-GM-LABELS") {
+                            for uid in &uids {
+                                if let Some((seq, m)) = view.by_uid(*uid) {
+                                    ack_gm_labels_store(&mut writer, m, seq, Some(*uid), &upper_store, subargs)
+                                        .await?;
+                                }
+                            }
+                            write_ok(&mut writer, &tag, "UID STORE completed").await?;
+                            continue;
+                        }
+                        if !is_store_flags_item(op_and_flags) {
+                            write_bad(&mut writer, &tag, "Unsupported STORE item").await?;
+                            continue;
+                        }
+                        let (op, flag_mask, silent) = parse_store_flags(op_and_flags);
+                        let store_keywords = parse_store_keywords(op_and_flags);
+                        let stored_ids: Vec<String> = uids
+                            .iter()
+                            .filter_map(|uid| view.by_uid(*uid).map(|(_, m)| m.aster_id.clone()))
+                            .collect();
+                        let tag_store =
+                            store_tag_keywords(&db, &client, &session, &stored_ids, op, store_keywords.as_deref())
+                                .await;
+                        let folder_keywords = db.folder_keywords(&folder).unwrap_or_default();
+                        let (seen_changes, star_changes, stored_rows) = db.write_batch(|batch| {
+                            let mut seen_changes: Vec<(String, bool)> = Vec::new();
+                            let mut star_changes: Vec<(String, bool)> = Vec::new();
+                            let mut stored_rows: Vec<(usize, u32, String, u32)> = Vec::new();
+                            for uid in &uids {
+                                if let Some((seq, m)) = view.by_uid(*uid) {
+                                    let old_flags = m.flags as u32;
+                                    let wanted_flags = apply_flags(old_flags, op, flag_mask);
+                                    let new_flags = if batch
+                                        .update_message_flags(m.imap_uid as i64, &folder, wanted_flags as i64)
+                                        .is_ok()
+                                    {
+                                        wanted_flags
+                                    } else {
+                                        old_flags
+                                    };
+                                    store_message_keywords(
+                                        batch,
+                                        &m.aster_id,
+                                        folder_keywords.get(&m.aster_id).map(Vec::as_slice).unwrap_or(&[]),
+                                        op,
+                                        store_keywords.as_deref(),
+                                        &tag_store.label_keywords,
+                                    );
+                                    if (old_flags & 1) != (new_flags & 1) {
+                                        seen_changes.push((m.aster_id.clone(), (new_flags & 1) != 0));
+                                    }
+                                    if (old_flags & 4) != (new_flags & 4) {
+                                        star_changes.push((m.aster_id.clone(), (new_flags & 4) != 0));
+                                    }
+                                    stored_rows.push((seq, *uid, m.aster_id.clone(), new_flags));
+                                }
+                            }
+                            (seen_changes, star_changes, stored_rows)
+                        });
+                        if !silent {
+                            let stored_keywords = db.folder_keywords(&folder).unwrap_or_default();
+                            let mut untagged = String::new();
+                            for (seq, uid, aster_id, new_flags) in &stored_rows {
+                                let keywords =
+                                    stored_keywords.get(aster_id).map(Vec::as_slice).unwrap_or(&[]);
+                                untagged.push_str(&format!(
+                                    "* {} FETCH (UID {} FLAGS ({}))\r\n",
+                                    seq,
+                                    uid,
+                                    flags_to_str(*new_flags, keywords)
+                                ));
+                            }
+                            writer.write_all(untagged.as_bytes()).await?;
+                        }
+                        push_read_status(&db, &client, &session, seen_changes);
+                        push_star_status(&db, &client, &session, star_changes);
+                        match tag_store.failure {
+                            Some(text) => write_no(&mut writer, &tag, text).await?,
+                            None => write_ok(&mut writer, &tag, "UID STORE completed").await?,
+                        }
+                    }
+                    "EXPUNGE" => {
+                        if conn.state != ImapState::Selected {
+                            write_no(&mut writer, &tag, "No mailbox selected").await?;
+                            continue;
+                        }
+                        if conn.read_only {
+                            write_no(&mut writer, &tag, "[READ-ONLY] Mailbox is read-only").await?;
+                            continue;
+                        }
+                        let folder = conn.selected_folder.clone().unwrap_or_else(|| "inbox".to_string());
+                        let uid_set_spec = subargs.trim();
+                        let messages = synced_meta
+                            .take()
+                            .unwrap_or_else(|| db.list_cached_message_meta(&folder).unwrap_or_default());
+                        let view = MailboxView::new(&conn.uids, &messages);
+                        let targets: Vec<(u32, String)> = view.iter()
+                            .filter(|(_, m)| m.flags & 8 != 0)
+                            .filter(|(_, m)| uid_set_spec.is_empty() || sequence_set_contains(uid_set_spec, m.imap_uid, view.max_uid))
+                            .map(|(_, m)| (m.imap_uid, m.aster_id.clone()))
+                            .collect();
+                        expunge_targets(&mut writer, &db, &client, &session, &mut conn, &folder, targets).await?;
+                        write_ok(&mut writer, &tag, "UID EXPUNGE completed").await?;
+                    }
+                    "COPY" | "MOVE" => {
+                        if conn.state != ImapState::Selected {
+                            write_no(&mut writer, &tag, "No mailbox selected").await?;
+                            continue;
+                        }
+                        handle_copy_move(
+                            &mut writer,
+                            &db,
+                            &client,
+                            &session,
+                            &broadcaster,
+                            &mut conn,
+                            &tag,
+                            subargs,
+                            true,
+                            subcmd == "MOVE",
+                        )
+                        .await?;
+                    }
+                    _ => {
+                        write_bad(&mut writer, &tag, "Unknown UID subcommand").await?;
+                    }
+                }
+            }
+            "SEARCH" => {
+                require_selected!(conn, writer, tag);
+                let folder = conn.selected_folder.as_deref().unwrap_or("inbox");
+                let criteria_upper = args.trim().to_ascii_uppercase();
+                let Ok(criteria) = strip_search_charset(&criteria_upper) else {
+                    write_no(&mut writer, &tag, "[BADCHARSET (US-ASCII UTF-8)] Unsupported charset").await?;
+                    continue;
+                };
+                let messages = if search_needs_body(criteria) {
+                    db.list_cached_messages(folder).unwrap_or_default()
+                } else {
+                    db.list_cached_message_meta(folder).unwrap_or_default()
+                };
+                let folder_keywords = db.folder_keywords(folder).unwrap_or_default();
+                let view = MailboxView::new(&conn.uids, &messages);
+                let mut unsupported = None;
+                let matched: std::result::Result<Vec<String>, SearchTooDeep> = view.iter()
+                    .filter_map(|(seq, m)| match search_matches_noting(
+                        m,
+                        view.position(seq),
+                        folder_keywords.get(&m.aster_id).map(Vec::as_slice).unwrap_or(&[]),
+                        criteria,
+                        &mut unsupported,
+                    ) {
+                        Ok(true) => Some(Ok(seq.to_string())),
+                        Ok(false) => None,
+                        Err(e) => Some(Err(e)),
+                    })
+                    .collect();
+                let Ok(matched) = matched else {
+                    write_bad(&mut writer, &tag, "SEARCH query nested too deeply").await?;
+                    continue;
+                };
+                if let Some(criterion) = unsupported {
+                    tracing::warn!("unsupported SEARCH criterion {}", criterion);
+                }
+                writer.write_all(search_response(&matched).as_bytes()).await?;
+                write_ok(&mut writer, &tag, "SEARCH completed").await?;
+            }
+            "STORE" => {
+                require_selected!(conn, writer, tag);
+                if conn.read_only {
+                    write_no(&mut writer, &tag, "[READ-ONLY] Mailbox is read-only").await?;
+                    continue;
+                }
+                let store_args = parts.get(2).copied().unwrap_or("");
+                let set_end = store_args.find(' ').unwrap_or(store_args.len());
+                let set_part = &store_args[..set_end];
+                let op_and_flags = store_args[set_end..].trim();
+                let upper_store = op_and_flags.to_ascii_uppercase();
+                let is_gm_labels = upper_store.contains("X-GM-LABELS");
+                let folder = conn.selected_folder.clone().unwrap_or_default();
+                let messages = db.list_cached_message_meta(&folder).unwrap_or_default();
+                let view = MailboxView::new(&conn.uids, &messages);
+                let seqs = parse_set(set_part, view.len());
+                let mut store_failure: Option<&'static str> = None;
+                if is_gm_labels {
+                    for s in &seqs {
+                        if let Some(m) = view.by_seq(*s) {
+                            ack_gm_labels_store(&mut writer, m, *s as usize, None, &upper_store, store_args)
+                                .await?;
+                        }
+                    }
+                } else if !is_store_flags_item(op_and_flags) {
+                    write_bad(&mut writer, &tag, "Unsupported STORE item").await?;
+                    continue;
+                } else {
+                    let (op, flag_mask, silent) = parse_store_flags(op_and_flags);
+                    let store_keywords = parse_store_keywords(op_and_flags);
+                    let stored_ids: Vec<String> = seqs
+                        .iter()
+                        .filter_map(|s| view.by_seq(*s).map(|m| m.aster_id.clone()))
+                        .collect();
+                    let tag_store =
+                        store_tag_keywords(&db, &client, &session, &stored_ids, op, store_keywords.as_deref())
+                            .await;
+                    store_failure = tag_store.failure;
+                    let folder_keywords = db.folder_keywords(&folder).unwrap_or_default();
+                    let (seen_changes, star_changes, stored_rows) = db.write_batch(|batch| {
+                        let mut seen_changes: Vec<(String, bool)> = Vec::new();
+                        let mut star_changes: Vec<(String, bool)> = Vec::new();
+                        let mut stored_rows: Vec<(u32, String, u32)> = Vec::new();
+                        for s in &seqs {
+                            if let Some(m) = view.by_seq(*s) {
+                                let old_flags = m.flags as u32;
+                                let wanted_flags = apply_flags(old_flags, op, flag_mask);
+                                let new_flags = if batch
+                                    .update_message_flags(m.imap_uid as i64, &folder, wanted_flags as i64)
+                                    .is_ok()
+                                {
+                                    wanted_flags
+                                } else {
+                                    old_flags
+                                };
+                                store_message_keywords(
+                                    batch,
+                                    &m.aster_id,
+                                    folder_keywords.get(&m.aster_id).map(Vec::as_slice).unwrap_or(&[]),
+                                    op,
+                                    store_keywords.as_deref(),
+                                    &tag_store.label_keywords,
+                                );
+                                if (old_flags & 1) != (new_flags & 1) {
+                                    seen_changes.push((m.aster_id.clone(), (new_flags & 1) != 0));
+                                }
+                                if (old_flags & 4) != (new_flags & 4) {
+                                    star_changes.push((m.aster_id.clone(), (new_flags & 4) != 0));
+                                }
+                                stored_rows.push((*s, m.aster_id.clone(), new_flags));
+                            }
+                        }
+                        (seen_changes, star_changes, stored_rows)
+                    });
+                    if !silent {
+                        let stored_keywords = db.folder_keywords(&folder).unwrap_or_default();
+                        let mut untagged = String::new();
+                        for (s, aster_id, new_flags) in &stored_rows {
+                            let keywords = stored_keywords.get(aster_id).map(Vec::as_slice).unwrap_or(&[]);
+                            untagged.push_str(&format!("* {} FETCH (FLAGS ({}))\r\n", s, flags_to_str(*new_flags, keywords)));
+                        }
+                        writer.write_all(untagged.as_bytes()).await?;
+                    }
+                    push_read_status(&db, &client, &session, seen_changes);
+                    push_star_status(&db, &client, &session, star_changes);
+                }
+                match store_failure {
+                    Some(text) => write_no(&mut writer, &tag, text).await?,
+                    None => write_ok(&mut writer, &tag, "STORE completed").await?,
+                }
+            }
+            "EXPUNGE" => {
+                require_selected!(conn, writer, tag);
+                if conn.read_only {
+                    write_no(&mut writer, &tag, "[READ-ONLY] Mailbox is read-only").await?;
+                    continue;
+                }
+                let synced_meta = sync_selected_meta(&mut writer, &db, &mut conn, true).await?;
+                let folder = conn.selected_folder.clone().unwrap_or_else(|| "inbox".to_string());
+                let messages = synced_meta
+                    .unwrap_or_else(|| db.list_cached_message_meta(&folder).unwrap_or_default());
+                let targets: Vec<(u32, String)> = messages.iter()
+                    .filter(|m| m.flags & 8 != 0)
+                    .map(|m| (m.imap_uid, m.aster_id.clone()))
+                    .collect();
+                expunge_targets(&mut writer, &db, &client, &session, &mut conn, &folder, targets).await?;
+                write_ok(&mut writer, &tag, "EXPUNGE completed").await?;
+            }
+            "COPY" | "MOVE" => {
+                require_selected!(conn, writer, tag);
+                handle_copy_move(
+                    &mut writer,
+                    &db,
+                    &client,
+                    &session,
+                    &broadcaster,
+                    &mut conn,
+                    &tag,
+                    &args,
+                    false,
+                    command.eq_ignore_ascii_case("MOVE"),
+                )
+                .await?;
+            }
+            "IDLE" => {
+                require_auth!(conn, writer, tag);
+                writer.write_all(b"+ idling\r\n").await?;
+
+                let mut idle_flags: std::collections::HashMap<u32, i64> = std::collections::HashMap::new();
+                if let Some(meta) = conn
+                    .selected_folder
+                    .as_deref()
+                    .and_then(|f| db.list_cached_message_meta(f).ok())
+                {
+                    let current: Vec<u32> = meta.iter().map(|m| m.imap_uid).collect();
+                    report_mailbox_changes(&mut writer, &mut conn, &current, true).await?;
+                    idle_flags = meta.iter().map(|m| (m.imap_uid, m.flags)).collect();
+                }
+
+                let mut rx = broadcaster.subscribe();
+                let mut keepalive = tokio::time::interval(
+                    std::time::Duration::from_secs(IDLE_KEEPALIVE_SECS),
+                );
+                keepalive.tick().await;
+
+                let mut buf: Vec<u8> = Vec::with_capacity(64);
+                let mut terminated = false;
+                let mut disconnected = false;
+
+                loop {
+                    tokio::select! {
+                        biased;
+                        read_res = reader.read_until(b'\n', &mut buf) => {
+                            match read_res {
+                                Ok(0) => {
+                                    disconnected = true;
+                                    break;
+                                }
+                                Ok(_) => {
+                                    if buf.len() > 128 {
+                                        disconnected = true;
+                                        break;
+                                    }
+                                    let s = String::from_utf8_lossy(&buf);
+                                    let t = s.trim_end_matches(['\r', '\n']);
+                                    if t.eq_ignore_ascii_case("DONE") {
+                                        terminated = true;
+                                        buf.clear();
+                                        break;
+                                    }
+                                    buf.clear();
+                                }
+                                Err(_) => {
+                                    disconnected = true;
+                                    break;
+                                }
+                            }
+                        }
+                        change = rx.recv() => {
+                            match change {
+                                Ok(state_change) if !state_change.changed.contains_key("Email") => continue,
+                                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                                Err(broadcast::error::RecvError::Closed) => {
+                                    rx = broadcaster.subscribe();
+                                    continue;
+                                }
+                            }
+                            let folder = match conn.selected_folder.as_deref() {
+                                Some(f) => f.to_string(),
+                                None => continue,
+                            };
+                            let Ok(current_meta) = db.list_cached_message_meta(&folder) else {
+                                continue;
+                            };
+                            let keywords_by_uid: std::collections::HashMap<u32, Vec<String>> = {
+                                let by_id = db.folder_keywords(&folder).unwrap_or_default();
+                                current_meta
+                                    .iter()
+                                    .filter_map(|m| by_id.get(&m.aster_id).map(|k| (m.imap_uid, k.clone())))
+                                    .collect()
+                            };
+                            let current: Vec<u32> = current_meta.iter().map(|m| m.imap_uid).collect();
+                            report_mailbox_changes(&mut writer, &mut conn, &current, true).await?;
+                            let mut seq_by_uid: Option<std::collections::HashMap<u32, usize>> = None;
+                            for m in &current_meta {
+                                if idle_flags.get(&m.imap_uid).is_none_or(|old| *old == m.flags) {
+                                    continue;
+                                }
+                                let seq_by_uid = seq_by_uid.get_or_insert_with(|| {
+                                    let mut map = std::collections::HashMap::with_capacity(conn.uids.len());
+                                    for (i, uid) in conn.uids.iter().enumerate() {
+                                        map.entry(*uid).or_insert(i);
+                                    }
+                                    map
+                                });
+                                let Some(&seq) = seq_by_uid.get(&m.imap_uid) else {
+                                    continue;
+                                };
+                                writer
+                                    .write_all(
+                                        format!(
+                                            "* {} FETCH (UID {} FLAGS ({}))\r\n",
+                                            seq + 1,
+                                            m.imap_uid,
+                                            flags_to_str(
+                                                m.flags as u32,
+                                                keywords_by_uid.get(&m.imap_uid).map(Vec::as_slice).unwrap_or(&[]),
+                                            )
+                                        )
+                                        .as_bytes(),
+                                    )
+                                    .await?;
+                            }
+                            idle_flags = current_meta.iter().map(|m| (m.imap_uid, m.flags)).collect();
+                        }
+                        _ = keepalive.tick() => {
+                            writer.write_all(b"* OK Still here\r\n").await?;
+                        }
+                    }
+                }
+
+                if disconnected {
+                    break;
+                }
+                if terminated {
+                    write_ok(&mut writer, &tag, "IDLE terminated").await?;
+                } else {
+                    write_bad(&mut writer, &tag, "IDLE aborted").await?;
+                }
+            }
+            "CLOSE" => {
+                require_selected!(conn, writer, tag);
+                let folder = conn.selected_folder.clone().unwrap_or_default();
+                if !conn.read_only {
+                    let messages = db.list_cached_message_meta(&folder).unwrap_or_default();
+                    let targets: Vec<(u32, String)> = messages.iter()
+                        .filter(|m| m.flags & 8 != 0)
+                        .map(|m| (m.imap_uid, m.aster_id.clone()))
+                        .collect();
+                    expunge_targets_silent(&db, &client, &session, &folder, &conn.copied_out, targets).await;
+                }
+                conn.state = ImapState::Authenticated;
+                conn.selected_mailbox = None;
+                conn.selected_folder = None;
+                conn.uids.clear();
+                conn.read_only = false;
+                write_ok(&mut writer, &tag, "CLOSE completed").await?;
+            }
+            "UNSELECT" => {
+                require_selected!(conn, writer, tag);
+                conn.state = ImapState::Authenticated;
+                conn.selected_mailbox = None;
+                conn.selected_folder = None;
+                conn.uids.clear();
+                write_ok(&mut writer, &tag, "UNSELECT completed").await?;
+            }
+            "STATUS" => {
+                require_auth!(conn, writer, tag);
+                let mailbox = parse_imap_atom_or_quoted(&args).0;
+                let entry = match resolve_mailbox(&db, &mailbox) {
+                    Some(entry) => entry,
+                    None => {
+                        write_no(&mut writer, &tag, "[NONEXISTENT] No such mailbox").await?;
+                        continue;
+                    }
+                };
+                let aster_folder = entry.label.as_str();
+                let validity = match uid_validity(&db) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!("STATUS could not read UIDVALIDITY: {}", e);
+                        write_no(&mut writer, &tag, "[UNAVAILABLE] mailbox state is unavailable, try again").await?;
+                        continue;
+                    }
+                };
+                let count = db.count_cached_messages(aster_folder).unwrap_or(0);
+                let uid_next = db.uid_next(aster_folder).unwrap_or(1);
+                let unseen = db.count_unread_messages(aster_folder).unwrap_or(0);
+                writer
+                    .write_all(
+                        format!(
+                            "* STATUS {} (MESSAGES {} RECENT 0 UNSEEN {} UIDVALIDITY {} UIDNEXT {})\r\n",
+                            quote_imap_string(&mailbox),
+                            count,
+                            unseen,
+                            validity,
+                            uid_next
+                        )
+                        .as_bytes(),
+                    )
+                    .await?;
+                write_ok(&mut writer, &tag, "STATUS completed").await?;
+            }
+            "APPEND" => {
+                require_auth!(conn, writer, tag);
+                let command = crate::imap::append::parse_append_command(&args);
+                let target_folder: Option<String> = command
+                    .as_ref()
+                    .and_then(|cmd| resolve_mailbox(&db, &cmd.mailbox))
+                    .map(|entry| entry.label);
+                match command {
+                    Some(cmd) if cmd.literal_len > MAX_APPEND_BYTES => {
+                        if cmd.non_sync {
+                            if cmd.literal_len > MAX_DRAINABLE_APPEND_BYTES {
+                                write_no(&mut writer, &tag, "[TOOBIG] APPEND literal too large")
+                                    .await?;
+                                break;
+                            }
+                            let mut sink = tokio::io::sink();
+                            let mut limited =
+                                tokio::io::AsyncReadExt::take(&mut reader, cmd.literal_len as u64);
+                            if tokio::io::copy(&mut limited, &mut sink).await.is_err() {
+                                break;
+                            }
+                            let mut trailer = [0u8; 2];
+                            let _ = tokio::io::AsyncReadExt::read_exact(&mut reader, &mut trailer)
+                                .await;
+                        }
+                        write_no(&mut writer, &tag, "[TOOBIG] APPEND literal too large").await?;
+                    }
+                    Some(cmd) => {
+                        use tokio::io::AsyncReadExt;
+                        if !cmd.non_sync {
+                            writer.write_all(b"+ Ready for literal data\r\n").await?;
+                            writer.flush().await?;
+                        }
+                        let mut buf = vec![0u8; cmd.literal_len];
+                        if let Err(e) = reader.read_exact(&mut buf).await {
+                            tracing::warn!("APPEND read failed: {}", e);
+                            write_bad(&mut writer, &tag, "APPEND read failed").await?;
+                            continue;
+                        }
+                        let mut trailer = [0u8; 2];
+                        let _ = reader.read_exact(&mut trailer).await;
+                        match target_folder.as_deref() {
+                            None => {
+                                write_no(&mut writer, &tag, "[TRYCREATE] No such mailbox").await?;
+                            }
+                            Some("drafts") => {
+                                let draft_db = db.clone();
+                                let draft_client = client.clone();
+                                let draft_session = session.clone();
+                                let draft_body = std::mem::take(&mut buf);
+                                let draft_outcome = run_with_keepalive(&mut writer, async move {
+                                    append_draft(
+                                        &draft_db,
+                                        &draft_client,
+                                        &draft_session,
+                                        &draft_body,
+                                    )
+                                    .await
+                                })
+                                .await;
+                                match draft_outcome {
+                                    Some(Ok((uid, draft_id))) => {
+                                        let _ = db.jmap_record_sync_batch("Email", &[draft_id.as_str()]);
+                                        let email_state = db.jmap_state_get("Email").unwrap_or(0);
+                                        let mailbox_state = db.jmap_state_bump("Mailbox").unwrap_or(0);
+                                        let thread_state = db.jmap_state_bump("Thread").unwrap_or(0);
+                                        let mut changed = std::collections::HashMap::new();
+                                        changed.insert("Email".to_string(), email_state.to_string());
+                                        changed.insert("Mailbox".to_string(), mailbox_state.to_string());
+                                        changed.insert("Thread".to_string(), thread_state.to_string());
+                                        let _ = broadcaster.send(StateChange { changed });
+                                        if conn.selected_folder.as_deref() == Some("drafts") {
+                                            sync_selected(&mut writer, &db, &mut conn, true).await?;
+                                        }
+                                        write_ok(
+                                            &mut writer,
+                                            &tag,
+                                            &append_completed(&db, uid),
+                                        )
+                                        .await?;
+                                    }
+                                    Some(Err(e)) => {
+                                        tracing::warn!("APPEND to Drafts failed: {}", e);
+                                        write_no(
+                                            &mut writer,
+                                            &tag,
+                                            "[SERVERBUG] could not save the draft to your Aster account",
+                                        )
+                                        .await?;
+                                    }
+                                    None => {
+                                        write_no(
+                                            &mut writer,
+                                            &tag,
+                                            "[UNAVAILABLE] saving the draft is taking too long, try again",
+                                        )
+                                        .await?;
+                                    }
+                                }
+                            }
+                            Some(folder) => {
+                                let existing = if folder == "sent" {
+                                    find_appended_sent_copy(&db, &buf)
+                                } else {
+                                    None
+                                };
+                                if existing.is_none()
+                                    && folder == "sent"
+                                    && crate::imap::append::was_recently_sent(&buf)
+                                {
+                                    crate::sync::poller::try_kick_sync();
+                                    write_ok(&mut writer, &tag, "APPEND completed").await?;
+                                    continue;
+                                }
+                                if let Some(uid) = existing {
+                                    let sent_copy = if cmd.keywords.is_empty() {
+                                        None
+                                    } else {
+                                        db.list_cached_message_meta("sent")
+                                            .ok()
+                                            .and_then(|all| all.into_iter().find(|m| m.imap_uid == uid))
+                                            .map(|m| m.aster_id)
+                                    };
+                                    if let Some(aster_id) = sent_copy {
+                                        let failure = store_append_keywords(
+                                            &db,
+                                            &client,
+                                            &session,
+                                            &aster_id,
+                                            &cmd.keywords,
+                                        )
+                                        .await;
+                                        let _ = db.jmap_record_sync_batch("Email", &[aster_id.as_str()]);
+                                        let mut changed = std::collections::HashMap::new();
+                                        changed.insert(
+                                            "Email".to_string(),
+                                            db.jmap_state_get("Email").unwrap_or(0).to_string(),
+                                        );
+                                        let _ = broadcaster.send(StateChange { changed });
+                                        if let Some(text) = failure {
+                                            tracing::warn!(
+                                                "APPEND to {} could not label the existing message: {}",
+                                                folder,
+                                                response_text(&text)
+                                            );
+                                            writer
+                                                .write_all(format!("* NO {}\r\n", response_text(&text)).as_bytes())
+                                                .await?;
+                                        }
+                                    }
+                                    write_ok(
+                                        &mut writer,
+                                        &tag,
+                                        &append_completed(&db, uid),
+                                    )
+                                    .await?;
+                                    continue;
+                                }
+                                let import_db = db.clone();
+                                let import_client = client.clone();
+                                let import_session = session.clone();
+                                let import_folder = folder.to_string();
+                                let import_flags = cmd.flags.clone();
+                                let import_date = cmd.internal_date;
+                                let import_keywords = cmd.keywords.clone();
+                                let import_body = std::mem::take(&mut buf);
+                                let imported = run_with_keepalive(&mut writer, async move {
+                                    let outcome = crate::imap::append::append_imported_message(
+                                        &import_db,
+                                        &import_client,
+                                        &import_session,
+                                        &import_folder,
+                                        &import_body,
+                                        &import_flags,
+                                        import_date,
+                                    )
+                                    .await;
+                                    let keyword_failure = match &outcome {
+                                        Ok(crate::imap::append::AppendOutcome::Stored {
+                                            aster_id,
+                                            ..
+                                        })
+                                        | Ok(crate::imap::append::AppendOutcome::Duplicate {
+                                            aster_id: Some(aster_id),
+                                            ..
+                                        }) => {
+                                            store_append_keywords(
+                                                &import_db,
+                                                &import_client,
+                                                &import_session,
+                                                aster_id,
+                                                &import_keywords,
+                                            )
+                                            .await
+                                        }
+                                        _ => None,
+                                    };
+                                    (outcome, keyword_failure)
+                                })
+                                .await;
+                                let (outcome, keyword_failure) = match imported {
+                                    Some((outcome, keyword_failure)) => (Some(outcome), keyword_failure),
+                                    None => (None, None),
+                                };
+                                match outcome {
+                                    Some(Ok(crate::imap::append::AppendOutcome::Stored {
+                                        uid,
+                                        aster_id,
+                                    })) => {
+                                        let _ = db
+                                            .jmap_record_sync_batch("Email", &[aster_id.as_str()]);
+                                        let email_state = db.jmap_state_get("Email").unwrap_or(0);
+                                        let mailbox_state = db.jmap_state_bump("Mailbox").unwrap_or(0);
+                                        let thread_state = db.jmap_state_bump("Thread").unwrap_or(0);
+                                        let mut changed = std::collections::HashMap::new();
+                                        changed.insert("Email".to_string(), email_state.to_string());
+                                        changed.insert("Mailbox".to_string(), mailbox_state.to_string());
+                                        changed.insert("Thread".to_string(), thread_state.to_string());
+                                        let _ = broadcaster.send(StateChange { changed });
+                                        if conn.selected_folder.as_deref() == Some(folder) {
+                                            sync_selected(&mut writer, &db, &mut conn, true).await?;
+                                        }
+                                        if let Some(text) = keyword_failure {
+                                            tracing::warn!(
+                                                "APPEND to {} stored {} without some keywords: {}",
+                                                folder,
+                                                aster_id,
+                                                response_text(&text)
+                                            );
+                                            writer
+                                                .write_all(format!("* NO {}\r\n", response_text(&text)).as_bytes())
+                                                .await?;
+                                        }
+                                        write_ok(
+                                            &mut writer,
+                                            &tag,
+                                            &append_completed(&db, uid),
+                                        )
+                                        .await?;
+                                    }
+                                    Some(Ok(crate::imap::append::AppendOutcome::Duplicate {
+                                        uid,
+                                        aster_id,
+                                    })) => {
+                                        crate::sync::poller::try_kick_sync();
+                                        match aster_id.as_deref() {
+                                            Some(aster_id) if !cmd.keywords.is_empty() => {
+                                                let _ = db.jmap_record_sync_batch("Email", &[aster_id]);
+                                                let mut changed = std::collections::HashMap::new();
+                                                changed.insert(
+                                                    "Email".to_string(),
+                                                    db.jmap_state_get("Email").unwrap_or(0).to_string(),
+                                                );
+                                                let _ = broadcaster.send(StateChange { changed });
+                                            }
+                                            None if !cmd.keywords.is_empty() => tracing::warn!(
+                                                "APPEND to {} repeated a message that is not cached yet, its keywords were not applied",
+                                                folder
+                                            ),
+                                            _ => {}
+                                        }
+                                        if let Some(text) = keyword_failure {
+                                            tracing::warn!(
+                                                "APPEND to {} could not label the existing message: {}",
+                                                folder,
+                                                response_text(&text)
+                                            );
+                                            writer
+                                                .write_all(format!("* NO {}\r\n", response_text(&text)).as_bytes())
+                                                .await?;
+                                        }
+                                        match uid {
+                                            Some(uid) => {
+                                                write_ok(
+                                                    &mut writer,
+                                                    &tag,
+                                                    &append_completed(&db, uid),
+                                                )
+                                                .await?
+                                            }
+                                            None => {
+                                                write_ok(&mut writer, &tag, "APPEND completed")
+                                                    .await?
+                                            }
+                                        }
+                                    }
+                                    Some(Err(e)) => {
+                                        tracing::warn!("APPEND to {} failed: {}", folder, e);
+                                        write_no(
+                                            &mut writer,
+                                            &tag,
+                                            &format!(
+                                                "[{}] {}",
+                                                crate::imap::append::no_response_code(&e),
+                                                e
+                                            ),
+                                        )
+                                        .await?;
+                                    }
+                                    None => {
+                                        write_no(
+                                            &mut writer,
+                                            &tag,
+                                            "[UNAVAILABLE] the import is taking too long, try again",
+                                        )
+                                        .await?;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    None => {
+                        write_bad(&mut writer, &tag, "APPEND missing literal").await?;
+                    }
+                }
+            }
+            _ => {
+                write_bad(&mut writer, &tag, "Unknown command").await?;
+            }
+        }
+    }
+
+    let closing = async {
+        let _ = writer.flush().await;
+        let _ = writer.shutdown().await;
+    };
+    match pre_auth.farewell_window() {
+        Some(window) => {
+            let _ = tokio::time::timeout(window, closing).await;
+        }
+        None => closing.await,
+    }
+
+    Ok(())
+}
+
+macro_rules! require_auth {
+    ($conn:expr, $writer:expr, $tag:expr) => {
+        if $conn.state == ImapState::NotAuthenticated {
+            write_no(&mut $writer, &$tag, "Not authenticated").await?;
+            continue;
+        }
+    };
+}
+use require_auth;
+
+macro_rules! require_selected {
+    ($conn:expr, $writer:expr, $tag:expr) => {
+        if $conn.state != ImapState::Selected {
+            write_no(&mut $writer, &$tag, "No mailbox selected").await?;
+            continue;
+        }
+    };
+}
+use require_selected;
+
+async fn delete_on_server(
+    db: &Arc<Database>,
+    client: &Arc<ApiClient>,
+    session: &Arc<RwLock<Session>>,
+    folder: &str,
+    aster_id: &str,
+) -> bool {
+    let token = session.read().await.access_token.to_string();
+    if folder == "drafts" {
+        match client.delete_draft(&token, aster_id).await {
+            Ok(()) => return true,
+            Err(crate::error::BridgeError::Api(ref msg)) if msg.starts_with("404") => {}
+            Err(e) => {
+                tracing::warn!("server draft delete failed for {}: {}", aster_id, e);
+                return false;
+            }
+        }
+    }
+    match client.delete_mail_item_permanent(&token, aster_id).await {
+        Ok(()) => true,
+        Err(crate::error::BridgeError::Api(ref msg)) if msg.starts_with("404") => true,
+        Err(e) => {
+            tracing::warn!("server delete failed for {}: {}", aster_id, e);
+            let _ = db;
+            false
+        }
+    }
+}
+
+async fn expunge_on_server(
+    db: &Arc<Database>,
+    client: &Arc<ApiClient>,
+    session: &Arc<RwLock<Session>>,
+    folder: &str,
+    aster_id: &str,
+    copied_out: &std::collections::HashSet<String>,
+) -> bool {
+    if matches!(folder, "trash" | "spam" | "drafts") || copied_out.contains(aster_id) {
+        return delete_on_server(db, client, session, folder, aster_id).await;
+    }
+    let Some(flags) = move_flags_for("trash") else {
+        return false;
+    };
+    let token = session.read().await.access_token.to_string();
+    if let Some(source_token) = crate::folders::token_of_label(folder) {
+        let ids = vec![aster_id.to_string()];
+        if let Err(e) = relabel_with_backoff(client, &token, &ids, None, Some(source_token)).await {
+            tracing::warn!("server trash move failed for {}: {}", aster_id, e);
+            return false;
+        }
+    }
+    match set_flags_with_backoff(client, &token, aster_id, &flags).await {
+        Ok(()) => true,
+        Err(crate::error::BridgeError::Api(ref msg)) if msg.starts_with("404") => true,
+        Err(e) => {
+            tracing::warn!("server trash move failed for {}: {}", aster_id, e);
+            false
+        }
+    }
+}
+
+const READ_STATUS_CONCURRENCY: usize = 8;
+const READ_STATUS_RATE_LIMIT_RETRIES: u32 = 3;
+
+fn push_read_status(
+    db: &Arc<Database>,
+    client: &Arc<ApiClient>,
+    session: &Arc<RwLock<Session>>,
+    changes: Vec<(String, bool)>,
+) {
+    push_flag_status(db, client, session, changes, "is_read", 1);
+}
+
+fn push_star_status(
+    db: &Arc<Database>,
+    client: &Arc<ApiClient>,
+    session: &Arc<RwLock<Session>>,
+    changes: Vec<(String, bool)>,
+) {
+    push_flag_status(db, client, session, changes, "is_starred", 4);
+}
+
+fn push_flag_status(
+    db: &Arc<Database>,
+    client: &Arc<ApiClient>,
+    session: &Arc<RwLock<Session>>,
+    changes: Vec<(String, bool)>,
+    field: &'static str,
+    bit: i64,
+) {
+    if changes.is_empty() {
+        return;
+    }
+    if let Err(e) = db.record_pending_flag_pushes(&changes, bit) {
+        tracing::warn!("could not queue {} sync: {}", field, e);
+    }
+    let db = db.clone();
+    let client = client.clone();
+    let session = session.clone();
+    crate::shutdown::current().spawn(async move {
+        let mut wanted: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+        let mut order: Vec<String> = Vec::new();
+        for (aster_id, is_read) in changes {
+            if wanted.insert(aster_id.clone(), is_read).is_none() {
+                order.push(aster_id);
+            }
+        }
+        for is_read in [true, false] {
+            let ids: Vec<String> = order.iter().filter(|id| wanted[*id] == is_read).cloned().collect();
+            for chunk in ids.chunks(ApiClient::MAX_BULK_METADATA_ITEMS) {
+                push_read_status_chunk(
+                    &db,
+                    &client,
+                    &session,
+                    chunk.to_vec(),
+                    is_read,
+                    field,
+                    bit,
+                    READ_STATUS_RATE_LIMIT_RETRIES,
+                )
+                .await;
+            }
+        }
+    });
+}
+
+const PENDING_FLAG_PUSH_BATCH: usize = 500;
+const PENDING_FLAG_PUSH_SETTLE_MS: i64 = 120_000;
+const PENDING_FLAG_PUSH_MAX_ATTEMPTS: i64 = 20;
+
+fn flag_field(bit: i64) -> Option<&'static str> {
+    match bit {
+        1 => Some("is_read"),
+        4 => Some("is_starred"),
+        _ => None,
+    }
+}
+
+pub(crate) async fn retry_pending_flag_pushes(
+    db: &Arc<Database>,
+    client: &Arc<ApiClient>,
+    session: &Arc<RwLock<Session>>,
+) {
+    match db.drop_exhausted_flag_pushes(PENDING_FLAG_PUSH_MAX_ATTEMPTS) {
+        Ok(0) => {}
+        Ok(n) => tracing::warn!("gave up syncing {} flag changes to the server", n),
+        Err(e) => tracing::warn!("could not prune queued flag changes: {}", e),
+    }
+    let rows = match db.pending_flag_pushes(PENDING_FLAG_PUSH_SETTLE_MS, PENDING_FLAG_PUSH_BATCH) {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!("could not read queued flag changes: {}", e);
+            return;
+        }
+    };
+    let mut groups: std::collections::BTreeMap<(i64, bool), Vec<String>> = std::collections::BTreeMap::new();
+    for (aster_id, bit, value) in rows {
+        groups.entry((bit, value)).or_default().push(aster_id);
+    }
+    for ((bit, value), ids) in groups {
+        let Some(field) = flag_field(bit) else {
+            let _ = db.clear_pending_flag_pushes(&ids, bit, value);
+            continue;
+        };
+        for chunk in ids.chunks(ApiClient::MAX_BULK_METADATA_ITEMS) {
+            push_read_status_chunk(db, client, session, chunk.to_vec(), value, field, bit, 0).await;
+        }
+    }
+}
+
+fn read_status_still_wanted(db: &Database, aster_id: &str, is_read: bool, bit: i64) -> bool {
+    db.get_message_flags_by_id(aster_id)
+        .map_or(true, |flags| ((flags & bit) != 0) == is_read)
+}
+
+fn flag_push_should_retry(error: &crate::error::BridgeError) -> bool {
+    crate::imap::append::is_rate_limited(error)
+        || crate::smtp::server::is_transient_send_error(error)
+        || matches!(error, crate::error::BridgeError::Api(msg) if msg.starts_with("401"))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn push_read_status_chunk(
+    db: &Database,
+    client: &ApiClient,
+    session: &Arc<RwLock<Session>>,
+    mut ids: Vec<String>,
+    is_read: bool,
+    field: &'static str,
+    bit: i64,
+    retries: u32,
+) {
+    use futures_util::StreamExt;
+
+    let flags = serde_json::json!({ field: is_read });
+    let mut attempt = 0u32;
+    loop {
+        let (wanted, superseded): (Vec<String>, Vec<String>) =
+            ids.into_iter().partition(|id| read_status_still_wanted(db, id, is_read, bit));
+        let _ = db.clear_pending_flag_pushes(&superseded, bit, is_read);
+        ids = wanted;
+        if ids.is_empty() {
+            return;
+        }
+        let token = session.read().await.access_token.to_string();
+        match client.bulk_set_mailbox_flags(&token, &ids, &flags).await {
+            Ok(_) => {
+                let _ = db.clear_pending_flag_pushes(&ids, bit, is_read);
+                return;
+            }
+            Err(e) if crate::imap::append::is_rate_limited(&e) => {
+                if attempt >= retries {
+                    tracing::warn!("{} sync for {} messages stopped by rate limiting: {}", field, ids.len(), e);
+                    for aster_id in &ids {
+                        let _ = db.note_failed_flag_push(aster_id, bit, is_read);
+                    }
+                    return;
+                }
+                let wait = crate::imap::append::rate_limit_backoff(attempt);
+                attempt += 1;
+                tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+            }
+            Err(e) => {
+                tracing::debug!("bulk {} sync failed, sending one at a time: {}", field, e);
+                break;
+            }
+        }
+    }
+    futures_util::stream::iter(ids)
+        .for_each_concurrent(READ_STATUS_CONCURRENCY, |aster_id| async move {
+            let mut attempt = 0u32;
+            let done = std::slice::from_ref(&aster_id);
+            loop {
+                if !read_status_still_wanted(db, &aster_id, is_read, bit) {
+                    let _ = db.clear_pending_flag_pushes(done, bit, is_read);
+                    return;
+                }
+                let token = session.read().await.access_token.to_string();
+                match client
+                    .set_mailbox_flags(&token, &aster_id, serde_json::json!({ field: is_read }))
+                    .await
+                {
+                    Ok(()) => {
+                        let _ = db.clear_pending_flag_pushes(done, bit, is_read);
+                        return;
+                    }
+                    Err(crate::error::BridgeError::Api(ref msg)) if msg.starts_with("404") => {
+                        let _ = db.clear_pending_flag_pushes(done, bit, is_read);
+                        return;
+                    }
+                    Err(e) if flag_push_should_retry(&e) && attempt < retries => {
+                        let wait = crate::imap::append::rate_limit_backoff(attempt);
+                        attempt += 1;
+                        tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                    }
+                    Err(e) => {
+                        tracing::warn!("{} sync failed for {}: {}", field, aster_id, e);
+                        let _ = db.note_failed_flag_push(&aster_id, bit, is_read);
+                        return;
+                    }
+                }
+            }
+        })
+        .await;
+}
+
+async fn expunge_targets(
+    writer: &mut (impl AsyncWrite + Unpin),
+    db: &Arc<Database>,
+    client: &Arc<ApiClient>,
+    session: &Arc<RwLock<Session>>,
+    conn: &mut ImapConnection,
+    folder: &str,
+    targets: Vec<(u32, String)>,
+) -> std::io::Result<()> {
+    let mut deleted: Vec<u32> = Vec::new();
+    for (uid, aster_id) in &targets {
+        if expunge_on_server(db, client, session, folder, aster_id, &conn.copied_out).await {
+            deleted.push(*uid);
+        }
+    }
+    db.write_batch(|batch| {
+        for uid in &deleted {
+            let _ = batch.delete_message_by_uid(*uid as i64, folder);
+        }
+    });
+    for uid in deleted {
+        if let Some(seq) = conn.expunged(uid) {
+            writer.write_all(format!("* {} EXPUNGE\r\n", seq).as_bytes()).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn expunge_targets_silent(
+    db: &Arc<Database>,
+    client: &Arc<ApiClient>,
+    session: &Arc<RwLock<Session>>,
+    folder: &str,
+    copied_out: &std::collections::HashSet<String>,
+    targets: Vec<(u32, String)>,
+) {
+    let mut deleted: Vec<u32> = Vec::new();
+    for (uid, aster_id) in &targets {
+        if expunge_on_server(db, client, session, folder, aster_id, copied_out).await {
+            deleted.push(*uid);
+        }
+    }
+    db.write_batch(|batch| {
+        for uid in &deleted {
+            let _ = batch.delete_message_by_uid(*uid as i64, folder);
+        }
+    });
+}
+
+fn format_attachment_size(bytes: usize) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    let b = bytes as f64;
+    if b >= MB {
+        format!("{:.1} MB", b / MB)
+    } else if b >= KB {
+        format!("{:.1} KB", b / KB)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+fn draft_content_from_mime(raw_message: &[u8]) -> Option<crate::crypto::draft::DraftContent> {
+    use mail_parser::MessageParser;
+
+    fn addr_list(a: Option<&mail_parser::Address<'_>>) -> Vec<String> {
+        a.map(|l| {
+            l.iter()
+                .filter_map(|x| x.address().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+    }
+
+    let parsed = MessageParser::default().parse(raw_message)?;
+    let to_recipients = addr_list(parsed.to());
+    let cc_recipients = addr_list(parsed.cc());
+    let bcc_recipients = addr_list(parsed.bcc());
+    let subject = parsed.subject().unwrap_or("").to_string();
+    let message = parsed
+        .body_html(0)
+        .map(|s| s.to_string())
+        .or_else(|| parsed.body_text(0).map(|s| s.to_string()))
+        .unwrap_or_default();
+
+    let attachments: Vec<crate::crypto::draft::DraftAttachment> =
+        crate::crypto::attachment::mime_attachments(&parsed, usize::MAX)
+            .into_iter()
+            .map(|part| crate::crypto::draft::DraftAttachment {
+                id: uuid::Uuid::new_v4().to_string(),
+                name: part.name,
+                size: format_attachment_size(part.data.len()),
+                size_bytes: part.data.len() as i64,
+                mime_type: part.mime_type,
+                data_base64: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &part.data),
+                content_id: part.content_id,
+            })
+            .collect();
+
+    Some(crate::crypto::draft::DraftContent {
+        to_recipients,
+        cc_recipients,
+        bcc_recipients,
+        subject,
+        message,
+        attachments: if attachments.is_empty() {
+            None
+        } else {
+            Some(attachments)
+        },
+    })
+}
+
+fn draft_reply_parent(db: &Database, raw_message: &[u8]) -> Option<String> {
+    let headers = crate::smtp::reply_thread::ReplyHeaders::from_mime(raw_message);
+    if headers.is_empty() {
+        return None;
+    }
+    crate::smtp::reply_thread::resolve_reply(db, &headers)
+        .parent_aster_id
+        .filter(|id| uuid::Uuid::parse_str(id).is_ok())
+        .filter(|id| matches!(db.get_cached_message(id), Ok(Some(_))))
+}
+
+pub(crate) async fn append_draft(
+    db: &Arc<Database>,
+    client: &Arc<ApiClient>,
+    session: &Arc<RwLock<Session>>,
+    raw_message: &[u8],
+) -> std::result::Result<(u32, String), String> {
+    let (token, identity_key, our_email) = {
+        let s = session.read().await;
+        (
+            s.access_token.to_string(),
+            s.identity_key.clone(),
+            s.email.clone(),
+        )
+    };
+    let identity_key =
+        identity_key.ok_or_else(|| "session has no identity key for draft encryption".to_string())?;
+
+    let content = draft_content_from_mime(raw_message)
+        .ok_or_else(|| "failed to parse draft message".to_string())?;
+
+    let (encrypted_content, content_nonce) =
+        crate::crypto::draft::encrypt_draft_content(&content, &identity_key)
+            .map_err(|e| e.to_string())?;
+    let content_hash = crate::crypto::draft::draft_content_hash(&encrypted_content);
+    let attachment_count = content
+        .attachments
+        .as_ref()
+        .map(|a| a.len() as i64)
+        .unwrap_or(0);
+    let reply_to_id = draft_reply_parent(db, raw_message);
+    let body = crate::api_client::CreateDraftBody {
+        draft_type: if reply_to_id.is_some() { "reply" } else { "new" },
+        reply_to_id: reply_to_id.as_deref(),
+        encrypted_content: &encrypted_content,
+        content_nonce: &content_nonce,
+        content_hash: &content_hash,
+        size_bytes: encrypted_content.len() as i64,
+        has_attachments: attachment_count > 0,
+        attachment_count,
+    };
+    let created = client
+        .create_draft(&token, &body)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let now = chrono::Utc::now().to_rfc3339();
+    crate::sync::poller::cache_web_draft(db, &created.id, &content, &our_email, &now, created.version, reply_to_id.as_deref());
+    let uid = db.assign_uid_if_missing("drafts", &created.id)?;
+    Ok((uid, created.id))
+}
+
+fn find_appended_sent_copy(db: &Database, raw_message: &[u8]) -> Option<u32> {
+    use mail_parser::MessageParser;
+    let parsed = MessageParser::default().parse(raw_message)?;
+    let mid = parsed
+        .message_id()
+        .map(normalize_message_id)
+        .filter(|s| !s.is_empty())?;
+    let messages = db.list_cached_message_meta("sent").ok()?;
+    // The stored message's own Message-ID, not any id in its metadata:
+    // a reply lists the message it answers in `in_reply_to` and
+    // `references`, and matching those treated the original as already
+    // saved and dropped it. A shared subject is never a match either:
+    // templated mail to different recipients repeats one subject.
+    messages
+        .iter()
+        .rev()
+        .find(|m| stored_message_id(m).is_some_and(|s| s.eq_ignore_ascii_case(&mid)))
+        .map(|m| m.imap_uid)
+}
+
+pub(crate) fn normalize_message_id(raw: &str) -> String {
+    raw.trim().trim_matches(&['<', '>'][..]).trim().to_string()
+}
+
+pub(crate) fn stored_message_id(m: &CachedMessage) -> Option<String> {
+    let meta: serde_json::Value = serde_json::from_str(m.raw_headers.as_deref()?).ok()?;
+    meta.get("message_id")
+        .and_then(|v| v.as_str())
+        .map(normalize_message_id)
+        .filter(|s| !s.is_empty())
+}
+
+const APPEND_KEEPALIVE_SECS: u64 = 20;
+const APPEND_DEADLINE_SECS: u64 = 15 * 60;
+
+async fn run_with_keepalive<T>(
+    writer: &mut (impl AsyncWrite + Unpin),
+    fut: impl std::future::Future<Output = T> + Send + 'static,
+) -> Option<T>
+where
+    T: Send + 'static,
+{
+    run_with_keepalive_every(
+        writer,
+        std::time::Duration::from_secs(APPEND_KEEPALIVE_SECS),
+        std::time::Duration::from_secs(APPEND_DEADLINE_SECS),
+        fut,
+    )
+    .await
+}
+
+async fn run_with_keepalive_every<T>(
+    writer: &mut (impl AsyncWrite + Unpin),
+    every: std::time::Duration,
+    deadline: std::time::Duration,
+    fut: impl std::future::Future<Output = T> + Send + 'static,
+) -> Option<T>
+where
+    T: Send + 'static,
+{
+    let mut handle = crate::shutdown::current().spawn(fut);
+    let expires_at = tokio::time::Instant::now() + deadline;
+    let mut alive = true;
+    loop {
+        tokio::select! {
+            joined = &mut handle => {
+                return match joined {
+                    Ok(out) => out,
+                    Err(e) => {
+                        tracing::error!("APPEND worker ended without a result: {}", e);
+                        None
+                    }
+                };
+            }
+            _ = tokio::time::sleep_until(expires_at) => {
+                tracing::warn!(
+                    seconds = deadline.as_secs(),
+                    "APPEND is still running past its deadline, asking the client to retry"
+                );
+                return None;
+            }
+            _ = tokio::time::sleep(every), if alive => {
+                let sent = writer.write_all(b"* OK APPEND in progress\r\n").await.is_ok()
+                    && writer.flush().await.is_ok();
+                if !sent {
+                    alive = false;
+                }
+            }
+        }
+    }
+}
+
+async fn write_ok(
+    writer: &mut (impl AsyncWrite + Unpin),
+    tag: &str,
+    msg: &str,
+) -> std::io::Result<()> {
+    writer
+        .write_all(format!("{} OK {}\r\n", tag, response_text(msg)).as_bytes())
+        .await
+}
+
+async fn write_no(
+    writer: &mut (impl AsyncWrite + Unpin),
+    tag: &str,
+    msg: &str,
+) -> std::io::Result<()> {
+    writer
+        .write_all(format!("{} NO {}\r\n", tag, response_text(msg)).as_bytes())
+        .await
+}
+
+async fn write_bad(
+    writer: &mut (impl AsyncWrite + Unpin),
+    tag: &str,
+    msg: &str,
+) -> std::io::Result<()> {
+    writer
+        .write_all(format!("{} BAD {}\r\n", tag, response_text(msg)).as_bytes())
+        .await
+}
+
+async fn handle_login(
+    writer: &mut (impl AsyncWrite + Unpin),
+    session: &Arc<RwLock<Session>>,
+    passwords: &AppPasswords,
+    conn: &mut ImapConnection,
+    tag: &str,
+    args: &str,
+) -> std::io::Result<bool> {
+    if conn.state != ImapState::NotAuthenticated {
+        write_bad(writer, tag, "already authenticated").await?;
+        return Ok(false);
+    }
+
+    let Some((username, password)) = parse_login_args(args) else {
+        write_bad(writer, tag, "LOGIN requires user and password").await?;
+        return Ok(false);
+    };
+    let (username, password) = (username.as_str(), password.as_str());
+
+    if !session.read().await.accepts_login_name(username) {
+        write_no(writer, tag, &format!("[AUTHENTICATIONFAILED] {}", crate::sign_in_notice::BAD_CREDENTIALS_TEXT)).await?;
+        return Ok(false);
+    }
+
+    if let Some(pw_id) = passwords.verify_and_id_cached(username, password).await {
+        conn.state = ImapState::Authenticated;
+        passwords.record_use(&pw_id, Some("imap"));
+        crate::sign_in_notice::record_signed_in("imap");
+        crate::sync::poller::try_kick_sync();
+        write_ok(writer, tag, "LOGIN completed").await?;
+        Ok(true)
+    } else {
+        write_no(writer, tag, &format!("[AUTHENTICATIONFAILED] {}", crate::sign_in_notice::BAD_CREDENTIALS_TEXT)).await?;
+        Ok(false)
+    }
+}
+
+fn parse_login_args(args: &str) -> Option<(String, String)> {
+    let args = args.trim_start();
+    let (username, rest) = if args.starts_with('"') {
+        parse_imap_atom_or_quoted(args)
+    } else {
+        let (user, rest) = args.split_once(' ')?;
+        (user.to_string(), rest)
+    };
+    let rest = rest.strip_prefix(' ').unwrap_or(rest);
+    if rest.is_empty() {
+        return None;
+    }
+    let password = if rest.starts_with('"') {
+        parse_imap_atom_or_quoted(rest).0
+    } else {
+        rest.to_string()
+    };
+    Some((username, password))
+}
+
+pub(crate) fn parse_imap_atom_or_quoted(s: &str) -> (String, &str) {
+    let s = s.trim_start();
+    if let Some(rest) = s.strip_prefix('"') {
+        let mut val = String::new();
+        let mut chars = rest.char_indices();
+        let mut end = rest.len();
+        while let Some((i, c)) = chars.next() {
+            if c == '\\' {
+                if let Some((_, nc)) = chars.next() {
+                    val.push(nc);
+                }
+            } else if c == '"' {
+                end = i;
+                break;
+            } else {
+                val.push(c);
+            }
+        }
+        let remainder = if end < rest.len() { &rest[end + 1..] } else { "" };
+        (val, remainder)
+    } else {
+        let end = s.find([' ', '\t', '\r', '\n'])
+            .unwrap_or(s.len());
+        (s[..end].to_string(), &s[end..])
+    }
+}
+
+fn imap_glob_match(pattern: &str, name: &str) -> bool {
+    let p: Vec<char> = pattern.chars().map(|c| c.to_ascii_uppercase()).collect();
+    let n: Vec<char> = name.chars().map(|c| c.to_ascii_uppercase()).collect();
+    let mut matches = vec![vec![false; n.len() + 1]; p.len() + 1];
+    matches[p.len()][n.len()] = true;
+    for i in (0..p.len()).rev() {
+        for j in (0..=n.len()).rev() {
+            matches[i][j] = match p[i] {
+                '*' => matches[i + 1][j] || (j < n.len() && matches[i][j + 1]),
+                '%' => matches[i + 1][j] || (j < n.len() && n[j] != '/' && matches[i][j + 1]),
+                c => j < n.len() && n[j] == c && matches[i + 1][j + 1],
+            };
+        }
+    }
+    matches[0][0]
+}
+
+fn skip_list_selection(args: &str) -> &str {
+    let trimmed = args.trim_start();
+    if !trimmed.starts_with('(') {
+        return trimmed;
+    }
+    match trimmed.find(')') {
+        Some(close) => trimmed[close + 1..].trim_start(),
+        None => "",
+    }
+}
+
+fn parse_list_patterns(input: &str) -> Vec<String> {
+    let trimmed = input.trim_start();
+    let Some(inner) = trimmed.strip_prefix('(') else {
+        return vec![parse_imap_atom_or_quoted(trimmed).0];
+    };
+    let mut rest = match inner.find(')') {
+        Some(close) => &inner[..close],
+        None => inner,
+    };
+    let mut patterns = Vec::new();
+    while !rest.trim().is_empty() {
+        let (pattern, remainder) = parse_imap_atom_or_quoted(rest);
+        if remainder.len() >= rest.len() {
+            break;
+        }
+        patterns.push(pattern);
+        rest = remainder;
+    }
+    patterns
+}
+
+fn list_attributes(entry: &crate::folders::MailboxEntry) -> String {
+    let children = if entry.has_children {
+        "\\HasChildren"
+    } else {
+        "\\HasNoChildren"
+    };
+    if entry.special_use.is_empty() {
+        children.to_string()
+    } else {
+        format!("{} {}", children, entry.special_use)
+    }
+}
+
+async fn handle_list(
+    writer: &mut (impl AsyncWrite + Unpin),
+    db: &Database,
+    tag: &str,
+    args: &str,
+    verb: &str,
+) -> std::io::Result<()> {
+    let (reference, rest) = parse_imap_atom_or_quoted(skip_list_selection(args));
+    let patterns = parse_list_patterns(rest);
+
+    if patterns.iter().all(|p| p.is_empty()) {
+        writer
+            .write_all(format!("* {} (\\Noselect) \"/\" \"\"\r\n", verb).as_bytes())
+            .await?;
+        return write_ok(writer, tag, &format!("{} completed", verb)).await;
+    }
+
+    let full_patterns: Vec<String> = patterns
+        .iter()
+        .filter(|p| !p.is_empty())
+        .map(|p| format!("{}{}", reference, p))
+        .collect();
+    for entry in &mailbox_directory(db).entries {
+        let encoded = crate::imap::mutf7::encode(&entry.path);
+        if !full_patterns.iter().any(|p| imap_glob_match(p, &encoded)) {
+            continue;
+        }
+        writer
+            .write_all(
+                format!(
+                    "* {} ({}) \"/\" {}\r\n",
+                    verb,
+                    list_attributes(entry),
+                    quote_imap_string(&encoded)
+                )
+                .as_bytes(),
+            )
+            .await?;
+    }
+    write_ok(writer, tag, &format!("{} completed", verb)).await
+}
+
+fn announce_mailbox_change(db: &Database, broadcaster: &broadcast::Sender<StateChange>) {
+    let email_state = db.jmap_state_get("Email").unwrap_or(0);
+    let mailbox_state = db.jmap_state_get("Mailbox").unwrap_or(0);
+    let thread_state = db.jmap_state_get("Thread").unwrap_or(0);
+    let mut changed = std::collections::HashMap::new();
+    changed.insert("Email".to_string(), email_state.to_string());
+    changed.insert("Mailbox".to_string(), mailbox_state.to_string());
+    changed.insert("Thread".to_string(), thread_state.to_string());
+    let _ = broadcaster.send(StateChange { changed });
+}
+
+async fn folder_credentials(
+    session: &Arc<RwLock<Session>>,
+) -> std::result::Result<(String, String), FolderOpError> {
+    let s = session.read().await;
+    match s.identity_key.clone() {
+        Some(key) => Ok((s.access_token.to_string(), key)),
+        None => Err(FolderOpError::Locked),
+    }
+}
+
+async fn ensure_folder_path(
+    db: &Database,
+    client: &ApiClient,
+    access_token: &str,
+    identity_key: &str,
+    segments: &[String],
+    forbidden_ancestor: Option<&str>,
+) -> std::result::Result<Option<String>, FolderOpError> {
+    let directory = mailbox_directory(db);
+    let mut parent: Option<String> = None;
+    let mut first_missing = segments.len();
+    for i in 0..segments.len() {
+        let path = segments[..=i].join("/");
+        match directory.resolve(&path).and_then(|e| e.folder.as_ref()) {
+            Some(node) => {
+                if let Some(ancestor) = forbidden_ancestor {
+                    if directory.is_descendant(&node.token, ancestor) {
+                        return Err(FolderOpError::Cycle);
+                    }
+                }
+                parent = Some(node.token.clone());
+            }
+            None => {
+                first_missing = i;
+                break;
+            }
+        }
+    }
+    let mut names = Vec::new();
+    for segment in &segments[first_missing..] {
+        let name = crate::folders::segment_to_name(segment);
+        crate::folders::validate_name(name.trim())
+            .map_err(|msg| FolderOpError::Invalid(msg.to_string()))?;
+        names.push(name);
+    }
+    for name in names {
+        let token = crate::folder_ops::create(
+            db,
+            client,
+            access_token,
+            identity_key,
+            &name,
+            parent.as_deref(),
+        )
+        .await?;
+        parent = Some(token);
+    }
+    Ok(parent)
+}
+
+fn parse_folder_path(raw: &str) -> std::result::Result<Vec<String>, FolderOpError> {
+    let decoded = crate::imap::mutf7::decode_lenient(raw);
+    let segments = crate::folders::split_path(&decoded)
+        .ok_or_else(|| FolderOpError::Invalid("invalid mailbox name".to_string()))?;
+    if crate::folders::system_mailbox(&segments[0]).is_some() {
+        return Err(FolderOpError::Invalid(format!(
+            "{} cannot contain folders; create the folder at the top level instead",
+            segments[0]
+        )));
+    }
+    Ok(segments)
+}
+
+async fn handle_create(
+    db: &Arc<Database>,
+    client: &Arc<ApiClient>,
+    session: &Arc<RwLock<Session>>,
+    args: &str,
+) -> std::result::Result<bool, String> {
+    let raw = parse_imap_atom_or_quoted(args).0;
+    if let Some(entry) = resolve_mailbox(db, &raw) {
+        if entry.folder.is_none() {
+            return Ok(false);
+        }
+        return Err(FolderOpError::AlreadyExists.imap_response());
+    }
+    let segments = parse_folder_path(&raw).map_err(|e| e.imap_response())?;
+    let (access_token, identity_key) =
+        folder_credentials(session).await.map_err(|e| e.imap_response())?;
+    let before = db.list_custom_folders()?;
+    let created =
+        ensure_folder_path(db, client, &access_token, &identity_key, &segments, None).await;
+    let after = db.list_custom_folders()?;
+    let changed = crate::sync::poller::record_mailbox_diff(db, &before, &after);
+    created.map(|_| changed).map_err(|e| e.imap_response())
+}
+
+async fn handle_delete(
+    db: &Arc<Database>,
+    client: &Arc<ApiClient>,
+    session: &Arc<RwLock<Session>>,
+    args: &str,
+) -> std::result::Result<bool, String> {
+    let raw = parse_imap_atom_or_quoted(args).0;
+    let Some(entry) = resolve_mailbox(db, &raw) else {
+        return Err(FolderOpError::NotFound.imap_response());
+    };
+    let Some(node) = entry.folder.as_ref() else {
+        return Err("[CANNOT] system mailboxes cannot be deleted".to_string());
+    };
+    let access_token = session.read().await.access_token.to_string();
+    let before = db.list_custom_folders()?;
+    crate::folder_ops::delete(db, client, &access_token, &node.token)
+        .await
+        .map_err(|e| e.imap_response())?;
+    let after = db.list_custom_folders()?;
+    crate::sync::poller::record_mailbox_diff(db, &before, &after);
+    Ok(true)
+}
+
+async fn handle_rename(
+    db: &Arc<Database>,
+    client: &Arc<ApiClient>,
+    session: &Arc<RwLock<Session>>,
+    args: &str,
+) -> std::result::Result<bool, String> {
+    let (old_raw, rest) = parse_imap_atom_or_quoted(args);
+    let new_raw = parse_imap_atom_or_quoted(rest).0;
+    let directory = mailbox_directory(db);
+    let Some(source) = directory
+        .resolve(&crate::imap::mutf7::decode_lenient(&old_raw))
+        .cloned()
+    else {
+        return Err(FolderOpError::NotFound.imap_response());
+    };
+    let Some(node) = source.folder.clone() else {
+        return Err("[CANNOT] system mailboxes cannot be renamed".to_string());
+    };
+    let new_path = crate::imap::mutf7::decode_lenient(&new_raw);
+    if let Some(existing) = directory.resolve(&new_path) {
+        if existing.label != source.label {
+            return Err(FolderOpError::AlreadyExists.imap_response());
+        }
+    }
+    let segments = parse_folder_path(&new_raw).map_err(|e| e.imap_response())?;
+    let Some((last, parents)) = segments.split_last() else {
+        return Err("[CANNOT] invalid mailbox name".to_string());
+    };
+    let new_name = crate::folders::segment_to_name(last);
+    let (access_token, identity_key) =
+        folder_credentials(session).await.map_err(|e| e.imap_response())?;
+    let before = db.list_custom_folders()?;
+    let renamed = rename_folder(
+        db,
+        client,
+        &access_token,
+        &identity_key,
+        parents,
+        &node.token,
+        &new_name,
+    )
+    .await;
+    let after = db.list_custom_folders()?;
+    let changed = crate::sync::poller::record_mailbox_diff(db, &before, &after);
+    renamed.map(|_| changed).map_err(|e| e.imap_response())
+}
+
+async fn rename_folder(
+    db: &Database,
+    client: &ApiClient,
+    access_token: &str,
+    identity_key: &str,
+    parents: &[String],
+    token: &str,
+    new_name: &str,
+) -> std::result::Result<(), FolderOpError> {
+    crate::folders::validate_name(new_name.trim())
+        .map_err(|msg| FolderOpError::Invalid(msg.to_string()))?;
+    let parent = ensure_folder_path(
+        db,
+        client,
+        access_token,
+        identity_key,
+        parents,
+        Some(token),
+    )
+    .await?;
+    crate::folder_ops::update(
+        db,
+        client,
+        access_token,
+        identity_key,
+        token,
+        Some(new_name),
+        Some(parent.as_deref()),
+    )
+    .await
+}
+
+fn move_flags_for(internal: &str) -> Option<serde_json::Value> {
+    match internal {
+        "archive" => Some(serde_json::json!({"is_archived": true, "is_trashed": false, "is_spam": false})),
+        "trash" => Some(serde_json::json!({"is_trashed": true, "is_archived": false})),
+        "spam" => Some(serde_json::json!({"is_spam": true, "is_archived": false, "is_trashed": false})),
+        "inbox" => Some(serde_json::json!({"is_archived": false, "is_trashed": false, "is_spam": false})),
+        _ => None,
+    }
+}
+
+async fn bulk_move_chunk(
+    client: &Arc<ApiClient>,
+    token: &str,
+    ids: &[String],
+    flags: &serde_json::Value,
+) -> bool {
+    let mut attempt = 0u32;
+    loop {
+        match client.bulk_set_mailbox_flags(token, ids, flags).await {
+            Ok(updated) => return updated as usize == ids.len(),
+            Err(e) => {
+                if crate::imap::append::is_rate_limited(&e) && attempt < 3 {
+                    let wait = crate::imap::append::rate_limit_backoff(attempt);
+                    attempt += 1;
+                    tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                    continue;
+                }
+                return false;
+            }
+        }
+    }
+}
+
+async fn relabel_with_backoff(
+    client: &Arc<ApiClient>,
+    token: &str,
+    ids: &[String],
+    add: Option<&str>,
+    remove: Option<&str>,
+) -> crate::error::Result<()> {
+    let mut attempt = 0u32;
+    loop {
+        let result = match (add, remove) {
+            (Some(label), _) => client.move_to_folder(token, ids, label).await,
+            (None, Some(label)) => client.remove_from_folder(token, ids, label).await,
+            (None, None) => Ok(()),
+        };
+        match result {
+            Err(e) if crate::imap::append::is_rate_limited(&e) && attempt < 3 => {
+                let wait = crate::imap::append::rate_limit_backoff(attempt);
+                attempt += 1;
+                tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+            }
+            other => return other,
+        }
+    }
+}
+
+async fn set_flags_with_backoff(
+    client: &Arc<ApiClient>,
+    token: &str,
+    id: &str,
+    flags: &serde_json::Value,
+) -> crate::error::Result<()> {
+    let mut attempt = 0u32;
+    loop {
+        match client.set_mailbox_flags(token, id, flags.clone()).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                if crate::imap::append::is_rate_limited(&e) && attempt < 3 {
+                    let wait = crate::imap::append::rate_limit_backoff(attempt);
+                    attempt += 1;
+                    tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_copy_move(
+    writer: &mut (impl AsyncWrite + Unpin),
+    db: &Arc<Database>,
+    client: &Arc<ApiClient>,
+    session: &Arc<RwLock<Session>>,
+    broadcaster: &broadcast::Sender<StateChange>,
+    conn: &mut ImapConnection,
+    tag: &str,
+    args: &str,
+    is_uid: bool,
+    is_move: bool,
+) -> std::io::Result<()> {
+    let verb = if is_move { "MOVE" } else { "COPY" };
+    if is_move && conn.read_only {
+        return write_no(writer, tag, "[READ-ONLY] Mailbox is read-only").await;
+    }
+    let source_folder = conn.selected_folder.clone().unwrap_or_else(|| "inbox".to_string());
+    let trimmed = args.trim();
+    let (set_str, mailbox_raw) = match trimmed.split_once(char::is_whitespace) {
+        Some((s, m)) => (s.trim(), m.trim()),
+        None => return write_bad(writer, tag, "command requires a message set and mailbox").await,
+    };
+    let mailbox = parse_imap_atom_or_quoted(mailbox_raw).0;
+    let target_internal = match resolve_mailbox(db, &mailbox) {
+        Some(entry) => entry.label,
+        None => return write_no(writer, tag, "[TRYCREATE] mailbox does not exist").await,
+    };
+    if !is_move {
+        return handle_copy(
+            writer,
+            db,
+            client,
+            session,
+            broadcaster,
+            conn,
+            tag,
+            set_str,
+            is_uid,
+            &source_folder,
+            &target_internal,
+        )
+        .await;
+    }
+    let target_token = crate::folders::token_of_label(&target_internal).map(str::to_string);
+    let source_token = crate::folders::token_of_label(&source_folder).map(str::to_string);
+    let flags = match (&target_token, source_folder.as_str()) {
+        (Some(_), "drafts") => None,
+        (Some(_), _) => move_flags_for("inbox"),
+        (None, _) => move_flags_for(&target_internal),
+    };
+    let flags = match flags {
+        Some(f) => f,
+        None => return write_no(writer, tag, "[CANNOT] cannot move messages into that mailbox").await,
+    };
+    if target_internal == source_folder {
+        return write_ok(writer, tag, &format!("{} completed", verb)).await;
+    }
+
+    let messages = {
+        let db = Arc::clone(db);
+        let folder = source_folder.clone();
+        tokio::task::spawn_blocking(move || db.list_cached_message_meta(&folder).unwrap_or_default())
+            .await
+            .unwrap_or_default()
+    };
+    let view = MailboxView::new(&conn.uids, &messages);
+    let mut selected: Vec<(usize, CachedMessage)> = Vec::new();
+    for (seq, m) in view.iter() {
+        let hit = if is_uid {
+            sequence_set_contains(set_str, m.imap_uid, view.max_uid)
+        } else {
+            sequence_set_contains(set_str, seq as u32, view.len())
+        };
+        if hit {
+            selected.push((seq, m.clone()));
+        }
+    }
+    if selected.is_empty() {
+        return write_ok(writer, tag, &format!("{} completed", verb)).await;
+    }
+
+    let token = session.read().await.access_token.to_string();
+    let validity = {
+        let db = Arc::clone(db);
+        match tokio::task::spawn_blocking(move || uid_validity(&db)).await {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => {
+                tracing::warn!("{} could not read UIDVALIDITY: {}", verb, e);
+                return write_no(writer, tag, "[UNAVAILABLE] mailbox state is unavailable, try again")
+                    .await;
+            }
+            Err(e) => {
+                tracing::warn!("{} UIDVALIDITY task failed: {}", verb, e);
+                return write_no(writer, tag, "[SERVERBUG] mailbox state is unavailable").await;
+            }
+        }
+    };
+    let selected_ids: Vec<String> = selected.iter().map(|(_, m)| m.aster_id.clone()).collect();
+    if let Err(e) = relabel_with_backoff(
+        client,
+        &token,
+        &selected_ids,
+        target_token.as_deref(),
+        source_token.as_deref(),
+    )
+    .await
+    {
+        tracing::warn!("{} folder update failed: {}", verb, e);
+        return write_no(writer, tag, "[SERVERBUG] could not move message on the server").await;
+    }
+    for chunk in selected.chunks(ApiClient::MAX_BULK_METADATA_ITEMS) {
+        let ids: Vec<String> = chunk.iter().map(|(_, m)| m.aster_id.clone()).collect();
+        if bulk_move_chunk(client, &token, &ids, &flags).await {
+            continue;
+        }
+        for (_, m) in chunk {
+            if let Err(e) = set_flags_with_backoff(client, &token, &m.aster_id, &flags).await {
+                let is_missing_item = matches!(
+                    &e,
+                    crate::error::BridgeError::Api(msg) if msg.starts_with("404")
+                );
+                let draft_removed = is_missing_item
+                    && source_folder == "drafts"
+                    && client.delete_draft(&token, &m.aster_id).await.is_ok();
+                if !draft_removed {
+                    tracing::warn!("{} backend update failed for {}: {}", verb, m.aster_id, e);
+                    return write_no(writer, tag, "[SERVERBUG] could not move message on the server")
+                        .await;
+                }
+            }
+        }
+    }
+    let assigned = {
+        let db = Arc::clone(db);
+        let folder = source_folder.clone();
+        let target = target_internal.clone();
+        let entries = selected.clone();
+        crate::shutdown::spawn_blocking_held(move || {
+            db.write_batch(|batch| {
+                let mut src: Vec<u32> = Vec::new();
+                let mut tgt: Vec<u32> = Vec::new();
+                let mut all_assigned = true;
+                for (_, m) in &entries {
+                    let _ = batch.upsert_cached_message(
+                        &m.aster_id,
+                        &target,
+                        m.subject.as_deref(),
+                        m.sender.as_deref(),
+                        m.recipients.as_deref(),
+                        m.date.as_deref(),
+                        m.size,
+                        m.body_text.as_deref(),
+                        m.raw_headers.as_deref(),
+                    );
+                    let _ = batch.remove_uid_mapping(m.imap_uid as i64, &folder);
+                    src.push(m.imap_uid);
+                    match batch.assign_uid_if_missing(&target, &m.aster_id) {
+                        Ok(uid) => tgt.push(uid),
+                        Err(e) => {
+                            tracing::warn!("MOVE could not assign a target UID to {}: {}", m.aster_id, e);
+                            all_assigned = false;
+                        }
+                    }
+                }
+                (src, tgt, all_assigned)
+            })
+        })
+        .await
+    };
+    let (src_uids, tgt_uids, all_assigned) = match assigned {
+        Some(Ok(result)) => result,
+        None => return write_no(writer, tag, "[UNAVAILABLE] Aster Bridge is stopping").await,
+        Some(Err(e)) => {
+            tracing::warn!("{} cache update task failed: {}", verb, e);
+            return write_no(writer, tag, "[SERVERBUG] could not update the local mailbox").await;
+        }
+    };
+
+    if all_assigned {
+        let src_set = src_uids.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
+        let tgt_set = tgt_uids.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
+        writer
+            .write_all(format!("* OK [COPYUID {} {} {}]\r\n", validity, src_set, tgt_set).as_bytes())
+            .await?;
+    }
+    for uid in &src_uids {
+        if let Some(seq) = conn.expunged(*uid) {
+            writer.write_all(format!("* {} EXPUNGE\r\n", seq).as_bytes()).await?;
+        }
+    }
+    write_ok(writer, tag, "MOVE completed").await
+}
+
+/// Why a message cannot be copied without losing its attachments: BODY[]
+/// shows a note in place of attachments that are not downloaded, and the
+/// import drops any attachment over its size limit.
+fn copy_refusal(db: &Database, messages: &[CachedMessage]) -> Option<String> {
+    for m in messages {
+        if crate::message_render::attachment_status_note(m).is_some() {
+            return Some(if m.attachments_state == crate::db::ATTACHMENTS_PENDING {
+                format!("[UNAVAILABLE] the attachments of UID {} are still downloading", m.imap_uid)
+            } else {
+                format!("[CANNOT] the attachments of UID {} could not be downloaded", m.imap_uid)
+            });
+        }
+        let too_big = crate::db::attachment_parts_known(m.attachments_state)
+            && db
+                .get_message_attachment_meta(&m.aster_id)
+                .unwrap_or_default()
+                .iter()
+                .any(|a| a.size.max(0) as usize > crate::imap::append::MAX_ATTACHMENT_BYTES);
+        if too_big {
+            return Some(format!("[TOOBIG] UID {} has an attachment too large to copy", m.imap_uid));
+        }
+    }
+    None
+}
+
+/// COPY leaves the source alone (RFC 3501 §6.4.7). An Aster message lives in
+/// one folder, so each copy is a new message, stored through the same path
+/// as APPEND. If one cannot be stored, the copies already made are deleted.
+#[allow(clippy::too_many_arguments)]
+async fn handle_copy(
+    writer: &mut (impl AsyncWrite + Unpin),
+    db: &Arc<Database>,
+    client: &Arc<ApiClient>,
+    session: &Arc<RwLock<Session>>,
+    broadcaster: &broadcast::Sender<StateChange>,
+    conn: &mut ImapConnection,
+    tag: &str,
+    set_str: &str,
+    is_uid: bool,
+    source_folder: &str,
+    target: &str,
+) -> std::io::Result<()> {
+    use crate::imap::append::{AppendFlags, AppendOutcome};
+
+    let messages = {
+        let db = Arc::clone(db);
+        let folder = source_folder.to_string();
+        tokio::task::spawn_blocking(move || db.list_cached_message_meta(&folder).unwrap_or_default())
+            .await
+            .unwrap_or_default()
+    };
+    let view = MailboxView::new(&conn.uids, &messages);
+    let selected: Vec<CachedMessage> = view
+        .iter()
+        .filter(|(seq, m)| {
+            if is_uid {
+                sequence_set_contains(set_str, m.imap_uid, view.max_uid)
+            } else {
+                sequence_set_contains(set_str, *seq as u32, view.len())
+            }
+        })
+        .map(|(_, m)| m.clone())
+        .collect();
+    let selected: Vec<CachedMessage> = {
+        let db = Arc::clone(db);
+        tokio::task::spawn_blocking(move || {
+            selected
+                .into_iter()
+                .filter_map(|m| db.get_cached_message(&m.aster_id).ok().flatten())
+                .collect()
+        })
+        .await
+        .unwrap_or_default()
+    };
+    if selected.is_empty() {
+        return write_ok(writer, tag, "COPY completed").await;
+    }
+    if let Some(reason) = copy_refusal(db, &selected) {
+        return write_no(writer, tag, &reason).await;
+    }
+    let mut selected = selected;
+    for m in selected.iter_mut() {
+        if m.attachments_state != crate::db::ATTACHMENTS_ON_DEMAND {
+            continue;
+        }
+        use crate::sync::poller::on_demand::{ensure_attachments, AttachmentFill};
+        let filled = match ensure_attachments(db, client, session, &m.aster_id, Some(broadcaster)).await {
+            AttachmentFill::Ready => db.attachments_state(&m.aster_id).ok(),
+            AttachmentFill::Replaced | AttachmentFill::Unavailable => None,
+        };
+        match filled {
+            Some(state) if state != crate::db::ATTACHMENTS_ON_DEMAND => m.attachments_state = state,
+            _ => {
+                return write_no(
+                    writer,
+                    tag,
+                    &format!("[UNAVAILABLE] the attachments of UID {} could not be downloaded; try again later", m.imap_uid),
+                )
+                .await;
+            }
+        }
+    }
+
+    // (source UID, new UID, new Aster id, keywords)
+    let mut copies: Vec<(u32, u32, String, Vec<String>)> = Vec::new();
+    let mut failure: Option<String> = None;
+    for m in &selected {
+        let (raw, keywords) = {
+            let db = Arc::clone(db);
+            let m = m.clone();
+            tokio::task::spawn_blocking(move || {
+                let attachments = if m.attachments_state == crate::db::ATTACHMENTS_STORED {
+                    db.get_message_attachments(&m.aster_id).unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                let keywords = db.message_keywords(&m.aster_id).unwrap_or_default();
+                (crate::message_render::render_text(&m, &attachments), keywords)
+            })
+            .await
+            .unwrap_or_default()
+        };
+        let stored = if target == "drafts" {
+            append_draft(db, client, session, raw.as_bytes()).await.map(Some)
+        } else {
+            let flags = AppendFlags {
+                seen: m.flags & 1 != 0,
+                answered: m.flags & 2 != 0,
+                flagged: m.flags & 4 != 0,
+                deleted: m.flags & 8 != 0,
+                draft: m.flags & 16 != 0,
+            };
+            let internal_date = m
+                .date
+                .as_deref()
+                .and_then(parse_datetime_lenient)
+                .map(|d| d.with_timezone(&chrono::Utc));
+            crate::imap::append::store_copy(
+                db,
+                client,
+                session,
+                target,
+                raw.as_bytes(),
+                &flags,
+                internal_date,
+            )
+            .await
+            .map(|outcome| match outcome {
+                AppendOutcome::Stored { uid, aster_id } => Some((uid, aster_id)),
+                AppendOutcome::Duplicate { .. } => None,
+            })
+        };
+        match stored {
+            Ok(Some((uid, aster_id))) => copies.push((m.imap_uid, uid, aster_id, keywords)),
+            Ok(None) => {
+                failure = Some(format!(
+                    "[CANNOT] Aster would not store a second copy of UID {}",
+                    m.imap_uid
+                ));
+                break;
+            }
+            Err(e) => {
+                tracing::warn!("COPY of {} into {} failed: {}", m.aster_id, target, e);
+                failure = Some(format!(
+                    "[{}] could not copy UID {}: {}",
+                    crate::imap::append::no_response_code(&e),
+                    m.imap_uid,
+                    e
+                ));
+                break;
+            }
+        }
+    }
+
+    if let Some(mut reason) = failure {
+        let mut kept = 0usize;
+        for (_, _, aster_id, _) in &copies {
+            if delete_on_server(db, client, session, target, aster_id).await {
+                let _ = db.delete_message_by_aster_id(aster_id);
+            } else {
+                kept += 1;
+            }
+        }
+        if kept > 0 {
+            tracing::warn!("COPY into {} could not remove {} of its copies", target, kept);
+            reason = format!(
+                "{}; {} copies made before the failure could not be removed",
+                reason, kept
+            );
+        }
+        return write_no(writer, tag, &reason).await;
+    }
+
+    for (_, _, aster_id, keywords) in &copies {
+        if !keywords.is_empty() {
+            let _ = db.set_message_keywords(aster_id, keywords);
+        }
+    }
+    conn.copied_out.extend(selected.iter().map(|m| m.aster_id.clone()));
+    let label_pairs: Vec<(String, String)> = selected
+        .iter()
+        .zip(copies.iter())
+        .map(|(source, (_, _, copy_id, _))| (source.aster_id.clone(), copy_id.clone()))
+        .collect();
+    let access_token = session.read().await.access_token.to_string();
+    if crate::tag_ops::copy_tags(db, client, &access_token, &label_pairs)
+        .await
+        .is_err()
+    {
+        tracing::warn!("COPY could not carry labels over to the copies");
+    }
+    let new_ids: Vec<&str> = copies.iter().map(|(_, _, id, _)| id.as_str()).collect();
+    let _ = db.jmap_record_sync_batch("Email", &new_ids);
+    let _ = db.jmap_state_bump("Mailbox");
+    let _ = db.jmap_state_bump("Thread");
+    announce_mailbox_change(db, broadcaster);
+    if conn.selected_folder.as_deref() == Some(target) {
+        sync_selected(writer, db, conn, is_uid).await?;
+    }
+    let src_set = copies.iter().map(|(s, ..)| s.to_string()).collect::<Vec<_>>().join(",");
+    let dst_set = copies.iter().map(|(_, d, ..)| d.to_string()).collect::<Vec<_>>().join(",");
+    let completed = match uid_validity(db) {
+        Ok(validity) => format!("[COPYUID {} {} {}] COPY completed", validity, src_set, dst_set),
+        Err(e) => {
+            tracing::warn!("UIDVALIDITY unavailable for COPYUID: {}", e);
+            "COPY completed".to_string()
+        }
+    };
+    write_ok(writer, tag, &completed).await
+}
+
+async fn handle_select(
+    writer: &mut (impl AsyncWrite + Unpin),
+    db: &Arc<Database>,
+    conn: &mut ImapConnection,
+    tag: &str,
+    args: &str,
+    command: &str,
+) -> std::io::Result<()> {
+    let requested = parse_imap_atom_or_quoted(args).0;
+    let entry = match resolve_mailbox(db, &requested) {
+        Some(entry) => entry,
+        None => {
+            return write_no(writer, tag, "[NONEXISTENT] No such mailbox").await;
+        }
+    };
+    let aster_folder = entry.label.as_str();
+    let validity = match uid_validity(db) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("{} could not read UIDVALIDITY: {}", command, e);
+            return write_no(writer, tag, "[UNAVAILABLE] mailbox state is unavailable, try again")
+                .await;
+        }
+    };
+
+    let messages = db.list_cached_message_meta(aster_folder).unwrap_or_default();
+    let count = messages.len();
+    if count == 0 {
+        crate::sync::poller::try_kick_sync();
+    }
+
+    conn.selected_mailbox = Some(entry.path.clone());
+    conn.selected_folder = Some(aster_folder.to_string());
+    conn.state = ImapState::Selected;
+    conn.uids = messages.iter().map(|m| m.imap_uid).collect();
+    conn.read_only = command == "EXAMINE";
+
+    writer
+        .write_all(format!("* {} EXISTS\r\n", count).as_bytes())
+        .await?;
+    writer.write_all(b"* 0 RECENT\r\n").await?;
+
+    if let Some(first_unseen) = messages.iter().position(|m| (m.flags & 1) == 0) {
+        let seq = first_unseen + 1;
+        writer
+            .write_all(format!("* OK [UNSEEN {}] Message {} is first unseen\r\n", seq, seq).as_bytes())
+            .await?;
+    }
+
+    writer
+        .write_all(format!("* OK [UIDVALIDITY {}]\r\n", validity).as_bytes())
+        .await?;
+    let uid_next = db.uid_next(aster_folder).unwrap_or(1);
+    writer
+        .write_all(format!("* OK [UIDNEXT {}]\r\n", uid_next).as_bytes())
+        .await?;
+    writer
+        .write_all(b"* FLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft)\r\n")
+        .await?;
+    writer
+        .write_all(
+            b"* OK [PERMANENTFLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft \\*)]\r\n",
+        )
+        .await?;
+
+    let rw = if conn.read_only { "READ-ONLY" } else { "READ-WRITE" };
+    write_ok(writer, tag, &format!("[{}] {} completed", rw, command)).await
+}
+
+fn sanitize_header(s: &str) -> String {
+    s.chars()
+        .filter(|c| *c != '\r' && *c != '\n' && *c != '\0')
+        .collect()
+}
+
+fn imap_quote(s: &str) -> String {
+    let cleaned = sanitize_header(s);
+    let escaped = cleaned.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{}\"", escaped)
+}
+
+fn parse_address(addr: &str) -> (String, String, String) {
+    let (name, email) = crate::address::parse_mailbox(addr);
+    let (mailbox, host) = if let Some(at) = email.find('@') {
+        (email[..at].to_string(), email[at + 1..].to_string())
+    } else {
+        (email.clone(), String::new())
+    };
+    (name, mailbox, host)
+}
+
+fn imap_address_list(addr_str: Option<&str>) -> String {
+    let s = match addr_str {
+        Some(s) if !s.is_empty() => s,
+        _ => return "NIL".to_string(),
+    };
+    let mut parts = Vec::new();
+    for addr in crate::address::split_address_list(s) {
+        let (name, mailbox, host) = parse_address(&addr);
+        let name_field = if name.is_empty() { "NIL".to_string() } else { imap_quote(&name) };
+        let host_field = if host.is_empty() { "NIL".to_string() } else { imap_quote(&host) };
+        let mailbox_field = if mailbox.is_empty() { "NIL".to_string() } else { imap_quote(&mailbox) };
+        parts.push(format!("({} NIL {} {})", name_field, mailbox_field, host_field));
+    }
+    if parts.is_empty() {
+        "NIL".to_string()
+    } else {
+        format!("({})", parts.join(""))
+    }
+}
+
+pub fn date_header_rfc2822(s: &str) -> String {
+    match parse_datetime_lenient(s) {
+        Some(d) => d.format("%a, %d %b %Y %H:%M:%S %z").to_string(),
+        None => s.to_string(),
+    }
+}
+
+#[cfg(test)]
+pub fn build_rfc822(msg: &CachedMessage) -> String {
+    crate::message_render::render_text(msg, &[])
+}
+
+fn contains_word(haystack: &str, needle: &str) -> bool {
+    let mut start = 0;
+    while let Some(pos) = haystack[start..].find(needle) {
+        let abs = start + pos;
+        let before_ok = abs == 0
+            || !haystack.as_bytes()[abs - 1].is_ascii_alphanumeric();
+        let after_idx = abs + needle.len();
+        let after_ok = after_idx >= haystack.len()
+            || {
+                let c = haystack.as_bytes()[after_idx];
+                !(c.is_ascii_alphanumeric() || c == b'.')
+            };
+        if before_ok && after_ok {
+            return true;
+        }
+        start = abs + needle.len();
+    }
+    false
+}
+
+fn parse_header_fields_request(fetch_parts: &str) -> Option<(String, Vec<String>)> {
+    let upper = fetch_parts.to_ascii_uppercase();
+    let key = "BODY.PEEK[HEADER.FIELDS (";
+    let alt = "BODY[HEADER.FIELDS (";
+    let (start, _) = if let Some(p) = upper.find(key) {
+        (p + key.len(), key.len())
+    } else {
+        let p = upper.find(alt)?;
+        (p + alt.len(), alt.len())
+    };
+    let rest = &fetch_parts[start..];
+    let end = rest.find(')')?;
+    let inner = &rest[..end];
+    let fields: Vec<String> = inner
+        .split_ascii_whitespace()
+        .map(|s| s.to_string())
+        .collect();
+    if fields.is_empty() {
+        return None;
+    }
+    Some((fields.join(" "), fields))
+}
+
+fn parse_body_partial(upper_parts: &str) -> Option<(usize, Option<usize>)> {
+    parse_section_partial(upper_parts, "")
+}
+
+fn parse_section_partial(upper_parts: &str, section: &str) -> Option<(usize, Option<usize>)> {
+    ["BODY[", "BODY.PEEK["].iter().find_map(|prefix| {
+        let marker = format!("{}{}]<", prefix, section);
+        let idx = upper_parts.find(&marker)? + marker.len();
+        let rest = &upper_parts[idx..];
+        let end = rest.find('>')?;
+        let spec = &rest[..end];
+        let mut it = spec.split('.');
+        let off: usize = it.next()?.parse().ok()?;
+        let len = it.next().and_then(|s| s.parse::<usize>().ok());
+        Some((off, len))
+    })
+}
+
+fn filter_header_fields(header: &str, fields: &[String]) -> String {
+    let wanted: Vec<String> = fields.iter().map(|f| f.to_ascii_lowercase()).collect();
+    let mut out = String::new();
+    let mut include_current = false;
+    for line in header.split_inclusive("\r\n") {
+        let is_continuation = line.starts_with(' ') || line.starts_with('\t');
+        if is_continuation {
+            if include_current {
+                out.push_str(line);
+            }
+            continue;
+        }
+        if line == "\r\n" {
+            continue;
+        }
+        let name = line.split(':').next().unwrap_or("").trim().to_ascii_lowercase();
+        include_current = wanted.iter().any(|w| w == &name);
+        if include_current {
+            out.push_str(line);
+        }
+    }
+    out.push_str("\r\n\r\n");
+    out
+}
+
+fn iso_to_imap_date(s: &str) -> String {
+    const MONTHS: &[&str] = &["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+    if let Some(dt) = parse_datetime_lenient(s) {
+        let dt = dt.with_timezone(&chrono::Utc);
+        let m = MONTHS.get(dt.date_naive().month0() as usize).unwrap_or(&"Jan");
+        return format!("{:02}-{}-{} {:02}:{:02}:{:02} +0000",
+            dt.date_naive().day(), m, dt.date_naive().year(),
+            dt.time().hour(), dt.time().minute(), dt.time().second());
+    }
+    "01-Jan-1970 00:00:00 +0000".to_string()
+}
+
+fn parse_set(spec: &str, max: u32) -> Vec<u32> {
+    if max == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for part in spec.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some((a, b)) = part.split_once(':') {
+            let lo: u32 = if a == "*" {
+                max
+            } else if let Ok(v) = a.parse() {
+                v
+            } else {
+                continue;
+            };
+            let hi: u32 = if b == "*" {
+                max
+            } else if let Ok(v) = b.parse() {
+                v
+            } else {
+                continue;
+            };
+            let (lo, hi) = if lo <= hi { (lo, hi) } else { (hi, lo) };
+            for i in lo..=hi.min(max) {
+                if i >= 1 {
+                    out.push(i);
+                }
+            }
+        } else if part == "*" {
+            out.push(max);
+        } else if let Ok(n) = part.parse::<u32>() {
+            if n >= 1 && n <= max {
+                out.push(n);
+            }
+        }
+    }
+    out
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct SectionRequest {
+    section: String,
+    mime: bool,
+    peek: bool,
+    partial: Option<(usize, Option<usize>)>,
+}
+
+fn parse_partial_spec(spec: &str) -> Option<(usize, Option<usize>)> {
+    let mut it = spec.split('.');
+    let off: usize = it.next()?.trim().parse().ok()?;
+    let len = it.next().and_then(|s| s.trim().parse::<usize>().ok());
+    Some((off, len))
+}
+
+fn is_numeric_section(s: &str) -> bool {
+    !s.is_empty() && s.split('.').all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn parse_section_requests(fetch_parts: &str) -> Vec<SectionRequest> {
+    let upper = fetch_parts.to_ascii_uppercase();
+    let mut out: Vec<SectionRequest> = Vec::new();
+    let mut cursor = 0;
+    while let Some(rel) = upper[cursor..].find("BODY") {
+        let start = cursor + rel;
+        let after = &upper[start + 4..];
+        let (peek, open) = if let Some(rest) = after.strip_prefix(".PEEK[") {
+            (true, start + 4 + (after.len() - rest.len()))
+        } else if let Some(rest) = after.strip_prefix('[') {
+            (false, start + 4 + (after.len() - rest.len()))
+        } else {
+            cursor = start + 4;
+            continue;
+        };
+        let Some(close_rel) = upper[open..].find(']') else {
+            break;
+        };
+        let close = open + close_rel;
+        let inner = upper[open..close].trim().to_string();
+        cursor = close + 1;
+        let partial = if upper[cursor..].starts_with('<') {
+            match upper[cursor..].find('>') {
+                Some(end_rel) => {
+                    let spec = &upper[cursor + 1..cursor + end_rel];
+                    cursor += end_rel + 1;
+                    parse_partial_spec(spec)
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        let (section, mime) = match inner.strip_suffix(".MIME") {
+            Some(base) => (base.to_string(), true),
+            None => (inner.clone(), false),
+        };
+        if !is_numeric_section(&section) {
+            continue;
+        }
+        if out.iter().any(|r| r.section == section && r.mime == mime && r.partial == partial) {
+            continue;
+        }
+        out.push(SectionRequest {
+            section,
+            mime,
+            peek,
+            partial,
+        });
+    }
+    out
+}
+
+fn apply_partial(data: &str, partial: Option<(usize, Option<usize>)>) -> (String, &[u8]) {
+    let bytes = data.as_bytes();
+    match partial {
+        Some((off, len_opt)) => {
+            let start = off.min(bytes.len());
+            let end = match len_opt {
+                Some(l) => start.saturating_add(l).min(bytes.len()),
+                None => bytes.len(),
+            };
+            (format!("<{}>", off), &bytes[start..end])
+        }
+        None => (String::new(), bytes),
+    }
+}
+
+fn literal(key: &str, data: impl AsRef<[u8]>) -> Vec<u8> {
+    let data = data.as_ref();
+    let mut out = format!("{} {{{}}}\r\n", key, data.len()).into_bytes();
+    out.extend_from_slice(data);
+    out
+}
+
+const FETCH_TARGETED_MAX: usize = 500;
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_fetch(
+    writer: &mut (impl AsyncWrite + Unpin),
+    db: &Arc<Database>,
+    client: &Arc<ApiClient>,
+    session: &Arc<RwLock<Session>>,
+    broadcaster: &broadcast::Sender<StateChange>,
+    conn: &ImapConnection,
+    tag: &str,
+    args: &str,
+    uid_command: bool,
+    listing: Option<Vec<CachedMessage>>,
+) -> std::io::Result<()> {
+    let folder = conn.selected_folder.as_deref().unwrap_or("inbox");
+    let mut fetch_seen_pushes: Vec<String> = Vec::new();
+
+    let (range_spec, fetch_parts) = args
+        .split_once(' ')
+        .map(|(r, rest)| (r, rest))
+        .unwrap_or((args, "(FLAGS)"));
+
+    let upper_parts = fetch_parts.to_ascii_uppercase();
+    let is_all  = contains_word(&upper_parts, "ALL");
+    let is_fast = contains_word(&upper_parts, "FAST");
+    let is_full = contains_word(&upper_parts, "FULL");
+    let wants_envelope = upper_parts.contains("ENVELOPE") || is_all || is_full;
+    let wants_flags = upper_parts.contains("FLAGS") || is_all || is_fast || is_full;
+    let wants_size = upper_parts.contains("RFC822.SIZE") || is_all || is_fast || is_full;
+    let wants_uid = uid_command || upper_parts.contains("UID");
+    let wants_rfc822_text = contains_word(&upper_parts, "RFC822.TEXT");
+    let wants_rfc822 = contains_word(&upper_parts, "RFC822");
+    let wants_rfc822_header = contains_word(&upper_parts, "RFC822.HEADER");
+    let wants_body = upper_parts.contains("BODY[]") || upper_parts.contains("BODY.PEEK[]");
+    let wants_body_header = upper_parts.contains("BODY[HEADER]")
+        || upper_parts.contains("BODY.PEEK[HEADER]");
+    let wants_body_text = upper_parts.contains("BODY[TEXT]") || upper_parts.contains("BODY.PEEK[TEXT]");
+    let body_text_is_peek = conn.read_only || upper_parts.contains("BODY.PEEK[TEXT]");
+    let header_fields = parse_header_fields_request(fetch_parts);
+    let wants_gm_labels = contains_word(&upper_parts, "X-GM-LABELS");
+    let wants_gm_thrid = contains_word(&upper_parts, "X-GM-THRID");
+    let wants_gm_msgid = contains_word(&upper_parts, "X-GM-MSGID");
+    let wants_bodystructure = contains_word(&upper_parts, "BODYSTRUCTURE");
+    let section_requests = parse_section_requests(fetch_parts);
+    let wants_internaldate = upper_parts.contains("INTERNALDATE")
+        || is_all || is_fast || is_full;
+    let body_is_peek = conn.read_only || upper_parts.contains("BODY.PEEK[]");
+    let marks_seen = !conn.read_only
+        && ((wants_body_text && !body_text_is_peek)
+            || section_requests.iter().any(|req| !req.peek)
+            || (wants_body && !body_is_peek)
+            || wants_rfc822
+            || wants_rfc822_text);
+
+    let needs_content = wants_body
+        || wants_rfc822
+        || wants_body_text
+        || !section_requests.is_empty()
+        || wants_rfc822_text;
+    let needs_layout = wants_rfc822_header
+        || wants_body_header
+        || wants_bodystructure
+        || header_fields.is_some();
+    let needs_body = needs_content || needs_layout;
+    let range_cap = if uid_command {
+        conn.uids.iter().copied().max().unwrap_or(0)
+    } else {
+        conn.uids.len() as u32
+    };
+    let selected = parse_set(range_spec, range_cap);
+    let wanted: Vec<u32> = if uid_command {
+        let known: std::collections::HashSet<u32> = conn.uids.iter().copied().collect();
+        selected.iter().copied().filter(|uid| known.contains(uid)).collect()
+    } else {
+        selected
+            .iter()
+            .filter_map(|n| conn.uids.get((*n as usize).checked_sub(1)?).copied())
+            .collect()
+    };
+    let targeted = wanted.len() <= FETCH_TARGETED_MAX;
+    let messages = match listing {
+        Some(listing) => listing,
+        None if targeted => db.list_cached_message_meta_for_uids(folder, &wanted).unwrap_or_default(),
+        None => db.list_cached_message_meta(folder).unwrap_or_default(),
+    };
+    let view = MailboxView::new(&conn.uids, &messages);
+    let wanted_ids: Vec<String> = if targeted {
+        wanted
+            .iter()
+            .filter_map(|uid| view.by_uid(*uid).map(|(_, m)| m.aster_id.clone()))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let folder_keywords = if targeted {
+        db.keywords_for_messages(&wanted_ids).unwrap_or_default()
+    } else {
+        db.folder_keywords(folder).unwrap_or_default()
+    };
+    let folder_attachment_meta = if needs_body || !wants_size {
+        std::collections::HashMap::new()
+    } else if targeted {
+        db.get_attachment_meta_for_messages(&wanted_ids).unwrap_or_default()
+    } else {
+        db.list_attachment_meta_for_folder(folder).unwrap_or_default()
+    };
+    let body_partial = parse_body_partial(&upper_parts);
+    let needs_every_byte = (wants_body && !matches!(body_partial, Some((_, Some(_)))))
+        || wants_rfc822
+        || wants_body_text
+        || wants_rfc822_text;
+
+    let mut out: Vec<u8> = Vec::new();
+    let mut refusal: Option<String> = None;
+    let mut skipped = 0usize;
+    for n in &selected {
+        let found = if uid_command {
+            view.by_uid(*n)
+        } else {
+            view.by_seq(*n).map(|m| (*n as usize, m))
+        };
+        let Some((seq_num, meta)) = found else {
+            continue;
+        };
+        let with_body = if needs_body {
+            let Ok(Some(stored)) = db.get_cached_message(&meta.aster_id) else {
+                continue;
+            };
+            Some(CachedMessage {
+                body_text: stored.body_text,
+                ..meta.clone()
+            })
+        } else {
+            None
+        };
+        let msg = with_body.as_ref().unwrap_or(meta);
+        let uid = msg.imap_uid;
+        let keywords = folder_keywords.get(&msg.aster_id).map(Vec::as_slice).unwrap_or(&[]);
+        let attachments: Vec<crate::db::CachedAttachment> = if needs_body {
+            if !crate::db::attachment_parts_known(msg.attachments_state) {
+                Vec::new()
+            } else if needs_content {
+                db.get_message_attachments(&msg.aster_id).unwrap_or_default()
+            } else {
+                db.get_message_attachment_layout(&msg.aster_id).unwrap_or_default()
+            }
+        } else {
+            folder_attachment_meta
+                .get(&msg.aster_id)
+                .cloned()
+                .unwrap_or_default()
+        };
+        let mut rendered = if needs_layout && !needs_content {
+            crate::message_render::render_layout(msg, &attachments)
+        } else {
+            crate::message_render::render(msg, &attachments, needs_content)
+        };
+        let missing_bytes = needs_content
+            && !rendered.is_complete()
+            && (needs_every_byte
+                || body_partial
+                    .is_some_and(|(off, len)| wants_body && !rendered.has_bytes(off.saturating_add(len.unwrap_or(0))))
+                || section_requests.iter().any(|req| {
+                    if req.mime {
+                        !rendered.has_part_header(&req.section)
+                    } else {
+                        !rendered.has_part_body(&req.section)
+                    }
+                }));
+        if missing_bytes {
+            if !out.is_empty() {
+                writer.write_all(&out).await?;
+                out.clear();
+            }
+            use crate::sync::poller::on_demand::{ensure_attachments, AttachmentFill};
+            let reason = match ensure_attachments(db, client, session, &msg.aster_id, Some(broadcaster)).await {
+                AttachmentFill::Ready => match db.get_cached_message(&msg.aster_id) {
+                    Ok(Some(current)) if current.imap_uid == uid => {
+                        let filled = CachedMessage {
+                            attachments_state: current.attachments_state,
+                            ..msg.clone()
+                        };
+                        let attachments = db.get_message_attachments(&msg.aster_id).unwrap_or_default();
+                        rendered = crate::message_render::render(&filled, &attachments, true);
+                        (!rendered.is_complete()).then(|| {
+                            format!("the attachments of UID {} are not downloaded yet; try again", uid)
+                        })
+                    }
+                    _ => Some(format!(
+                        "UID {} changed when its attachments were downloaded and arrives again as a new message",
+                        uid
+                    )),
+                },
+                AttachmentFill::Replaced => Some(format!(
+                    "UID {} changed when its attachments were downloaded and arrives again as a new message",
+                    uid
+                )),
+                AttachmentFill::Unavailable => Some(format!(
+                    "the attachments of UID {} could not be downloaded; try again later",
+                    uid
+                )),
+            };
+            if let Some(reason) = reason {
+                skipped += 1;
+                refusal.get_or_insert(reason);
+                continue;
+            }
+        }
+        let mut items: Vec<Vec<u8>> = Vec::new();
+
+        let mut flags = msg.flags as u32;
+        if marks_seen && flags & 1 == 0 {
+            flags |= 1;
+            let _ = db.update_message_flags(msg.imap_uid as i64, folder, flags as i64);
+            fetch_seen_pushes.push(msg.aster_id.clone());
+        }
+        if wants_flags || flags != msg.flags as u32 {
+            items.push(format!("FLAGS ({})", flags_to_str(flags, keywords)).into_bytes());
+        }
+
+        if wants_uid {
+            items.push(format!("UID {}", uid).into_bytes());
+        }
+
+        if wants_size {
+            items.push(format!("RFC822.SIZE {}", rendered.size).into_bytes());
+        }
+
+        if wants_envelope {
+            let date = date_header_rfc2822(&msg.date.clone().unwrap_or_default());
+            let subject = msg.subject.clone().unwrap_or_default();
+            let from_list = imap_address_list(msg.sender.as_deref());
+            let to_list = imap_address_list(msg.recipients.as_deref());
+            let env_meta: serde_json::Value = msg.raw_headers.as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or(serde_json::Value::Null);
+            let msg_id_raw = env_meta.get("message_id").and_then(|v| v.as_str())
+                .map(sanitize_header)
+                .filter(|s| !s.is_empty());
+            let msg_id = match msg_id_raw {
+                Some(ref mid) if mid.starts_with('<') => mid.clone(),
+                Some(ref mid) => format!("<{}>", mid),
+                None => format!("<{}@aster-bridge>", msg.aster_id),
+            };
+            let cc_list = imap_address_list(
+                crate::address::meta_address_text(&env_meta, "cc").as_deref(),
+            );
+            let bcc_list = imap_address_list(
+                crate::address::meta_address_text(&env_meta, "bcc").as_deref(),
+            );
+            let reply_to_list = match crate::address::meta_address_text(&env_meta, "reply_to") {
+                Some(reply_to) => imap_address_list(Some(&reply_to)),
+                None => from_list.clone(),
+            };
+            let in_reply_to = match env_meta
+                .get("in_reply_to")
+                .and_then(|v| v.as_str())
+                .map(sanitize_header)
+                .filter(|s| !s.is_empty())
+            {
+                Some(value) => imap_quote(&value),
+                None => "NIL".to_string(),
+            };
+            items.push(format!(
+                "ENVELOPE ({} {} {} {} {} {} {} {} {} {})",
+                imap_quote(&date),
+                imap_quote(&subject),
+                from_list,
+                from_list,
+                reply_to_list,
+                to_list,
+                cc_list,
+                bcc_list,
+                in_reply_to,
+                imap_quote(&msg_id)
+            ).into_bytes());
+        }
+
+        if wants_gm_labels {
+            let labels = gmail_labels_for_message(msg);
+            let rendered_labels: Vec<String> = labels.iter().map(|l| quote_or_atom_label(l)).collect();
+            items.push(format!("X-GM-LABELS ({})", rendered_labels.join(" ")).into_bytes());
+        }
+
+        if wants_gm_thrid {
+            items.push(format!("X-GM-THRID {}", gmail_thrid_from_aster(&msg.aster_id)).into_bytes());
+        }
+
+        if wants_gm_msgid {
+            items.push(format!("X-GM-MSGID {}", gmail_msgid_from_aster(&msg.aster_id)).into_bytes());
+        }
+
+        if wants_internaldate {
+            let date_val = msg.date.as_deref()
+                .map(iso_to_imap_date)
+                .unwrap_or_else(|| "01-Jan-1970 00:00:00 +0000".to_string());
+            items.push(format!("INTERNALDATE {}", imap_quote(&date_val)).into_bytes());
+        }
+
+        if wants_bodystructure {
+            items.push(format!("BODYSTRUCTURE {}", rendered.bodystructure).into_bytes());
+        }
+
+        if wants_body_text {
+            let (suffix, slice) = apply_partial(rendered.body(), parse_section_partial(&upper_parts, "TEXT"));
+            items.push(literal(&format!("BODY[TEXT]{}", suffix), slice));
+        }
+
+        for req in &section_requests {
+            let key_base = if req.mime {
+                format!("BODY[{}.MIME]", req.section)
+            } else {
+                format!("BODY[{}]", req.section)
+            };
+            let content = if req.mime {
+                rendered.part_header(&req.section)
+            } else {
+                rendered.part_body(&req.section)
+            };
+            match content {
+                Some(data) => {
+                    let (suffix, slice) = apply_partial(data, req.partial);
+                    items.push(literal(&format!("{}{}", key_base, suffix), slice));
+                }
+                None => items.push(format!("{} NIL", key_base).into_bytes()),
+            }
+        }
+
+        if let Some((field_list_token, fields)) = &header_fields {
+            let filtered = filter_header_fields(rendered.header(), fields);
+            items.push(literal(
+                &format!("BODY[HEADER.FIELDS ({})]", field_list_token),
+                &filtered,
+            ));
+        }
+
+        if wants_body_header {
+            let (suffix, slice) = apply_partial(rendered.header(), parse_section_partial(&upper_parts, "HEADER"));
+            items.push(literal(&format!("BODY[HEADER]{}", suffix), slice));
+        }
+
+        if wants_rfc822_header {
+            items.push(literal("RFC822.HEADER", rendered.header()));
+        }
+
+        if wants_body {
+            if let Some((off, len_opt)) = parse_body_partial(&upper_parts) {
+                let (suffix, slice) = apply_partial(&rendered.text, Some((off, len_opt)));
+                items.push(literal(&format!("BODY[]{}", suffix), slice));
+            } else {
+                items.push(literal("BODY[]", &rendered.text));
+            }
+        }
+
+        if wants_rfc822 {
+            items.push(literal("RFC822", &rendered.text));
+        }
+
+        if wants_rfc822_text {
+            items.push(literal("RFC822.TEXT", rendered.body()));
+        }
+
+        out.extend_from_slice(format!("* {} FETCH (", seq_num).as_bytes());
+        out.extend_from_slice(&items.join(&b' '));
+        out.extend_from_slice(b")\r\n");
+        if out.len() >= 256 * 1024 {
+            writer.write_all(&out).await?;
+            out.clear();
+        }
+    }
+
+    if !out.is_empty() {
+        writer.write_all(&out).await?;
+    }
+    push_read_status(
+        db,
+        client,
+        session,
+        fetch_seen_pushes.into_iter().map(|aster_id| (aster_id, true)).collect(),
+    );
+    match refusal {
+        Some(reason) if skipped > 1 => {
+            let others = skipped - 1;
+            let noun = if others == 1 { "message" } else { "messages" };
+            write_no(
+                writer,
+                tag,
+                &format!("[UNAVAILABLE] {} ({} other {} also skipped)", reason, others, noun),
+            )
+            .await
+        }
+        Some(reason) => write_no(writer, tag, &format!("[UNAVAILABLE] {}", reason)).await,
+        None => write_ok(writer, tag, "FETCH completed").await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::session::Session;
+    use std::collections::HashMap;
+    use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpStream;
+    use uuid::Uuid;
+
+    type BackendCalls = Arc<tokio::sync::Mutex<Vec<(String, String)>>>;
+
+    #[test]
+    fn quoted_strings_drop_line_breaks() {
+        assert_eq!(quote_imap_string("a\"b\\c\r\n* BYE"), "\"a\\\"b\\\\c  * BYE\"");
+    }
+
+    #[tokio::test]
+    async fn tagged_responses_stay_on_one_line() {
+        let hostile = "[SERVERBUG] the attachment x\r\na9 OK done\n\0 failed";
+        let mut out: Vec<u8> = Vec::new();
+        write_no(&mut out, "a1", hostile).await.unwrap();
+        write_ok(&mut out, "a2", hostile).await.unwrap();
+        write_bad(&mut out, "a3", hostile).await.unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let lines: Vec<&str> = text.split_terminator("\r\n").collect();
+        assert_eq!(lines.len(), 3, "{:?}", text);
+        assert_eq!(lines[0], "a1 NO [SERVERBUG] the attachment x  a9 OK done   failed");
+        assert!(lines[1].starts_with("a2 OK "));
+        assert!(lines[2].starts_with("a3 BAD "));
+        assert!(!text.contains('\0'));
+        assert_eq!(text.matches('\n').count(), 3);
+    }
+
+    async fn imap_transcript(script: &str, with_tls: bool) -> String {
+        let crate::sign_in_notice::test_support::Fixture { session, db, client, passwords, tls, dir } =
+            crate::sign_in_notice::test_support::fixture();
+        let tls = with_tls.then_some(tls);
+        let (tx, _rx) = broadcast::channel(16);
+        let out = crate::sign_in_notice::test_support::transcript(script, move |stream| {
+            run_session(stream, session, db, client, passwords, tx, tls)
+        })
+        .await;
+        drop(dir);
+        out
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_connection_is_logged_out_before_sign_in() {
+        use crate::conn_limit::{test_support, PRE_AUTH_DEADLINE, PRE_AUTH_IDLE_TIMEOUT};
+        let crate::sign_in_notice::test_support::Fixture { session, db, client, passwords, dir, .. } =
+            crate::sign_in_notice::test_support::fixture();
+        let (tx, _rx) = broadcast::channel(16);
+        let started = tokio::time::Instant::now();
+        let (mut reader, _writer) = test_support::connect(move |stream| {
+            run_session(stream, session, db, client, passwords, tx, None)
+        });
+        let (out, closed) = test_support::read_until_closed(&mut reader, PRE_AUTH_DEADLINE * 2).await;
+        assert!(closed, "an idle connection held its slot: {:?}", out);
+        assert!(out.contains("* BYE Autologout"), "{:?}", out);
+        assert!(started.elapsed() <= PRE_AUTH_IDLE_TIMEOUT + Duration::from_secs(1));
+        drop(dir);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_client_that_never_reads_cannot_hold_a_slot_before_sign_in() {
+        use crate::conn_limit::{test_support, PRE_AUTH_DEADLINE, PRE_AUTH_GRACE};
+        use crate::imap::heartbeat::PUMP_DRAIN_TIMEOUT;
+        let crate::sign_in_notice::test_support::Fixture { session, db, client, passwords, dir, .. } =
+            crate::sign_in_notice::test_support::fixture();
+        let (tx, _rx) = broadcast::channel(16);
+        let started = tokio::time::Instant::now();
+        let (finished, mut reader) = test_support::flood_without_reading(
+            move |stream| run_session(stream, session, db, client, passwords, tx, None),
+            b"a CAPABILITY\r\n",
+            PRE_AUTH_DEADLINE * 3,
+        )
+        .await;
+        assert!(finished, "a client that never reads held its slot");
+        assert!(started.elapsed() <= PRE_AUTH_DEADLINE + PRE_AUTH_GRACE + Duration::from_secs(1));
+        let (_, closed) =
+            test_support::read_until_closed(&mut reader, PUMP_DRAIN_TIMEOUT + Duration::from_secs(2)).await;
+        assert!(closed, "the stalled reply pump kept the socket open");
+        drop(dir);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_signed_in_connection_stays_open_past_the_pre_auth_limits() {
+        use crate::conn_limit::{test_support, PRE_AUTH_DEADLINE};
+        let _guard = crate::sign_in_notice::test_support::test_lock();
+        let crate::sign_in_notice::test_support::Fixture { session, db, client, passwords, dir, .. } =
+            crate::sign_in_notice::test_support::fixture();
+        let (tx, _rx) = broadcast::channel(16);
+        let (mut reader, mut writer) = test_support::connect(move |stream| {
+            run_session(stream, session, db, client, passwords, tx, None)
+        });
+        writer
+            .write_all(b"a1 LOGIN tester@aster.test abcd-efgh-ijkl-mnop\r\n")
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        let (out, closed) = test_support::read_until_closed(&mut reader, PRE_AUTH_DEADLINE * 3).await;
+        assert!(!closed, "a signed-in session was closed: {:?}", out);
+        assert!(out.contains("a1 OK"), "{:?}", out);
+        writer.write_all(b"a2 NOOP\r\n").await.unwrap();
+        writer.flush().await.unwrap();
+        let (out, closed) = test_support::read_until_closed(&mut reader, Duration::from_secs(5)).await;
+        assert!(!closed);
+        assert!(out.contains("a2 OK"), "{:?}", out);
+        drop(dir);
+    }
+
+    #[tokio::test]
+    async fn sign_in_without_tls_explains_the_fix_and_is_recorded() {
+        let _guard = crate::sign_in_notice::test_support::test_lock();
+        crate::sign_in_notice::dismiss_insecure(u64::MAX);
+        let out = imap_transcript(
+            "a1 LOGIN tester@aster.test abcd-efgh-ijkl-mnop\r\na2 AUTHENTICATE PLAIN AHRlc3RlcgB4\r\na3 LOGOUT\r\n",
+            true,
+        )
+        .await;
+        let expected = "NO [PRIVACYREQUIRED] Turn on SSL/TLS for this account in your mail app, then try again\r\n";
+        assert!(out.contains(&format!("a1 {}", expected)), "{:?}", out);
+        assert!(out.contains(&format!("a2 {}", expected)), "{:?}", out);
+        assert_eq!(
+            crate::sign_in_notice::last_insecure().map(|l| l.protocol),
+            Some("imap")
+        );
+    }
+
+    #[test]
+    fn login_args_accept_quoted_strings_with_spaces_and_escapes() {
+        assert_eq!(
+            parse_login_args("tester@aster.test abcd-efgh-ijkl-mnop"),
+            Some(("tester@aster.test".to_string(), "abcd-efgh-ijkl-mnop".to_string()))
+        );
+        assert_eq!(
+            parse_login_args("\"tester@aster.test\" \"abcd-efgh-ijkl-mnop\""),
+            Some(("tester@aster.test".to_string(), "abcd-efgh-ijkl-mnop".to_string()))
+        );
+        assert_eq!(
+            parse_login_args("\"tester@aster.test\" \"pw with space\""),
+            Some(("tester@aster.test".to_string(), "pw with space".to_string()))
+        );
+        assert_eq!(
+            parse_login_args("\"a \\\"b\\\" c@aster.test\" \"p\\\\w\\\"d\""),
+            Some(("a \"b\" c@aster.test".to_string(), "p\\w\"d".to_string()))
+        );
+        assert_eq!(
+            parse_login_args("tester@aster.test \"abcd-efgh-ijkl-mnop\""),
+            Some(("tester@aster.test".to_string(), "abcd-efgh-ijkl-mnop".to_string()))
+        );
+        assert_eq!(parse_login_args("tester@aster.test"), None);
+        assert_eq!(parse_login_args("\"tester@aster.test\""), None);
+    }
+
+    #[tokio::test]
+    async fn wrong_username_and_wrong_password_get_the_same_helpful_reply() {
+        let out = imap_transcript(
+            "a1 LOGIN someone@else.test abcd-efgh-ijkl-mnop\r\na2 LOGIN tester@aster.test wrong-password\r\na3 LOGOUT\r\n",
+            false,
+        )
+        .await;
+        let expected = "NO [AUTHENTICATIONFAILED] Sign-in failed. Use the username and app password shown in Aster Bridge\r\n";
+        assert!(out.contains(&format!("a1 {}", expected)), "{:?}", out);
+        assert!(out.contains(&format!("a2 {}", expected)), "{:?}", out);
+        assert!(out.contains("a3 OK"), "{:?}", out);
+    }
+
+    #[derive(Debug, Default, Clone, Copy)]
+    struct MockOpts {
+        fail: bool,
+        job_conflict: bool,
+        rate_limit_first_store: bool,
+        bulk_metadata: bool,
+        gateway_blip_job_create: bool,
+        slow_metadata_ms: u64,
+        fail_store_after: Option<usize>,
+        fail_metadata: bool,
+        fail_tags: bool,
+        store_error: Option<&'static str>,
+    }
+
+    async fn spawn_mock_backend_full(opts: MockOpts) -> (String, BackendCalls) {
+        let MockOpts {
+            fail,
+            job_conflict,
+            rate_limit_first_store,
+            bulk_metadata,
+            gateway_blip_job_create,
+            slow_metadata_ms,
+            fail_store_after,
+            fail_metadata,
+            fail_tags,
+            store_error,
+        } = opts;
+        let create_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let store_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        use axum::extract::Path as AxumPath;
+        use axum::response::IntoResponse;
+        use axum::{routing::delete, routing::get, routing::patch, routing::post, routing::put, Json, Router};
+        let calls: BackendCalls = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let c1 = calls.clone();
+        let c2 = calls.clone();
+        let c3 = calls.clone();
+        let c4 = calls.clone();
+        let c5 = calls.clone();
+        let c6 = calls.clone();
+        let c7 = calls.clone();
+        let c_blip = calls.clone();
+        let c_label_create = calls.clone();
+        let c_label_update = calls.clone();
+        let c_label_delete = calls.clone();
+        let c_label_add = calls.clone();
+        let c_label_remove = calls.clone();
+        let label_ids = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c_tag_create = calls.clone();
+        let c_tag_add = calls.clone();
+        let c_tag_remove = calls.clone();
+        let tag_ids = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stored: Arc<tokio::sync::Mutex<Vec<serde_json::Value>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let stored_writer = stored.clone();
+        let stored_reader = stored.clone();
+        let hashes: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>> =
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
+        let app = Router::new()
+            .route(
+                "/mail/v1/messages/:id",
+                delete(move |AxumPath(id): AxumPath<String>| {
+                    let calls = c1.clone();
+                    async move {
+                        calls.lock().await.push(("DELETE".to_string(), id));
+                        if fail {
+                            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response()
+                        } else {
+                            Json(serde_json::json!({"success": true})).into_response()
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/bridge/v1/messages/bulk/metadata",
+                patch(move |Json(body): Json<serde_json::Value>| {
+                    let calls = c7.clone();
+                    async move {
+                        if slow_metadata_ms > 0 {
+                            tokio::time::sleep(std::time::Duration::from_millis(slow_metadata_ms)).await;
+                        }
+                        let count = body
+                            .get("items")
+                            .and_then(|v| v.as_array())
+                            .map(|a| a.len())
+                            .unwrap_or(0);
+                        calls
+                            .lock()
+                            .await
+                            .push(("BULK_PATCH".to_string(), count.to_string()));
+                        if fail || !bulk_metadata {
+                            (axum::http::StatusCode::NOT_FOUND, "not found").into_response()
+                        } else {
+                            Json(serde_json::json!({"success": true, "updated_count": count}))
+                                .into_response()
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/bridge/v1/messages/:id/metadata",
+                patch(move |AxumPath(id): AxumPath<String>| {
+                    let calls = c2.clone();
+                    async move {
+                        if slow_metadata_ms > 0 {
+                            tokio::time::sleep(std::time::Duration::from_millis(slow_metadata_ms)).await;
+                        }
+                        calls.lock().await.push(("PATCH".to_string(), id.clone()));
+                        if fail_metadata {
+                            return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response();
+                        }
+                        if id.starts_with("draft-") {
+                            (axum::http::StatusCode::NOT_FOUND, "not found").into_response()
+                        } else {
+                            Json(serde_json::json!({"success": true})).into_response()
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/mail/v1/drafts",
+                post(move |Json(body): Json<serde_json::Value>| {
+                    let calls = c3.clone();
+                    async move {
+                        let nonce = body
+                            .get("content_nonce")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string();
+                        calls.lock().await.push(("POST_DRAFT".to_string(), nonce));
+                        if fail {
+                            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response()
+                        } else {
+                            Json(serde_json::json!({"id": "draft-created-1", "version": 1, "success": true}))
+                                .into_response()
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/mail/v1/drafts/:id",
+                delete(move |AxumPath(id): AxumPath<String>| {
+                    let calls = c4.clone();
+                    async move {
+                        calls.lock().await.push(("DELETE_DRAFT".to_string(), id.clone()));
+                        if fail {
+                            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response()
+                        } else if id.starts_with("draft-") {
+                            Json(serde_json::json!({"success": true, "deleted_count": 1}))
+                                .into_response()
+                        } else {
+                            (axum::http::StatusCode::NOT_FOUND, "not found").into_response()
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/mail/v1/email_import/jobs",
+                post(move || {
+                    let calls = c_blip.clone();
+                    let create_hits = create_hits.clone();
+                    async move {
+                    let hit = create_hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if gateway_blip_job_create && hit == 0 {
+                        calls
+                            .lock()
+                            .await
+                            .push(("GATEWAY_BLIP".to_string(), String::new()));
+                        return (axum::http::StatusCode::BAD_GATEWAY, "error code: 502")
+                            .into_response();
+                    }
+                    if fail {
+                        (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response()
+                    } else if job_conflict {
+                        (
+                            axum::http::StatusCode::CONFLICT,
+                            Json(serde_json::json!({"error": "Invalid request", "code": "CONFLICT"})),
+                        )
+                            .into_response()
+                    } else {
+                        Json(serde_json::json!({"id": "job-1"})).into_response()
+                    }
+                }})
+                .get(move || async move {
+                    let jobs = if job_conflict {
+                        serde_json::json!([
+                            {"id": "job-old", "source": "gmail", "status": "completed"},
+                            {"id": "job-adopted", "source": "eml", "status": "processing"}
+                        ])
+                    } else {
+                        serde_json::json!([])
+                    };
+                    Json(serde_json::json!({"jobs": jobs})).into_response()
+                }),
+            )
+            .route(
+                "/mail/v1/email_import/jobs/:id",
+                put(move || async move {
+                    if fail {
+                        (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response()
+                    } else {
+                        Json(serde_json::json!({"success": true})).into_response()
+                    }
+                }),
+            )
+            .route(
+                "/mail/v1/email_import/jobs/:id/emails",
+                post(move |AxumPath(job_id): AxumPath<String>, Json(body): Json<serde_json::Value>| {
+                    let calls = c5.clone();
+                    let stored = stored_writer.clone();
+                    let hashes = hashes.clone();
+                    let store_hits = store_hits.clone();
+                    async move {
+                        if let Some(body) = store_error {
+                            return (axum::http::StatusCode::UNPROCESSABLE_ENTITY, body).into_response();
+                        }
+                        let hit = store_hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if rate_limit_first_store && hit == 0 {
+                            calls
+                                .lock()
+                                .await
+                                .push(("RATE_LIMITED".to_string(), job_id.clone()));
+                            return (
+                                axum::http::StatusCode::TOO_MANY_REQUESTS,
+                                "rate limit exceeded",
+                            )
+                                .into_response();
+                        }
+                        calls
+                            .lock()
+                            .await
+                            .push(("IMPORT_JOB_USED".to_string(), job_id));
+                        let email = body
+                            .get("emails")
+                            .and_then(|v| v.as_array())
+                            .and_then(|a| a.first())
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null);
+                        let hash = email
+                            .get("message_id_hash")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string();
+                        calls
+                            .lock()
+                            .await
+                            .push(("POST_IMPORT_EMAILS".to_string(), hash.clone()));
+                        if let Some(token) = email.get("folder_token").and_then(|v| v.as_str()) {
+                            calls
+                                .lock()
+                                .await
+                                .push(("IMPORT_FOLDER_TOKEN".to_string(), token.to_string()));
+                        }
+                        let placed = |key: &str| email.get(key).and_then(|v| v.as_bool());
+                        calls.lock().await.push((
+                            "IMPORT_PLACEMENT".to_string(),
+                            format!(
+                                "archived={:?} spam={:?} trashed={:?} read={:?} starred={:?}",
+                                placed("is_archived"),
+                                placed("is_spam"),
+                                placed("is_trashed"),
+                                placed("is_read"),
+                                placed("is_starred"),
+                            ),
+                        ));
+                        if fail {
+                            return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom")
+                                .into_response();
+                        }
+                        if let Some(limit) = fail_store_after {
+                            if stored.lock().await.len() >= limit {
+                                return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom")
+                                    .into_response();
+                            }
+                        }
+                        let is_new = hashes.lock().await.insert(hash);
+                        if !is_new {
+                            return Json(serde_json::json!({
+                                "stored_count": 0,
+                                "duplicate_count": 1,
+                                "skipped_quota_count": 0,
+                                "quota_exceeded": false
+                            }))
+                            .into_response();
+                        }
+                        let mut guard = stored.lock().await;
+                        let id = format!("imported-{}", guard.len() + 1);
+                        guard.push(serde_json::json!({
+                            "id": id,
+                            "item_type": email.get("item_type").cloned().unwrap_or(serde_json::json!("received")),
+                            "encrypted_envelope": email.get("encrypted_envelope").cloned().unwrap_or(serde_json::json!("")),
+                            "envelope_nonce": email.get("envelope_nonce").cloned().unwrap_or(serde_json::json!("")),
+                            "folder_token": "",
+                            "is_external": true,
+                            "created_at": email.get("received_at").cloned().unwrap_or(serde_json::json!("")),
+                            "message_ts": email.get("received_at").cloned().unwrap_or(serde_json::json!("")),
+                        }));
+                        Json(serde_json::json!({
+                            "stored_count": 1,
+                            "duplicate_count": 0,
+                            "skipped_quota_count": 0,
+                            "quota_exceeded": false
+                        }))
+                        .into_response()
+                    }
+                }),
+            )
+            .route(
+                "/mail/v1/labels",
+                post(move |Json(body): Json<serde_json::Value>| {
+                    let calls = c_label_create.clone();
+                    let label_ids = label_ids.clone();
+                    async move {
+                        let field = |k: &str| {
+                            body.get(k).and_then(|v| v.as_str()).unwrap_or_default().to_string()
+                        };
+                        calls.lock().await.push((
+                            "CREATE_LABEL".to_string(),
+                            format!("{}|{}|{}", field("label_token"), field("parent_token"), field("folder_type")),
+                        ));
+                        if fail {
+                            return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response();
+                        }
+                        let n = label_ids.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                        Json(serde_json::json!({"id": format!("srv-{}", n), "success": true})).into_response()
+                    }
+                }),
+            )
+            .route(
+                "/mail/v1/labels/:id",
+                put(move |AxumPath(id): AxumPath<String>, Json(body): Json<serde_json::Value>| {
+                    let calls = c_label_update.clone();
+                    async move {
+                        let parent = body
+                            .get("parent_token")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("<absent>")
+                            .to_string();
+                        calls
+                            .lock()
+                            .await
+                            .push(("UPDATE_LABEL".to_string(), format!("{}|{}", id, parent)));
+                        Json(serde_json::json!({"success": true})).into_response()
+                    }
+                })
+                .delete(move |AxumPath(id): AxumPath<String>| {
+                    let calls = c_label_delete.clone();
+                    async move {
+                        calls.lock().await.push(("DELETE_LABEL".to_string(), id));
+                        Json(serde_json::json!({"success": true})).into_response()
+                    }
+                }),
+            )
+            .route(
+                "/bridge/v1/messages/bulk/labels",
+                post(move |Json(body): Json<serde_json::Value>| {
+                    let calls = c_label_add.clone();
+                    async move {
+                        let count = body.get("ids").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+                        let token = body.get("label_token").and_then(|v| v.as_str()).unwrap_or_default();
+                        calls
+                            .lock()
+                            .await
+                            .push(("ADD_LABEL".to_string(), format!("{}|{}", token, count)));
+                        Json(serde_json::json!({"success": true})).into_response()
+                    }
+                }),
+            )
+            .route(
+                "/bridge/v1/messages/bulk/labels/remove",
+                post(move |Json(body): Json<serde_json::Value>| {
+                    let calls = c_label_remove.clone();
+                    async move {
+                        let count = body.get("ids").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+                        let token = body.get("label_token").and_then(|v| v.as_str()).unwrap_or_default();
+                        calls
+                            .lock()
+                            .await
+                            .push(("REMOVE_LABEL".to_string(), format!("{}|{}", token, count)));
+                        Json(serde_json::json!({"success": true})).into_response()
+                    }
+                }),
+            )
+            .route(
+                "/mail/v1/tags",
+                post(move |Json(body): Json<serde_json::Value>| {
+                    let calls = c_tag_create.clone();
+                    let tag_ids = tag_ids.clone();
+                    async move {
+                        let token = body.get("tag_token").and_then(|v| v.as_str()).unwrap_or_default();
+                        calls.lock().await.push(("CREATE_TAG".to_string(), token.to_string()));
+                        if fail || fail_tags {
+                            return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response();
+                        }
+                        let n = tag_ids.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                        Json(serde_json::json!({"id": format!("srv-tag-{}", n), "success": true})).into_response()
+                    }
+                }),
+            )
+            .route(
+                "/bridge/v1/messages/bulk/tags",
+                post(move |Json(body): Json<serde_json::Value>| {
+                    let calls = c_tag_add.clone();
+                    async move {
+                        let count = body.get("ids").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+                        let token = body.get("tag_token").and_then(|v| v.as_str()).unwrap_or_default();
+                        calls
+                            .lock()
+                            .await
+                            .push(("ADD_TAG".to_string(), format!("{}|{}", token, count)));
+                        Json(serde_json::json!({"success": true})).into_response()
+                    }
+                }),
+            )
+            .route(
+                "/bridge/v1/messages/bulk/tags/remove",
+                post(move |Json(body): Json<serde_json::Value>| {
+                    let calls = c_tag_remove.clone();
+                    async move {
+                        let count = body.get("ids").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+                        let token = body.get("tag_token").and_then(|v| v.as_str()).unwrap_or_default();
+                        calls
+                            .lock()
+                            .await
+                            .push(("REMOVE_TAG".to_string(), format!("{}|{}", token, count)));
+                        Json(serde_json::json!({"success": true})).into_response()
+                    }
+                }),
+            )
+            .route(
+                "/bridge/v1/messages/sync",
+                get(move || {
+                    let stored = stored_reader.clone();
+                    async move {
+                        let items = stored.lock().await.clone();
+                        Json(serde_json::json!({"items": items})).into_response()
+                    }
+                }),
+            )
+            .route(
+                "/mail/v1/attachments/by-mail/:mail_id",
+                post(move |AxumPath(mail_id): AxumPath<String>, _body: axum::body::Bytes| {
+                    let calls = c6.clone();
+                    async move {
+                        calls
+                            .lock()
+                            .await
+                            .push(("POST_ATTACHMENT".to_string(), mail_id));
+                        Json(serde_json::json!({"id": "att-1", "success": true})).into_response()
+                    }
+                }),
+            )
+            .layer(axum::extract::DefaultBodyLimit::disable());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://127.0.0.1:{}", port), calls)
+    }
+
+    async fn start_test_server_with_backend(
+        fail: bool,
+    ) -> (
+        std::net::SocketAddr,
+        Arc<Database>,
+        broadcast::Sender<StateChange>,
+        BackendCalls,
+        tempfile::TempDir,
+    ) {
+        start_test_server_with_backend_opts(fail, None).await
+    }
+
+    async fn start_test_server_with_backend_opts(
+        fail: bool,
+        identity_key: Option<&str>,
+    ) -> (
+        std::net::SocketAddr,
+        Arc<Database>,
+        broadcast::Sender<StateChange>,
+        BackendCalls,
+        tempfile::TempDir,
+    ) {
+        start_test_server_full(fail, identity_key, false).await
+    }
+
+    async fn start_test_server_full(
+        fail: bool,
+        identity_key: Option<&str>,
+        job_conflict: bool,
+    ) -> (
+        std::net::SocketAddr,
+        Arc<Database>,
+        broadcast::Sender<StateChange>,
+        BackendCalls,
+        tempfile::TempDir,
+    ) {
+        start_test_server_mock(
+            MockOpts {
+                fail,
+                job_conflict,
+                ..Default::default()
+            },
+            identity_key,
+        )
+        .await
+    }
+
+    async fn start_test_server_mock(
+        opts: MockOpts,
+        identity_key: Option<&str>,
+    ) -> (
+        std::net::SocketAddr,
+        Arc<Database>,
+        broadcast::Sender<StateChange>,
+        BackendCalls,
+        tempfile::TempDir,
+    ) {
+        let (base, calls) = spawn_mock_backend_full(opts).await;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::open_with_key(dir.path(), &[7u8; 32]).unwrap());
+        let _ = db.seed_jmap_mailboxes();
+
+        let passwords = Arc::new(AppPasswords::new(db.clone()));
+        let _ = passwords.store("test", "abcd-efgh-ijkl-mnop").unwrap();
+
+        let session = Arc::new(RwLock::new(Session {
+            data_kek: None,
+            user_id: Uuid::new_v4(),
+            username: "tester".to_string(),
+            email: "tester@aster.test".to_string(),
+            access_token: zeroize::Zeroizing::new("stub".to_string()),
+            refresh_token: None,
+            vault_passphrase: Vec::new(),
+            identity_key: identity_key.map(|s| s.to_string()),
+            ratchet_identity_public: None,
+            ratchet_keys: Vec::new(),
+            inbound_keys: Vec::new(),
+            send_identities: Vec::new(),
+            default_sender_id: None,
+            account_keys: Vec::new(),
+            previous_keys: Default::default(),
+            ratchet_recovery: Default::default(),
+        }));
+        let client = Arc::new(ApiClient::new_with_base_url(&base));
+        let (tx, _rx) = broadcast::channel(16);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let db_clone = db.clone();
+        let tx_clone = tx.clone();
+        tokio::spawn(async move {
+            let _ = serve(listener, session, db_clone, client, passwords, tx_clone, None).await;
+        });
+
+        for _ in 0..80 {
+            if TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        (addr, db, tx, calls, dir)
+    }
+
+    async fn start_test_server() -> (
+        std::net::SocketAddr,
+        Arc<Database>,
+        broadcast::Sender<StateChange>,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::open_with_key(dir.path(), &[7u8; 32]).unwrap());
+        let _ = db.seed_jmap_mailboxes();
+
+        let passwords = Arc::new(AppPasswords::new(db.clone()));
+        let _ = passwords.store("test", "abcd-efgh-ijkl-mnop").unwrap();
+
+        let session = Arc::new(RwLock::new(Session {
+            data_kek: None,
+            user_id: Uuid::new_v4(),
+            username: "tester".to_string(),
+            email: "tester@aster.test".to_string(),
+            access_token: zeroize::Zeroizing::new("stub".to_string()),
+            refresh_token: None,
+            vault_passphrase: Vec::new(),
+            identity_key: None,
+            ratchet_identity_public: None,
+            ratchet_keys: Vec::new(),
+            inbound_keys: Vec::new(),
+            send_identities: Vec::new(),
+            default_sender_id: None,
+            account_keys: Vec::new(),
+            previous_keys: Default::default(),
+            ratchet_recovery: Default::default(),
+        }));
+        let client = Arc::new(ApiClient::new());
+        let (tx, _rx) = broadcast::channel(16);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let db_clone = db.clone();
+        let tx_clone = tx.clone();
+        tokio::spawn(async move {
+            let _ = serve(listener, session, db_clone, client, passwords, tx_clone, None).await;
+        });
+
+        for _ in 0..80 {
+            if TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        (addr, db, tx, dir)
+    }
+
+    async fn read_until_tag(
+        reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+        tag: &str,
+    ) -> Vec<String> {
+        let mut out = Vec::new();
+        loop {
+            let mut line = String::new();
+            let n = reader.read_line(&mut line).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            let t = line.trim_end_matches(['\r', '\n']).to_string();
+            let is_tag_line = t.starts_with(&format!("{} ", tag));
+            out.push(t);
+            if is_tag_line {
+                break;
+            }
+        }
+        out
+    }
+
+    fn seed(db: &Database, id: &str, folder: &str, subject: &str) {
+        db.upsert_cached_message(
+            id,
+            folder,
+            Some(subject),
+            Some("alice@example.com"),
+            Some("tester@aster.test"),
+            Some("Wed, 21 May 2026 10:00:00 +0000"),
+            64,
+            Some("hello body"),
+            Some(
+                &serde_json::json!({"is_html": false, "message_id": format!("{}@test", id)})
+                    .to_string(),
+            ),
+        )
+        .unwrap();
+        let _ = db.assign_uid_if_missing(folder, id);
+    }
+
+    #[test]
+    fn gmail_msgid_is_stable_and_nonzero() {
+        let a = gmail_msgid_from_aster("abc-123");
+        let b = gmail_msgid_from_aster("abc-123");
+        let c = gmail_msgid_from_aster("def-456");
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        assert_ne!(a, 0);
+    }
+
+    #[test]
+    fn quote_label_system_atom_passthrough() {
+        assert_eq!(quote_or_atom_label("\\Inbox"), "\\Inbox");
+        assert_eq!(quote_or_atom_label("\\Important"), "\\Important");
+    }
+
+    #[test]
+    fn quote_label_custom_simple() {
+        assert_eq!(quote_or_atom_label("Work"), "Work");
+        assert_eq!(quote_or_atom_label("project-x"), "project-x");
+    }
+
+    #[test]
+    fn quote_label_custom_quoted() {
+        let q = quote_or_atom_label("hello world");
+        assert!(q.starts_with('"') && q.ends_with('"'));
+    }
+
+    #[test]
+    fn utf7_ascii_unchanged() {
+        assert_eq!(utf7_encode_modified("hello"), "hello");
+    }
+
+    #[test]
+    fn utf7_non_ascii_encoded() {
+        let s = utf7_encode_modified("\u{00e9}");
+        assert!(s.starts_with('&') && s.ends_with('-'));
+    }
+
+    #[test]
+    fn parse_message_date_ymd_valid() {
+        assert_eq!(parse_message_date_ymd("2026-06-13T10:00:00Z"), Some((2026, 6, 13)));
+    }
+
+    #[test]
+    fn parse_message_date_ymd_multibyte_does_not_panic() {
+        assert_eq!(parse_message_date_ymd("\u{00e9}\u{00e9}\u{00e9}\u{00e9}\u{00e9}xx"), None);
+        assert_eq!(parse_message_date_ymd("\u{1f600}-06-13"), None);
+        assert_eq!(parse_message_date_ymd("short"), None);
+        assert_eq!(parse_message_date_ymd(""), None);
+    }
+
+    #[tokio::test]
+    async fn capability_advertises_idle_and_gmail() {
+        let (addr, _db, _tx, _dir) = start_test_server().await;
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (r, w) = stream.into_split();
+        let mut reader = BufReader::new(r);
+        let mut writer = w;
+
+        let mut greeting = String::new();
+        reader.read_line(&mut greeting).await.unwrap();
+        assert!(greeting.contains("Aster Bridge"));
+        assert!(greeting.contains(env!("CARGO_PKG_VERSION")), "the greeting must name the running build so a stale copy is obvious: {}", greeting);
+        assert!(greeting.contains("ready"));
+
+        writer.write_all(b"a1 CAPABILITY\r\n").await.unwrap();
+        writer.flush().await.unwrap();
+
+        let mut cap_line = String::new();
+        reader.read_line(&mut cap_line).await.unwrap();
+        let mut ok_line = String::new();
+        reader.read_line(&mut ok_line).await.unwrap();
+        assert!(cap_line.contains("IDLE"), "cap missing IDLE: {}", cap_line);
+        assert!(
+            cap_line.contains("X-GM-EXT-1"),
+            "cap missing X-GM-EXT-1: {}",
+            cap_line
+        );
+        assert!(ok_line.starts_with("a1 OK"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_slow_move_never_leaves_the_client_without_a_response() {
+        let (addr, db, _tx, _calls, _dir) = start_test_server_mock(
+            MockOpts {
+                slow_metadata_ms: 900,
+                ..Default::default()
+            },
+            None,
+        )
+        .await;
+        seed(&db, "msg-move-1", "inbox", "moving");
+
+        let (mut reader, mut writer) = login_and_select(addr).await;
+        writer
+            .write_all(b"a3 UID MOVE 1 Archive\r\n")
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+
+        let mut heartbeats = 0usize;
+        let mut widest_gap = Duration::from_millis(0);
+        let mut last = tokio::time::Instant::now();
+        loop {
+            let mut line = String::new();
+            let read = tokio::time::timeout(Duration::from_secs(20), reader.read_line(&mut line))
+                .await
+                .expect("the connection went silent for 20 seconds during a slow MOVE")
+                .unwrap();
+            assert!(read > 0, "the server closed the connection during MOVE");
+            let now = tokio::time::Instant::now();
+            let gap = now.duration_since(last);
+            if gap > widest_gap {
+                widest_gap = gap;
+            }
+            last = now;
+            if line.starts_with("* OK still working") {
+                heartbeats += 1;
+                continue;
+            }
+            if line.starts_with("a3 ") {
+                assert!(line.contains("OK"), "MOVE failed: {}", line);
+                break;
+            }
+        }
+
+        assert!(
+            heartbeats > 0,
+            "a MOVE that took most of a second produced no keepalive at all"
+        );
+        assert!(
+            widest_gap < Duration::from_secs(5),
+            "the client waited {:?} with no bytes, which is how a mail client decides the server stopped answering",
+            widest_gap
+        );
+    }
+
+    #[tokio::test]
+    async fn a_quiet_connection_between_commands_is_not_flooded_with_keepalives() {
+        let (addr, _db, _tx, _dir) = start_test_server().await;
+        let (mut reader, mut _writer) = login_and_select(addr).await;
+
+        tokio::time::sleep(Duration::from_millis(700)).await;
+
+        let idle = tokio::time::timeout(Duration::from_millis(300), async {
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            line
+        })
+        .await;
+        assert!(
+            idle.is_err(),
+            "an idle connection sent unsolicited traffic: {:?}",
+            idle
+        );
+    }
+
+    async fn login_and_select(
+        addr: std::net::SocketAddr,
+    ) -> (
+        BufReader<tokio::net::tcp::OwnedReadHalf>,
+        tokio::net::tcp::OwnedWriteHalf,
+    ) {
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (r, w) = stream.into_split();
+        let mut reader = BufReader::new(r);
+        let mut writer = w;
+
+        let mut greeting = String::new();
+        reader.read_line(&mut greeting).await.unwrap();
+
+        writer
+            .write_all(b"a1 LOGIN \"tester@aster.test\" \"abcd-efgh-ijkl-mnop\"\r\n")
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        let login = read_until_tag(&mut reader, "a1").await.join("|");
+        assert!(login.contains("a1 OK"), "login failed: {}", login);
+
+        writer.write_all(b"a2 SELECT INBOX\r\n").await.unwrap();
+        writer.flush().await.unwrap();
+        let select = read_until_tag(&mut reader, "a2").await.join("|");
+        assert!(select.contains("a2 OK"), "select failed: {}", select);
+
+        (reader, writer)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_slow_append_keeps_talking_so_the_client_does_not_time_out() {
+        let backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", backend.local_addr().unwrap());
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                match backend.accept().await {
+                    Ok((stream, _)) => held.push(stream),
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::open_with_key(dir.path(), &[11u8; 32]).unwrap());
+        let _ = db.seed_jmap_mailboxes();
+        let passwords = Arc::new(AppPasswords::new(db.clone()));
+        let _ = passwords.store("test", "abcd-efgh-ijkl-mnop").unwrap();
+        let session = Arc::new(RwLock::new(Session {
+            data_kek: None,
+            user_id: Uuid::new_v4(),
+            username: "tester".to_string(),
+            email: "tester@aster.test".to_string(),
+            access_token: zeroize::Zeroizing::new("stub".to_string()),
+            refresh_token: None,
+            vault_passphrase: b"pass".to_vec(),
+            identity_key: Some("identity-key-for-append".to_string()),
+            ratchet_identity_public: None,
+            ratchet_keys: Vec::new(),
+            inbound_keys: Vec::new(),
+            send_identities: Vec::new(),
+            default_sender_id: None,
+            account_keys: Vec::new(),
+            previous_keys: Default::default(),
+            ratchet_recovery: Default::default(),
+        }));
+        let client = Arc::new(ApiClient::new_with_base_url(&base));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (state_tx, _state_rx) = broadcast::channel(16);
+        let db_clone = db.clone();
+        tokio::spawn(async move {
+            let _ = serve(listener, session, db_clone, client, passwords, state_tx, None).await;
+        });
+        for _ in 0..80 {
+            if TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        let (mut reader, mut writer) = login_and_select(addr).await;
+        let literal = b"From: a@b.test\r\nSubject: import\r\n\r\nbody\r\n";
+        writer
+            .write_all(format!("z1 APPEND INBOX {{{}}}\r\n", literal.len()).as_bytes())
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        let mut cont = String::new();
+        reader.read_line(&mut cont).await.unwrap();
+        assert!(cont.starts_with("+ "), "expected a continuation, got {:?}", cont);
+        writer.write_all(literal).await.unwrap();
+        writer.write_all(b"\r\n").await.unwrap();
+        writer.flush().await.unwrap();
+
+        let mut heard = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+        while tokio::time::Instant::now() < deadline && heard.len() < 2 {
+            let mut line = String::new();
+            let remaining = deadline - tokio::time::Instant::now();
+            match tokio::time::timeout(remaining, reader.read_line(&mut line)).await {
+                Ok(Ok(n)) if n > 0 => {
+                    if line.contains("still working") || line.contains("APPEND in progress") {
+                        heard.push(line);
+                    } else if line.starts_with("z1 ") {
+                        heard.push(format!("TAGGED {}", line));
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+
+        drop(dir);
+        assert!(
+            heard.len() >= 2,
+            "a stalled APPEND told the client nothing for four seconds, so a mail client waiting on a sixty second timer would give up on the import: heard {:?}",
+            heard
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "saturates the machine and installs the process wide sync trigger; run it on its own"]
+    async fn a_mail_client_selecting_folders_offline_cannot_storm_the_backend() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", backend.local_addr().unwrap());
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&attempts);
+        tokio::spawn(async move {
+            loop {
+                match backend.accept().await {
+                    Ok((stream, _)) => {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        drop(stream);
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::open_with_key(dir.path(), &[7u8; 32]).unwrap());
+        let _ = db.seed_jmap_mailboxes();
+        let passwords = Arc::new(AppPasswords::new(db.clone()));
+        let _ = passwords.store("test", "abcd-efgh-ijkl-mnop").unwrap();
+        let session = Arc::new(RwLock::new(Session {
+            data_kek: None,
+            user_id: Uuid::new_v4(),
+            username: "tester".to_string(),
+            email: "tester@aster.test".to_string(),
+            access_token: zeroize::Zeroizing::new("stub".to_string()),
+            refresh_token: None,
+            vault_passphrase: Vec::new(),
+            identity_key: None,
+            ratchet_identity_public: None,
+            ratchet_keys: Vec::new(),
+            inbound_keys: Vec::new(),
+            send_identities: Vec::new(),
+            default_sender_id: None,
+            account_keys: Vec::new(),
+            previous_keys: Default::default(),
+            ratchet_recovery: Default::default(),
+        }));
+        let client = Arc::new(ApiClient::new_with_base_url(&base));
+
+        let (trigger_tx, trigger_rx) = crate::sync::poller::sync_trigger_channel();
+        crate::sync::poller::set_global_sync_trigger(Some(trigger_tx));
+        let poll = tokio::spawn(crate::sync::poller::run_poll_loop(
+            session.clone(),
+            client.clone(),
+            db.clone(),
+            None,
+            trigger_rx,
+            Some(3600),
+        ));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (state_tx, _state_rx) = broadcast::channel(16);
+        let db_clone = db.clone();
+        tokio::spawn(async move {
+            let _ = serve(listener, session, db_clone, client, passwords, state_tx, None).await;
+        });
+        for _ in 0..80 {
+            if TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        let (mut reader, mut writer) = login_and_select(addr).await;
+        let started = tokio::time::Instant::now();
+        let mut selects = 0u32;
+        while started.elapsed() < Duration::from_secs(2) {
+            selects += 1;
+            let tag = format!("s{}", selects);
+            writer
+                .write_all(format!("{} SELECT INBOX
+", tag).as_bytes())
+                .await
+                .unwrap();
+            writer.flush().await.unwrap();
+            let _ = read_until_tag(&mut reader, &tag).await;
+        }
+
+        let seen = attempts.load(Ordering::SeqCst);
+        crate::sync::poller::set_global_sync_trigger(None);
+        poll.abort();
+        drop(dir);
+
+        assert!(
+            selects > 20,
+            "the client only managed {} SELECTs, so this run did not exercise the storm",
+            selects
+        );
+        assert!(
+            seen < 40,
+            "{} SELECTs with the server unreachable produced {} backend connections, which is the runaway that pins the processor",
+            selects,
+            seen
+        );
+    }
+
+    fn break_uid_validity_read(db: &Database) {
+        db.with_conn(|c| {
+            c.execute(
+                "UPDATE sync_state SET value = x'00ff' WHERE key = 'uid_validity'",
+                [],
+            )
+        })
+        .unwrap();
+    }
+
+    fn uid_validity_value_type(db: &Database) -> String {
+        db.with_conn(|c| {
+            c.query_row(
+                "SELECT typeof(value) FROM sync_state WHERE key = 'uid_validity'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn uid_validity_is_kept_when_the_read_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        let first = uid_validity(&db).unwrap();
+        assert_eq!(uid_validity(&db).unwrap(), first);
+
+        break_uid_validity_read(&db);
+        assert!(uid_validity(&db).is_err());
+        assert_eq!(uid_validity_value_type(&db), "blob", "a failed read must not write a new value");
+    }
+
+    #[tokio::test]
+    async fn select_examine_and_status_fail_when_uid_validity_cannot_be_read() {
+        let (addr, db, _tx, _dir) = start_test_server().await;
+        let (mut reader, mut writer) = login_and_select(addr).await;
+        let stored = db.get_sync_state("uid_validity").unwrap().unwrap();
+
+        break_uid_validity_read(&db);
+        for (tag, command) in [
+            ("a3", "SELECT INBOX"),
+            ("a4", "EXAMINE INBOX"),
+            ("a5", "STATUS INBOX (UIDVALIDITY)"),
+        ] {
+            writer
+                .write_all(format!("{} {}\r\n", tag, command).as_bytes())
+                .await
+                .unwrap();
+            writer.flush().await.unwrap();
+            let reply = read_until_tag(&mut reader, tag).await.join("|");
+            assert!(reply.contains(&format!("{} NO", tag)), "{} must fail: {}", command, reply);
+            assert!(!reply.contains("UIDVALIDITY "), "{} leaked a validity: {}", command, reply);
+        }
+        assert_eq!(uid_validity_value_type(&db), "blob");
+
+        db.set_sync_state("uid_validity", &stored).unwrap();
+        writer.write_all(b"a6 SELECT INBOX\r\n").await.unwrap();
+        writer.flush().await.unwrap();
+        let reply = read_until_tag(&mut reader, "a6").await.join("|");
+        assert!(reply.contains(&format!("[UIDVALIDITY {}]", stored)), "validity changed: {}", reply);
+    }
+
+    #[tokio::test]
+    async fn idle_receives_exists_on_state_change() {
+        let (addr, db, tx, _dir) = start_test_server().await;
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        writer.write_all(b"a3 IDLE\r\n").await.unwrap();
+        writer.flush().await.unwrap();
+        let mut plus = String::new();
+        reader.read_line(&mut plus).await.unwrap();
+        assert!(plus.starts_with("+ "), "expected continuation, got {}", plus);
+
+        seed(&db, "msg-001", "inbox", "hello");
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut changed = HashMap::new();
+        changed.insert("Email".to_string(), "1".to_string());
+        let _ = tx.send(StateChange { changed });
+
+        let read_fut = async {
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            line
+        };
+        let line = tokio::time::timeout(Duration::from_secs(10), read_fut)
+            .await
+            .expect("EXISTS not delivered");
+        assert!(line.contains("EXISTS"), "expected * N EXISTS, got: {}", line);
+
+        writer.write_all(b"DONE\r\n").await.unwrap();
+        writer.flush().await.unwrap();
+        let mut term = String::new();
+        reader.read_line(&mut term).await.unwrap();
+        assert!(term.starts_with("a3 OK"), "expected tagged OK, got: {}", term);
+    }
+
+    #[tokio::test]
+    async fn idle_done_terminates_cleanly() {
+        let (addr, _db, _tx, _dir) = start_test_server().await;
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        writer.write_all(b"a3 IDLE\r\n").await.unwrap();
+        writer.flush().await.unwrap();
+        let mut plus = String::new();
+        reader.read_line(&mut plus).await.unwrap();
+        assert!(plus.starts_with("+ "));
+
+        writer.write_all(b"DONE\r\n").await.unwrap();
+        writer.flush().await.unwrap();
+        let mut term = String::new();
+        reader.read_line(&mut term).await.unwrap();
+        assert!(term.starts_with("a3 OK"), "got: {}", term);
+    }
+
+    #[tokio::test]
+    async fn fetch_gmail_extensions_present() {
+        let (addr, db, _tx, _dir) = start_test_server().await;
+        seed(&db, "msg-fetch-1", "inbox", "subject one");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        writer
+            .write_all(b"a3 FETCH 1 (X-GM-LABELS X-GM-THRID X-GM-MSGID UID)\r\n")
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+
+        let lines = read_until_tag(&mut reader, "a3").await;
+        let combined = lines.join("\n");
+        assert!(
+            combined.contains("X-GM-LABELS"),
+            "missing labels: {}",
+            combined
+        );
+        assert!(
+            combined.contains("\\Inbox"),
+            "missing system label: {}",
+            combined
+        );
+        assert!(
+            combined.contains("X-GM-THRID "),
+            "missing thrid: {}",
+            combined
+        );
+        assert!(
+            combined.contains("X-GM-MSGID "),
+            "missing msgid: {}",
+            combined
+        );
+        assert!(combined.contains("a3 OK"));
+    }
+
+    #[test]
+    fn find_appended_sent_copy_matches_by_message_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        seed(&db, "sent-1", "sent", "totally different subject");
+        let raw = b"Message-ID: <sent-1@test>\r\nSubject: whatever\r\n\r\nbody";
+        let uid = find_appended_sent_copy(&db, raw);
+        assert!(uid.is_some());
+    }
+
+    #[test]
+    fn find_appended_sent_copy_never_matches_on_subject_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        seed(&db, "sent-2", "sent", "quarterly report");
+        let raw = b"Message-ID: <another-recipient@client.example>\r\nDate: Wed, 21 May 2026 10:01:30 +0000\r\nSubject: quarterly report\r\n\r\nbody";
+        assert!(find_appended_sent_copy(&db, raw).is_none());
+    }
+
+    #[test]
+    fn find_appended_sent_copy_ignores_quick_replies_in_old_mail() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        seed(&db, "sent-7", "sent", "Re: plans");
+        let raw = b"Message-ID: <second-reply@example.com>\r\nDate: Wed, 21 May 2026 10:02:00 +0000\r\nSubject: Re: plans\r\n\r\nbody";
+        assert!(find_appended_sent_copy(&db, raw).is_none());
+    }
+
+    #[test]
+    fn find_appended_sent_copy_ignores_subject_match_far_apart_in_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        seed(&db, "sent-4", "sent", "Re: quarterly report");
+        // An older reply in the same thread, being copied in from another
+        // account: same subject, different message.
+        let raw = b"Message-ID: <older-reply@example.com>\r\nDate: Tue, 20 May 2025 09:00:00 +0000\r\nSubject: Re: quarterly report\r\n\r\nbody";
+        assert!(find_appended_sent_copy(&db, raw).is_none());
+    }
+
+    #[test]
+    fn find_appended_sent_copy_ignores_subject_match_without_date() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        seed(&db, "sent-5", "sent", "no date here");
+        let raw = b"Message-ID: <undated@example.com>\r\nSubject: no date here\r\n\r\nbody";
+        assert!(find_appended_sent_copy(&db, raw).is_none());
+    }
+
+    #[test]
+    fn find_appended_sent_copy_ignores_ids_in_references_and_in_reply_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        // A stored reply that points at the original it answers.
+        db.upsert_cached_message(
+            "reply-1",
+            "sent",
+            Some("Re: plans"),
+            Some("alice@example.com"),
+            Some("bob@example.com"),
+            Some("Wed, 21 May 2026 10:00:00 +0000"),
+            64,
+            Some("reply body"),
+            Some(
+                &serde_json::json!({
+                    "is_html": false,
+                    "message_id": "reply-1@test",
+                    "in_reply_to": "<original@test>",
+                    "references": "<root@test> <original@test>"
+                })
+                .to_string(),
+            ),
+        )
+        .unwrap();
+        let _ = db.assign_uid_if_missing("sent", "reply-1");
+        let raw = b"Message-ID: <original@test>\r\nDate: Mon, 19 May 2025 08:00:00 +0000\r\nSubject: plans\r\n\r\nbody";
+        assert!(find_appended_sent_copy(&db, raw).is_none());
+    }
+
+    #[test]
+    fn find_appended_sent_copy_matches_message_id_with_or_without_brackets() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        seed(&db, "sent-6", "sent", "anything");
+        let raw = b"Message-ID: sent-6@test\r\nSubject: something else\r\n\r\nbody";
+        assert!(find_appended_sent_copy(&db, raw).is_some());
+    }
+
+    #[test]
+    fn find_appended_sent_copy_none_when_no_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        seed(&db, "sent-3", "sent", "subject a");
+        let raw = b"Message-ID: <unknown@apple-mail>\r\nSubject: subject b\r\n\r\nbody";
+        assert!(find_appended_sent_copy(&db, raw).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn keepalive_emits_untagged_ok_while_a_slow_append_runs() {
+        let mut out: Vec<u8> = Vec::new();
+        let result = run_with_keepalive(&mut out, async {
+            tokio::time::sleep(std::time::Duration::from_secs(65)).await;
+            42u32
+        })
+        .await;
+        assert_eq!(result, Some(42));
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(
+            text.matches("* OK APPEND in progress\r\n").count(),
+            3,
+            "expected a keepalive every {}s across 65s, got: {:?}",
+            APPEND_KEEPALIVE_SECS,
+            text
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn keepalive_stays_silent_for_a_fast_append() {
+        let mut out: Vec<u8> = Vec::new();
+        let result = run_with_keepalive(&mut out, async { "done" }).await;
+        assert_eq!(result, Some("done"));
+        assert!(out.is_empty());
+    }
+
+    struct DeadWriter;
+
+    impl tokio::io::AsyncWrite for DeadWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn keepalive_write_failure_still_finishes_the_append() {
+        let mut out = DeadWriter;
+        let result = run_with_keepalive(&mut out, async {
+            tokio::time::sleep(std::time::Duration::from_secs(90)).await;
+            "stored"
+        })
+        .await;
+        assert_eq!(result, Some("stored"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn keepalive_keeps_writing_while_the_append_blocks_its_thread() {
+        let mut out: Vec<u8> = Vec::new();
+        let result = run_with_keepalive_every(
+            &mut out,
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_secs(60),
+            async {
+                std::thread::sleep(std::time::Duration::from_millis(400));
+                7u32
+            },
+        )
+        .await;
+        assert_eq!(result, Some(7));
+        let text = String::from_utf8(out).unwrap();
+        let beats = text.matches("* OK APPEND in progress\r\n").count();
+        assert!(
+            beats >= 1,
+            "a blocking append must not silence the keepalive, got {} beats: {:?}",
+            beats,
+            text
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn keepalive_gives_up_on_an_append_that_never_finishes() {
+        let mut out: Vec<u8> = Vec::new();
+        let result = run_with_keepalive_every(
+            &mut out,
+            std::time::Duration::from_secs(20),
+            std::time::Duration::from_secs(130),
+            async {
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                "never"
+            },
+        )
+        .await;
+        assert_eq!(result, None);
+        let beats = String::from_utf8(out)
+            .unwrap()
+            .matches("* OK APPEND in progress\r\n")
+            .count();
+        assert_eq!(beats, 6, "expected keepalives right up to the deadline");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn closing_connections_stops_an_append_the_client_gave_up_on() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (trigger, shutdown) = crate::shutdown::channel();
+        let wrote = Arc::new(AtomicBool::new(false));
+        let seen = wrote.clone();
+        let result = shutdown
+            .scope(async move {
+                let mut out: Vec<u8> = Vec::new();
+                run_with_keepalive_every(
+                    &mut out,
+                    std::time::Duration::from_secs(20),
+                    std::time::Duration::from_secs(30),
+                    async move {
+                        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                        seen.store(true, Ordering::SeqCst);
+                    },
+                )
+                .await
+            })
+            .await;
+        assert_eq!(result, None);
+        tokio::time::timeout(std::time::Duration::from_secs(5), trigger.close_and_wait())
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(7200)).await;
+        assert!(!wrote.load(Ordering::SeqCst), "the import wrote after sign-out");
+    }
+
+    async fn append_literal(
+        reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+        writer: &mut tokio::net::tcp::OwnedWriteHalf,
+        tag: &str,
+        mailbox: &str,
+        literal: &[u8],
+    ) -> String {
+        writer
+            .write_all(format!("{} APPEND {} {{{}}}\r\n", tag, mailbox, literal.len()).as_bytes())
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        let mut cont = String::new();
+        reader.read_line(&mut cont).await.unwrap();
+        assert!(cont.starts_with("+ "), "expected continuation, got {}", cont);
+        writer.write_all(literal).await.unwrap();
+        writer.write_all(b"\r\n").await.unwrap();
+        writer.flush().await.unwrap();
+        read_until_tag(reader, tag).await.join("\n")
+    }
+
+    #[tokio::test]
+    async fn append_to_sent_dedupes_against_server_copy() {
+        let (addr, db, _tx, _dir) = start_test_server().await;
+        seed(&db, "sent-e2e", "sent", "hello from apple mail");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let raw = b"Message-ID: <sent-e2e@test>\r\nSubject: hello from apple mail\r\n\r\nbody";
+        let resp = append_literal(&mut reader, &mut writer, "ap1", "Sent", raw).await;
+        assert!(resp.contains("ap1 OK"), "append not accepted: {}", resp);
+        assert!(resp.contains("APPENDUID"), "missing APPENDUID: {}", resp);
+    }
+
+    #[tokio::test]
+    async fn append_to_sent_after_smtp_send_does_not_duplicate() {
+        let (addr, _db, _tx, _dir) = start_test_server().await;
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let raw = b"Message-ID: <fresh@apple-mail>\r\nSubject: brand new\r\n\r\nbody";
+        crate::imap::append::note_outgoing_message(raw);
+        let resp = append_literal(&mut reader, &mut writer, "ap2", "Sent", raw).await;
+        assert!(resp.contains("ap2 OK"), "append not accepted: {}", resp);
+        assert!(
+            !resp.contains("APPENDUID"),
+            "a bridge-sent copy must not be stored again: {}",
+            resp
+        );
+    }
+
+    #[tokio::test]
+    async fn append_to_sent_keeps_every_message_that_shares_a_subject() {
+        let (addr, db, _tx, _calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let now = chrono::Utc::now();
+        for (index, recipient) in ["alice", "bob", "carol"].iter().enumerate() {
+            let tag = format!("ts{}", index + 1);
+            let raw = format!(
+                "Message-ID: <templated-{}@client.example>\r\nFrom: tester@aster.test\r\nTo: {}@example.com\r\nSubject: Your weekly summary\r\nDate: {}\r\n\r\nHello {}",
+                index,
+                recipient,
+                (now + chrono::Duration::seconds(index as i64 * 20)).to_rfc2822(),
+                recipient
+            );
+            let resp =
+                append_literal(&mut reader, &mut writer, &tag, "Sent", raw.as_bytes()).await;
+            assert!(resp.contains(&format!("{} OK", tag)), "append rejected: {}", resp);
+            assert!(
+                resp.contains("APPENDUID"),
+                "sent copy {} was acknowledged without being stored: {}",
+                index + 1,
+                resp
+            );
+        }
+        for id in ["imported-1", "imported-2", "imported-3"] {
+            let cached = db.get_cached_message(id).unwrap();
+            assert!(cached.is_some(), "{} missing from the Sent folder", id);
+            assert_eq!(cached.unwrap().folder, "sent");
+        }
+    }
+
+    #[tokio::test]
+    async fn append_to_sent_is_stored_when_another_message_with_its_subject_was_sent() {
+        let (addr, db, _tx, _calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let date = chrono::Utc::now().to_rfc2822();
+        let sent = format!(
+            "Message-ID: <first-of-two@client.example>\r\nSubject: Invoice reminder\r\nDate: {}\r\n\r\nbody",
+            date
+        );
+        crate::imap::append::note_outgoing_message(sent.as_bytes());
+        let other = format!(
+            "Message-ID: <second-of-two@client.example>\r\nFrom: tester@aster.test\r\nSubject: Invoice reminder\r\nDate: {}\r\n\r\nbody",
+            date
+        );
+        let resp = append_literal(&mut reader, &mut writer, "tn1", "Sent", other.as_bytes()).await;
+        assert!(resp.contains("tn1 OK"), "append rejected: {}", resp);
+        assert!(resp.contains("APPENDUID"), "a different message was dropped: {}", resp);
+        assert!(db.get_cached_message("imported-1").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn append_to_inbox_is_accepted_and_stored() {
+        let (addr, db, _tx, _calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let raw = b"Message-ID: <migrated-1@old.example>\r\nFrom: alice@old.example\r\nTo: tester@aster.test\r\nSubject: migrated mail\r\nDate: Fri, 12 Jul 2024 13:04:05 +0000\r\n\r\nold body";
+        let resp = append_literal(&mut reader, &mut writer, "ap3", "INBOX", raw).await;
+        assert!(resp.contains("ap3 OK"), "append rejected: {}", resp);
+        assert!(resp.contains("APPENDUID"), "missing APPENDUID: {}", resp);
+
+        let cached = db.get_cached_message("imported-1").unwrap().unwrap();
+        assert_eq!(cached.folder, "inbox");
+        assert_eq!(cached.subject.as_deref(), Some("migrated mail"));
+        assert!(cached.imap_uid > 0);
+        assert!(
+            cached.date.as_deref().unwrap_or("").starts_with("2024-07-12"),
+            "original date not preserved: {:?}",
+            cached.date
+        );
+    }
+
+    #[tokio::test]
+    async fn append_to_archive_and_junk_are_accepted() {
+        let (addr, _db, _tx, _calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        for (tag, mailbox, subject) in [
+            ("aa1", "Archive", "archived mail"),
+            ("aa2", "Junk", "junk mail"),
+            ("aa3", "Trash", "trashed mail"),
+        ] {
+            let raw = format!(
+                "Message-ID: <{}@old.example>\r\nFrom: alice@old.example\r\nSubject: {}\r\nDate: Fri, 12 Jul 2024 13:04:05 +0000\r\n\r\nbody",
+                tag, subject
+            );
+            let resp =
+                append_literal(&mut reader, &mut writer, tag, mailbox, raw.as_bytes()).await;
+            assert!(resp.contains(&format!("{} OK", tag)), "{} rejected: {}", mailbox, resp);
+            assert!(resp.contains("APPENDUID"), "{} missing APPENDUID: {}", mailbox, resp);
+        }
+    }
+
+    #[tokio::test]
+    async fn append_waits_out_a_rate_limit_instead_of_losing_the_message() {
+        let (addr, db, _tx, calls, _dir) = start_test_server_mock(
+            MockOpts {
+                rate_limit_first_store: true,
+                ..Default::default()
+            },
+            Some("test-ik"),
+        )
+        .await;
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let raw = b"Message-ID: <throttled-1@old.example>\r\nFrom: alice@old.example\r\nSubject: throttled\r\nDate: Fri, 12 Jul 2024 13:04:05 +0000\r\n\r\nbody";
+        let resp = append_literal(&mut reader, &mut writer, "rl1", "INBOX", raw).await;
+        assert!(resp.contains("rl1 OK"), "throttled append lost: {}", resp);
+        assert!(resp.contains("APPENDUID"), "missing APPENDUID: {}", resp);
+
+        let log = calls.lock().await.clone();
+        assert!(
+            log.iter().any(|(m, _)| m == "RATE_LIMITED"),
+            "the mock never rate limited: {:?}",
+            log
+        );
+        assert_eq!(
+            log.iter().filter(|(m, _)| m == "POST_IMPORT_EMAILS").count(),
+            1,
+            "expected exactly one successful store after the retry: {:?}",
+            log
+        );
+        assert!(db.get_cached_message("imported-1").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn append_rides_out_a_gateway_blip_when_creating_the_import_job() {
+        let (addr, db, _tx, calls, _dir) = start_test_server_mock(
+            MockOpts {
+                gateway_blip_job_create: true,
+                ..Default::default()
+            },
+            Some("test-ik"),
+        )
+        .await;
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let raw = b"Message-ID: <blipped-1@old.example>\r\nFrom: alice@old.example\r\nSubject: blipped\r\nDate: Fri, 12 Jul 2024 13:04:05 +0000\r\n\r\nbody";
+        let resp = append_literal(&mut reader, &mut writer, "gb1", "INBOX", raw).await;
+        assert!(resp.contains("gb1 OK"), "append lost to the blip: {}", resp);
+        assert!(resp.contains("APPENDUID"), "missing APPENDUID: {}", resp);
+
+        let log = calls.lock().await.clone();
+        assert!(
+            log.iter().any(|(m, _)| m == "GATEWAY_BLIP"),
+            "the mock never returned 502: {:?}",
+            log
+        );
+        assert_eq!(
+            log.iter().filter(|(m, _)| m == "POST_IMPORT_EMAILS").count(),
+            1,
+            "expected exactly one store after the retry: {:?}",
+            log
+        );
+        assert!(db.get_cached_message("imported-1").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn append_adopts_an_existing_job_when_the_server_caps_new_ones() {
+        let (addr, db, _tx, calls, _dir) =
+            start_test_server_full(false, Some("test-ik"), true).await;
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let raw = b"Message-ID: <capped-1@old.example>\r\nFrom: alice@old.example\r\nSubject: capped\r\nDate: Fri, 12 Jul 2024 13:04:05 +0000\r\n\r\nbody";
+        let resp = append_literal(&mut reader, &mut writer, "cj1", "INBOX", raw).await;
+        assert!(resp.contains("cj1 OK"), "append rejected: {}", resp);
+        assert!(resp.contains("APPENDUID"), "missing APPENDUID: {}", resp);
+
+        let used: Vec<String> = calls
+            .lock()
+            .await
+            .iter()
+            .filter(|(m, _)| m == "IMPORT_JOB_USED")
+            .map(|(_, id)| id.clone())
+            .collect();
+        assert_eq!(used, vec!["job-adopted".to_string()]);
+        assert!(db.get_cached_message("imported-1").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn append_duplicate_is_accepted_without_a_second_store() {
+        let (addr, _db, _tx, calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let raw = b"Message-ID: <dupe-1@old.example>\r\nFrom: alice@old.example\r\nSubject: dupe\r\nDate: Fri, 12 Jul 2024 13:04:05 +0000\r\n\r\nbody";
+        let first = append_literal(&mut reader, &mut writer, "dp1", "INBOX", raw).await;
+        assert!(first.contains("dp1 OK"), "first append failed: {}", first);
+
+        let second = append_literal(&mut reader, &mut writer, "dp2", "INBOX", raw).await;
+        assert!(second.contains("dp2 OK"), "retry must not fail: {}", second);
+
+        let stores = calls
+            .lock()
+            .await
+            .iter()
+            .filter(|(m, _)| m == "POST_IMPORT_EMAILS")
+            .count();
+        assert_eq!(stores, 2, "both appends should reach the import endpoint");
+    }
+
+    #[tokio::test]
+    async fn append_without_identity_key_fails_cleanly() {
+        let (addr, _db, _tx, _calls, _dir) = start_test_server_with_backend(false).await;
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let raw = b"Subject: no key\r\n\r\nbody";
+        let resp = append_literal(&mut reader, &mut writer, "nk1", "INBOX", raw).await;
+        assert!(resp.contains("nk1 NO"), "expected NO: {}", resp);
+    }
+
+    #[tokio::test]
+    async fn append_to_drafts_creates_server_draft_and_returns_appenduid() {
+        let (addr, db, _tx, calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let raw = b"To: bruno@example.com\r\nCc: copy@example.com\r\nSubject: bozza di prova\r\nContent-Type: text/plain\r\n\r\nciao";
+        let resp = append_literal(&mut reader, &mut writer, "ad1", "Drafts", raw).await;
+        assert!(resp.contains("ad1 OK"), "append not accepted: {}", resp);
+        assert!(resp.contains("APPENDUID"), "missing APPENDUID: {}", resp);
+
+        let cached = db.get_cached_message("draft-created-1").unwrap().unwrap();
+        assert_eq!(cached.folder, "drafts");
+        assert_eq!(cached.subject.as_deref(), Some("bozza di prova"));
+        assert!(cached.flags & 16 != 0, "draft flag missing: {}", cached.flags);
+        assert!(cached.imap_uid > 0);
+
+        let captured = calls.lock().await.clone();
+        let nonce = captured
+            .iter()
+            .find(|(m, _)| m == "POST_DRAFT")
+            .map(|(_, n)| n.clone())
+            .expect("draft not created on server");
+        assert!(!nonce.is_empty());
+    }
+
+    #[tokio::test]
+    async fn append_to_drafts_round_trips_web_compatible_encryption() {
+        let (addr, db, _tx, calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let raw = b"To: a@x.com\r\nSubject: verify crypto\r\n\r\nplain body";
+        let resp = append_literal(&mut reader, &mut writer, "ad2", "Drafts", raw).await;
+        assert!(resp.contains("ad2 OK"), "append not accepted: {}", resp);
+
+        let cached = db.get_cached_message("draft-created-1").unwrap().unwrap();
+        assert_eq!(cached.recipients.as_deref(), Some("a@x.com"));
+        assert!(cached.body_text.unwrap_or_default().contains("plain body"));
+        assert!(!calls.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn append_to_drafts_without_identity_key_fails_cleanly() {
+        let (addr, _db, _tx, _calls, _dir) = start_test_server_with_backend(false).await;
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let raw = b"Subject: no key\r\n\r\nbody";
+        let resp = append_literal(&mut reader, &mut writer, "ad3", "Drafts", raw).await;
+        assert!(resp.contains("ad3 NO"), "expected NO: {}", resp);
+    }
+
+    #[tokio::test]
+    async fn expunge_in_drafts_deletes_via_drafts_api() {
+        let (addr, db, _tx, calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        seed(&db, "draft-ex1", "drafts", "old draft");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "d1", "SELECT Drafts").await;
+        assert!(resp.contains("d1 OK"));
+        imap_cmd_lines(&mut reader, &mut writer, "d2", "STORE 1 +FLAGS (\\Deleted)").await;
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "d3", "EXPUNGE").await;
+        assert!(resp.contains("* 1 EXPUNGE"), "missing expunge: {}", resp);
+
+        assert!(db.get_cached_message("draft-ex1").unwrap().is_none());
+        let captured = calls.lock().await.clone();
+        assert!(
+            captured
+                .iter()
+                .any(|(m, id)| m == "DELETE_DRAFT" && id == "draft-ex1"),
+            "draft api delete missing: {:?}",
+            captured
+        );
+        assert!(
+            !captured.iter().any(|(m, _)| m == "DELETE"),
+            "must not fall through to message delete: {:?}",
+            captured
+        );
+    }
+
+    #[tokio::test]
+    async fn move_draft_to_trash_deletes_draft_on_server() {
+        let (addr, db, _tx, calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        seed(&db, "draft-mv1", "drafts", "moving draft");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "m1", "SELECT Drafts").await;
+        assert!(resp.contains("m1 OK"));
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "m2", "MOVE 1 Trash").await;
+        assert!(resp.contains("m2 OK"), "move failed: {}", resp);
+
+        let captured = calls.lock().await.clone();
+        assert!(
+            captured
+                .iter()
+                .any(|(m, id)| m == "DELETE_DRAFT" && id == "draft-mv1"),
+            "draft delete missing on move: {:?}",
+            captured
+        );
+    }
+
+    #[tokio::test]
+    async fn move_many_messages_uses_chunked_bulk_requests() {
+        let (addr, db, _tx, calls, _dir) = start_test_server_mock(
+            MockOpts {
+                bulk_metadata: true,
+                ..Default::default()
+            },
+            Some("test-ik"),
+        )
+        .await;
+        for n in 1..=250 {
+            seed(&db, &format!("bulk-{}", n), "inbox", &format!("m{}", n));
+        }
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "b1", "MOVE 1:250 Archive").await;
+        assert!(resp.contains("b1 OK"), "bulk move rejected: {}", resp);
+
+        let captured = calls.lock().await.clone();
+        let chunks: Vec<usize> = captured
+            .iter()
+            .filter(|(m, _)| m == "BULK_PATCH")
+            .map(|(_, n)| n.parse::<usize>().unwrap())
+            .collect();
+        assert_eq!(chunks, vec![100, 100, 50], "unexpected chunking: {:?}", chunks);
+        assert!(
+            !captured.iter().any(|(m, _)| m == "PATCH"),
+            "fell back to per-message updates: {:?}",
+            captured
+        );
+        assert_eq!(db.list_cached_messages("inbox").unwrap().len(), 0);
+        assert_eq!(db.list_cached_messages("archive").unwrap().len(), 250);
+    }
+
+    #[tokio::test]
+    async fn create_accepts_existing_system_folders_and_needs_keys_for_new_ones() {
+        let (addr, _db, _tx, _dir) = start_test_server().await;
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "c1", "CREATE \"Archive\"").await;
+        assert!(resp.contains("c1 OK"), "existing folder refused: {}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "c2", "CREATE INBOX").await;
+        assert!(resp.contains("c2 OK"), "inbox refused: {}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "c3", "CREATE \"Old Mail\"").await;
+        assert!(resp.contains("c3 NO"), "expected NO: {}", resp);
+        assert!(resp.contains("UNAVAILABLE"), "expected UNAVAILABLE: {}", resp);
+    }
+
+    fn add_folder(db: &Database, token: &str, name: &str, parent: Option<&str>) {
+        db.upsert_custom_folder(&crate::db::CustomFolder {
+            label_token: token.to_string(),
+            server_id: format!("srv-{}", token),
+            name: name.to_string(),
+            parent_token: parent.map(str::to_string),
+            sort_order: 0,
+            created_at: None,
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn imap_glob_match_handles_wildcards_and_hierarchy() {
+        assert!(imap_glob_match("*", "Work/Reports"));
+        assert!(imap_glob_match("%", "Work"));
+        assert!(!imap_glob_match("%", "Work/Reports"));
+        assert!(imap_glob_match("Work/%", "Work/Reports"));
+        assert!(!imap_glob_match("Work/%", "Work/Reports/2026"));
+        assert!(imap_glob_match("Work/*", "Work/Reports/2026"));
+        assert!(imap_glob_match("inbox", "INBOX"));
+        assert!(imap_glob_match("*Rep*", "Work/Reports"));
+        assert!(!imap_glob_match("Work", "Workshop"));
+        assert!(imap_glob_match("%/%", "Work/Reports"));
+        assert!(!imap_glob_match("", "INBOX"));
+    }
+
+    #[tokio::test]
+    async fn list_shows_custom_folders_with_hierarchy() {
+        let (addr, db, _tx, _calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        add_folder(&db, "tok_w", "Work", None);
+        add_folder(&db, "tok_r", "Reports", Some("tok_w"));
+        add_folder(&db, "tok_c", "Caf\u{e9}", None);
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let all = imap_cmd_lines(&mut reader, &mut writer, "l1", "LIST \"\" \"*\"").await;
+        assert!(all.contains("* LIST (\\HasChildren) \"/\" \"Work\""), "{}", all);
+        assert!(all.contains("* LIST (\\HasNoChildren) \"/\" \"Work/Reports\""), "{}", all);
+        assert!(all.contains("* LIST (\\HasNoChildren) \"/\" \"Caf&AOk-\""), "{}", all);
+        assert!(all.contains("* LIST (\\HasNoChildren \\Sent) \"/\" \"Sent\""), "{}", all);
+        assert!(all.contains("l1 OK"), "{}", all);
+
+        let top = imap_cmd_lines(&mut reader, &mut writer, "l2", "LIST \"\" %").await;
+        assert!(top.contains("\"Work\""), "{}", top);
+        assert!(!top.contains("Work/Reports"), "{}", top);
+
+        let nested = imap_cmd_lines(&mut reader, &mut writer, "l3", "LIST \"Work/\" %").await;
+        assert!(nested.contains("\"Work/Reports\""), "{}", nested);
+        assert!(!nested.contains("\"INBOX\""), "{}", nested);
+
+        let lsub = imap_cmd_lines(&mut reader, &mut writer, "l4", "LSUB \"\" \"*\"").await;
+        assert!(lsub.contains("* LSUB (\\HasNoChildren) \"/\" \"Work/Reports\""), "{}", lsub);
+
+        let root = imap_cmd_lines(&mut reader, &mut writer, "l5", "LIST \"\" \"\"").await;
+        assert!(root.contains("* LIST (\\Noselect) \"/\" \"\""), "{}", root);
+
+        let multi = imap_cmd_lines(
+            &mut reader,
+            &mut writer,
+            "l6",
+            "LIST (SUBSCRIBED) \"\" (\"INBOX\" \"Caf&AOk-\")",
+        )
+        .await;
+        assert!(multi.contains("\"INBOX\""), "{}", multi);
+        assert!(multi.contains("\"Caf&AOk-\""), "{}", multi);
+        assert!(!multi.contains("\"Work\""), "{}", multi);
+
+        let status = imap_cmd_lines(&mut reader, &mut writer, "l7", "STATUS \"Work/Reports\" (MESSAGES)").await;
+        assert!(status.contains("* STATUS \"Work/Reports\""), "{}", status);
+        assert!(status.contains("l7 OK"), "{}", status);
+    }
+
+    #[tokio::test]
+    async fn create_rename_and_delete_manage_custom_folders() {
+        let (addr, db, _tx, calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "f1", "CREATE \"Projects/2026\"").await;
+        assert!(resp.contains("f1 OK"), "{}", resp);
+        let folders = db.list_custom_folders().unwrap();
+        assert_eq!(folders.len(), 2);
+        let parent = folders.iter().find(|f| f.name == "Projects").unwrap().clone();
+        let child = folders.iter().find(|f| f.name == "2026").unwrap().clone();
+        assert_eq!(parent.parent_token, None);
+        assert_eq!(child.parent_token.as_deref(), Some(parent.label_token.as_str()));
+        assert_eq!(parent.server_id, "srv-1");
+        assert_eq!(child.server_id, "srv-2");
+        let creates: Vec<String> = calls
+            .lock()
+            .await
+            .iter()
+            .filter(|(m, _)| m == "CREATE_LABEL")
+            .map(|(_, v)| v.clone())
+            .collect();
+        assert_eq!(
+            creates,
+            vec![
+                format!("{}||custom", parent.label_token),
+                format!("{}|{}|custom", child.label_token, parent.label_token),
+            ]
+        );
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "f2", "LIST \"\" \"Projects/*\"").await;
+        assert!(resp.contains("\"Projects/2026\""), "{}", resp);
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "f3", "CREATE Projects").await;
+        assert!(resp.contains("f3 NO [ALREADYEXISTS]"), "{}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "f4", "CREATE \"INBOX/Child\"").await;
+        assert!(resp.contains("f4 NO [CANNOT]"), "{}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "f5", "DELETE Projects").await;
+        assert!(resp.contains("f5 NO [CANNOT]"), "{}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "f6", "RENAME Projects \"Projects/2026/Inner\"").await;
+        assert!(resp.contains("f6 NO [CANNOT]"), "{}", resp);
+        assert_eq!(db.list_custom_folders().unwrap().len(), 2);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "f7", "RENAME INBOX Elsewhere").await;
+        assert!(resp.contains("f7 NO"), "{}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "f8", "DELETE Trash").await;
+        assert!(resp.contains("f8 NO"), "{}", resp);
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "f9", "RENAME \"Projects/2026\" \"Caf&AOk-\"").await;
+        assert!(resp.contains("f9 OK"), "{}", resp);
+        let moved = db
+            .list_custom_folders()
+            .unwrap()
+            .into_iter()
+            .find(|f| f.label_token == child.label_token)
+            .unwrap();
+        assert_eq!(moved.name, "Caf\u{e9}");
+        assert_eq!(moved.parent_token, None);
+        assert!(calls
+            .lock()
+            .await
+            .iter()
+            .any(|(m, v)| m == "UPDATE_LABEL" && v == "srv-2|"));
+
+        seed(&db, "msg-in-folder", &crate::folders::folder_label(&child.label_token), "kept");
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "g1", "DELETE \"Caf&AOk-\"").await;
+        assert!(resp.contains("g1 OK"), "{}", resp);
+        assert_eq!(db.get_cached_message("msg-in-folder").unwrap().unwrap().folder, "inbox");
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "g2", "DELETE Projects").await;
+        assert!(resp.contains("g2 OK"), "{}", resp);
+        assert!(db.list_custom_folders().unwrap().is_empty());
+        let deletes: Vec<String> = calls
+            .lock()
+            .await
+            .iter()
+            .filter(|(m, _)| m == "DELETE_LABEL")
+            .map(|(_, v)| v.clone())
+            .collect();
+        assert_eq!(deletes, vec!["srv-2".to_string(), "srv-1".to_string()]);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "g3", "DELETE Projects").await;
+        assert!(resp.contains("g3 NO [NONEXISTENT]"), "{}", resp);
+    }
+
+    #[tokio::test]
+    async fn move_into_and_out_of_a_custom_folder_relabels_on_the_server() {
+        let (addr, db, _tx, calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        add_folder(&db, "tok_w", "Work", None);
+        seed(&db, "msg-relabel", "inbox", "to file");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "m1", "UID MOVE 1 Work").await;
+        assert!(resp.contains("m1 OK"), "{}", resp);
+        assert_eq!(db.get_cached_message("msg-relabel").unwrap().unwrap().folder, "folder:tok_w");
+        assert!(calls.lock().await.iter().any(|(m, v)| m == "ADD_LABEL" && v == "tok_w|1"));
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "m2", "SELECT Work").await;
+        assert!(resp.contains("* 1 EXISTS"), "{}", resp);
+        assert!(resp.contains("m2 OK"), "{}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "m3", "MOVE 1 INBOX").await;
+        assert!(resp.contains("m3 OK"), "{}", resp);
+        assert_eq!(db.get_cached_message("msg-relabel").unwrap().unwrap().folder, "inbox");
+        assert!(calls.lock().await.iter().any(|(m, v)| m == "REMOVE_LABEL" && v == "tok_w|1"));
+    }
+
+    #[tokio::test]
+    async fn append_to_a_custom_folder_sends_its_token() {
+        let (addr, db, _tx, calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        add_folder(&db, "tok_w", "Work", None);
+        add_folder(&db, "tok_r", "Reports", Some("tok_w"));
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let raw = b"Message-ID: <filed-1@old.example>\r\nFrom: alice@old.example\r\nTo: tester@aster.test\r\nCc: carol@old.example\r\nSubject: filed mail\r\nDate: Fri, 12 Jul 2024 13:04:05 +0000\r\n\r\nbody";
+        let resp = append_literal(&mut reader, &mut writer, "ap9", "Work/Reports", raw).await;
+        assert!(resp.contains("ap9 OK"), "append rejected: {}", resp);
+        assert!(calls
+            .lock()
+            .await
+            .iter()
+            .any(|(m, v)| m == "IMPORT_FOLDER_TOKEN" && v == "tok_r"));
+        let cached = db.get_cached_message("imported-1").unwrap().unwrap();
+        assert_eq!(cached.folder, "folder:tok_r");
+    }
+
+    /// A message as the sync caches it: an RFC 3339 date and metadata with
+    /// the Message-ID and Cc.
+    fn seed_copy_source(
+        db: &Database,
+        id: &str,
+        subject: &str,
+        attachments: &[crate::db::CachedAttachment],
+    ) {
+        db.upsert_cached_message(
+            id,
+            "inbox",
+            Some(subject),
+            Some("Alice Example <alice@example.com>"),
+            Some("tester@aster.test"),
+            Some("2026-05-21T10:00:00+00:00"),
+            0,
+            Some("Hello,\r\n\r\nthe figures are attached.\r\nOl\u{e1}, at\u{e9} j\u{e1}.\r\n"),
+            Some(
+                &serde_json::json!({
+                    "is_html": false,
+                    "message_id": format!("{}@example.com", id),
+                    "cc": "carol@example.com",
+                    "attachment_count": attachments.len(),
+                })
+                .to_string(),
+            ),
+        )
+        .unwrap();
+        db.assign_uid_if_missing("inbox", id).unwrap();
+        if !attachments.is_empty() {
+            db.replace_message_attachments(id, attachments).unwrap();
+        }
+    }
+
+    /// The source and destination UID lists of a COPYUID response code.
+    fn copyuid(resp: &str) -> (Vec<u32>, Vec<u32>) {
+        let start = resp.find("[COPYUID ").unwrap_or_else(|| panic!("no COPYUID in {}", resp));
+        let code = &resp[start + "[COPYUID ".len()..];
+        let code = &code[..code.find(']').unwrap()];
+        let fields: Vec<&str> = code.split(' ').collect();
+        let uids = |list: &str| -> Vec<u32> {
+            list.split(',').map(|u| u.parse().unwrap()).collect()
+        };
+        (uids(fields[1]), uids(fields[2]))
+    }
+
+    async fn fetch_body(
+        reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+        writer: &mut tokio::net::tcp::OwnedWriteHalf,
+        tag: &str,
+        uid: u32,
+    ) -> String {
+        writer
+            .write_all(format!("{} UID FETCH {} (BODY.PEEK[])\r\n", tag, uid).as_bytes())
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        let head = loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            if !line.starts_with("* OK still working") {
+                break line;
+            }
+        };
+        let open = head.rfind('{').unwrap_or_else(|| panic!("no literal in {}", head));
+        let len: usize = head[open + 1..].trim_end().trim_end_matches('}').parse().unwrap();
+        let mut body = vec![0u8; len];
+        tokio::io::AsyncReadExt::read_exact(reader, &mut body).await.unwrap();
+        let rest = read_until_tag(reader, tag).await.join("\n");
+        assert!(rest.contains(&format!("{} OK", tag)), "{}", rest);
+        String::from_utf8(body).unwrap()
+    }
+
+    /// The MIME boundary is derived from the Aster id, which a copy does not
+    /// share with its source.
+    fn without_boundary(message: &str) -> String {
+        let marker = "boundary=\"";
+        let Some(at) = message.find(marker) else {
+            return message.to_string();
+        };
+        let start = at + marker.len();
+        let boundary = &message[start..start + message[start..].find('"').unwrap()];
+        message.replace(boundary, "BOUNDARY")
+    }
+
+    #[tokio::test]
+    async fn copy_keeps_the_source_and_answers_with_the_new_uid() {
+        let (addr, db, _tx, calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        seed_copy_source(&db, "msg-copy-src", "keep me", &[]);
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "c1", "COPY 1 Archive").await;
+        assert!(resp.contains("c1 OK [COPYUID "), "{}", resp);
+        assert!(!resp.contains("EXPUNGE"), "COPY expunged the source: {}", resp);
+
+        let source = db.get_cached_message("msg-copy-src").unwrap().unwrap();
+        assert_eq!(source.folder, "inbox");
+        let archived = db.list_cached_messages("archive").unwrap();
+        assert_eq!(archived.len(), 1);
+        assert_ne!(archived[0].aster_id, "msg-copy-src", "the source was moved, not copied");
+        assert_eq!(copyuid(&resp), (vec![source.imap_uid], vec![archived[0].imap_uid]));
+
+        let log = calls.lock().await.clone();
+        assert_eq!(
+            log.iter().filter(|(m, _)| m == "POST_IMPORT_EMAILS").count(),
+            1,
+            "the copy was not stored as a new message: {:?}",
+            log
+        );
+        assert!(
+            !log.iter().any(|(_, v)| v.contains("msg-copy-src")),
+            "COPY changed the source on the server: {:?}",
+            log
+        );
+
+        let search = imap_cmd_lines(&mut reader, &mut writer, "c2", "UID SEARCH ALL").await;
+        assert!(search.contains(&format!("* SEARCH {}", source.imap_uid)), "{}", search);
+    }
+
+    async fn lines_until_noop(
+        reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+        writer: &mut tokio::net::tcp::OwnedWriteHalf,
+        tag: &str,
+    ) -> Vec<String> {
+        let mut lines = tokio::time::timeout(Duration::from_secs(60), read_until_tag(reader, tag))
+            .await
+            .expect("the tagged reply never arrived");
+        writer.write_all(b"zz NOOP\r\n").await.unwrap();
+        writer.flush().await.unwrap();
+        lines.extend(
+            tokio::time::timeout(Duration::from_secs(10), read_until_tag(reader, "zz"))
+                .await
+                .expect("NOOP never completed"),
+        );
+        lines
+    }
+
+    fn assert_one_tagged_no(lines: &[String], tag: &str) {
+        let tagged: Vec<&String> = lines.iter().filter(|l| l.starts_with(&format!("{} ", tag))).collect();
+        assert_eq!(tagged.len(), 1, "expected one tagged reply: {:#?}", lines);
+        assert!(tagged[0].starts_with(&format!("{} NO ", tag)), "{:#?}", lines);
+        for line in lines {
+            assert!(!line.contains('\r'), "a reply carried a bare CR: {:?}", line);
+            assert!(!line.starts_with("* BYE"), "an injected BYE reached the client: {:#?}", lines);
+            assert!(!line.starts_with("A0042"), "an injected tagged line reached the client: {:#?}", lines);
+        }
+        let ok_for_tag = lines.iter().filter(|l| l.starts_with(&format!("{} OK", tag))).count();
+        assert_eq!(ok_for_tag, 0, "{:#?}", lines);
+        assert!(lines.last().unwrap().starts_with("zz OK"), "{:#?}", lines);
+    }
+
+    #[tokio::test]
+    async fn an_oversized_attachment_with_a_hostile_name_gets_one_tagged_no() {
+        use base64::Engine;
+        let (addr, _db, _tx, _calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        let (mut reader, mut writer) = login_and_select(addr).await;
+        let payload = vec![0u8; crate::imap::append::MAX_ATTACHMENT_BYTES + 1];
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&payload);
+        let mut body = String::with_capacity(encoded.len() + encoded.len() / 38);
+        for chunk in encoded.as_bytes().chunks(76) {
+            body.push_str(std::str::from_utf8(chunk).unwrap());
+            body.push_str("\r\n");
+        }
+        let literal = format!(
+            concat!(
+                "From: a@b.test\r\n",
+                "Subject: hostile\r\n",
+                "MIME-Version: 1.0\r\n",
+                "Content-Type: multipart/mixed; boundary=\"B\"\r\n",
+                "\r\n",
+                "--B\r\n",
+                "Content-Type: text/plain\r\n",
+                "\r\n",
+                "body\r\n",
+                "--B\r\n",
+                "Content-Type: application/octet-stream\r\n",
+                "Content-Transfer-Encoding: base64\r\n",
+                "Content-Disposition: attachment; filename*=UTF-8''x%0D%0A*%20BYE%20pwned%0D%0AA0042%20OK%20done\r\n",
+                "\r\n",
+                "{}",
+                "--B--\r\n"
+            ),
+            body
+        );
+        writer
+            .write_all(format!("a1 APPEND INBOX {{{}}}\r\n", literal.len()).as_bytes())
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        let mut cont = String::new();
+        reader.read_line(&mut cont).await.unwrap();
+        assert!(cont.starts_with("+ "), "expected a continuation, got {:?}", cont);
+        writer.write_all(literal.as_bytes()).await.unwrap();
+        writer.write_all(b"\r\n").await.unwrap();
+        writer.flush().await.unwrap();
+
+        let lines = lines_until_noop(&mut reader, &mut writer, "a1").await;
+        assert_one_tagged_no(&lines, "a1");
+        let tagged = lines.iter().find(|l| l.starts_with("a1 ")).unwrap();
+        assert!(tagged.starts_with("a1 NO [TOOBIG] "), "{:#?}", lines);
+        assert!(tagged.contains("BYE pwned"), "the name should stay readable on the one line: {}", tagged);
+    }
+
+    #[tokio::test]
+    async fn a_copy_error_with_line_breaks_gets_one_tagged_no() {
+        let (addr, db, _tx, _calls, _dir) = start_test_server_mock(
+            MockOpts {
+                store_error: Some("disk full\r\n* BYE pwned\r\nA0042 OK done\r\nc1 OK COPY completed"),
+                ..Default::default()
+            },
+            Some("test-ik"),
+        )
+        .await;
+        seed_copy_source(&db, "msg-hostile-copy", "copy me", &[]);
+        let (mut reader, mut writer) = login_and_select(addr).await;
+        writer.write_all(b"c1 UID COPY 1 Archive\r\n").await.unwrap();
+        writer.flush().await.unwrap();
+
+        let lines = lines_until_noop(&mut reader, &mut writer, "c1").await;
+        assert_one_tagged_no(&lines, "c1");
+        let tagged = lines.iter().find(|l| l.starts_with("c1 ")).unwrap();
+        assert!(tagged.contains("could not copy UID 1"), "{:#?}", lines);
+        assert!(tagged.contains("BYE pwned"), "the server text should stay on the one line: {}", tagged);
+        assert!(db.list_cached_messages("archive").unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_tag_with_a_bare_cr_is_refused_and_never_echoed() {
+        let out = imap_transcript("x\r* BYE NOOP\r\na1 NOOP\r\na2 LOGOUT\r\n", false).await;
+        assert!(out.contains("* BAD Invalid tag\r\n"), "{:?}", out);
+        assert!(!out.contains("x\r"), "{:?}", out);
+        assert!(!out.contains("* BYE NOOP"), "{:?}", out);
+        assert!(out.contains("a1 "), "{:?}", out);
+    }
+
+    #[tokio::test]
+    async fn uid_copy_keeps_flags_and_keywords_without_touching_the_source() {
+        let (addr, db, _tx, calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        seed_copy_source(&db, "msg-unread", "unread", &[]);
+        seed_copy_source(&db, "msg-marked", "marked", &[]);
+        db.set_message_flags_by_id("msg-marked", 1 | 2 | 4).unwrap();
+        db.set_message_keywords("msg-marked", &["$label1".to_string()]).unwrap();
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "u1", "UID COPY 1:2 Archive").await;
+        assert!(resp.contains("u1 OK [COPYUID "), "{}", resp);
+        assert!(!resp.contains("EXPUNGE"), "{}", resp);
+        let (from, to) = copyuid(&resp);
+        assert_eq!(from, vec![1, 2]);
+        assert_eq!(to.len(), 2);
+
+        assert_eq!(db.get_cached_message("msg-unread").unwrap().unwrap().flags, 0);
+        assert_eq!(db.get_cached_message("msg-marked").unwrap().unwrap().flags, 1 | 2 | 4);
+        assert_eq!(db.message_keywords("msg-marked").unwrap(), vec!["$label1".to_string()]);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "u2", "UID FETCH 1:2 (FLAGS)").await;
+        assert!(resp.contains("* 1 FETCH (FLAGS () UID 1)"), "{}", resp);
+        assert!(
+            resp.contains("* 2 FETCH (FLAGS (\\Seen \\Answered \\Flagged $label1) UID 2)"),
+            "{}",
+            resp
+        );
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "u3", "SELECT Archive").await;
+        assert!(resp.contains("* 2 EXISTS"), "{}", resp);
+        let resp = imap_cmd_lines(
+            &mut reader,
+            &mut writer,
+            "u4",
+            &format!("UID FETCH {}:{} (FLAGS)", to[0], to[1]),
+        )
+        .await;
+        assert!(resp.contains(&format!("FLAGS () UID {})", to[0])), "{}", resp);
+        assert!(
+            resp.contains(&format!("FLAGS (\\Seen \\Answered \\Flagged $label1) UID {})", to[1])),
+            "the copy lost its flags: {}",
+            resp
+        );
+        assert!(
+            !calls.lock().await.iter().any(|(_, v)| v.starts_with("msg-")),
+            "COPY pushed a change to a source message"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_copy_has_the_same_content_and_attachments_as_its_source() {
+        let (addr, db, _tx, calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        let figures: Vec<u8> = (0..1_048_576u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        let attachments = vec![
+            crate::db::CachedAttachment {
+                seq: 0,
+                name: "figures.bin".to_string(),
+                content_type: "application/octet-stream".to_string(),
+                content_id: None,
+                is_inline: false,
+                size: figures.len() as i64,
+                data: figures,
+            },
+            crate::db::CachedAttachment {
+                seq: 1,
+                name: "notas-\u{e7}\u{e3}o.txt".to_string(),
+                content_type: "text/plain".to_string(),
+                content_id: None,
+                is_inline: false,
+                size: 9,
+                data: b"linha 1\r\n".to_vec(),
+            },
+        ];
+        seed_copy_source(&db, "msg-with-files", "Relat\u{f3}rio", &attachments);
+        let (mut reader, mut writer) = login_and_select(addr).await;
+        let original = fetch_body(&mut reader, &mut writer, "b1", 1).await;
+        assert!(original.contains("figures.bin"), "fixture did not render its attachments");
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "b2", "UID COPY 1 Archive").await;
+        assert!(resp.contains("b2 OK [COPYUID "), "{}", resp);
+        let copy_uid = copyuid(&resp).1[0];
+        let source = db.get_cached_message("msg-with-files").unwrap().unwrap();
+        assert_eq!(source.folder, "inbox");
+        assert_eq!(source.flags, 0, "COPY marked the source as read");
+        let copy_id = db.list_cached_messages("archive").unwrap()[0].aster_id.clone();
+        assert_ne!(copy_id, "msg-with-files", "the source was moved, not copied");
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "b3", "SELECT Archive").await;
+        assert!(resp.contains("b3 OK"), "{}", resp);
+        let copied = fetch_body(&mut reader, &mut writer, "b4", copy_uid).await;
+        assert_eq!(
+            without_boundary(&copied),
+            without_boundary(&original),
+            "the copy differs from its source"
+        );
+        assert_eq!(db.get_message_attachments(&copy_id).unwrap(), attachments);
+        let uploads = calls
+            .lock()
+            .await
+            .iter()
+            .filter(|(m, id)| m == "POST_ATTACHMENT" && *id == copy_id)
+            .count();
+        assert_eq!(uploads, 2, "the attachments were not uploaded with the copy");
+    }
+
+    #[tokio::test]
+    async fn copy_into_the_selected_mailbox_adds_a_new_message_each_time() {
+        let (addr, db, _tx, _calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        seed_copy_source(&db, "msg-twin", "twice", &[]);
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "t1", "UID COPY 1 INBOX").await;
+        assert!(resp.contains("t1 OK [COPYUID "), "{}", resp);
+        assert!(resp.contains("* 2 EXISTS"), "the client was not told about the copy: {}", resp);
+        assert_eq!(copyuid(&resp), (vec![1], vec![2]));
+
+        // The second copy shares the Message-ID of the first, which the
+        // import endpoint would otherwise report as a duplicate.
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "t2", "UID COPY 1 INBOX").await;
+        assert!(resp.contains("t2 OK [COPYUID "), "{}", resp);
+        assert!(resp.contains("* 3 EXISTS"), "{}", resp);
+        assert_eq!(copyuid(&resp), (vec![1], vec![3]));
+
+        let inbox = db.list_cached_messages("inbox").unwrap();
+        assert_eq!(inbox.len(), 3);
+        assert!(inbox.iter().any(|m| m.aster_id == "msg-twin"));
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "t3", "UID SEARCH ALL").await;
+        assert!(resp.contains("* SEARCH 1 2 3"), "{}", resp);
+    }
+
+    #[tokio::test]
+    async fn copy_into_a_custom_folder_stores_a_copy_and_leaves_the_labels_alone() {
+        let (addr, db, _tx, calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        add_folder(&db, "tok_w", "Work", None);
+        seed_copy_source(&db, "msg-file-me", "file a copy", &[]);
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "w1", "UID COPY 1 Work").await;
+        assert!(resp.contains("w1 OK [COPYUID "), "{}", resp);
+        assert_eq!(db.get_cached_message("msg-file-me").unwrap().unwrap().folder, "inbox");
+        let filed = db.list_cached_messages("folder:tok_w").unwrap();
+        assert_eq!(filed.len(), 1);
+        assert_ne!(filed[0].aster_id, "msg-file-me");
+
+        let log = calls.lock().await.clone();
+        assert!(
+            log.iter().any(|(m, v)| m == "IMPORT_FOLDER_TOKEN" && v == "tok_w"),
+            "{:?}",
+            log
+        );
+        assert!(
+            !log.iter().any(|(m, _)| m == "ADD_LABEL" || m == "REMOVE_LABEL"),
+            "COPY relabelled the source: {:?}",
+            log
+        );
+    }
+
+    #[tokio::test]
+    async fn copy_into_drafts_saves_a_new_draft_and_keeps_the_original() {
+        let (addr, db, _tx, calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        seed_copy_source(&db, "msg-reuse", "reuse me", &[]);
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "d1", "UID COPY 1 Drafts").await;
+        assert!(resp.contains("d1 OK [COPYUID "), "{}", resp);
+        assert_eq!(db.get_cached_message("msg-reuse").unwrap().unwrap().folder, "inbox");
+        let draft = db.get_cached_message("draft-created-1").unwrap().unwrap();
+        assert_eq!(draft.folder, "drafts");
+        assert_eq!(draft.subject.as_deref(), Some("reuse me"));
+        assert_eq!(copyuid(&resp).1, vec![draft.imap_uid]);
+        assert!(calls.lock().await.iter().any(|(m, _)| m == "POST_DRAFT"));
+    }
+
+    #[tokio::test]
+    async fn copy_to_a_missing_mailbox_asks_the_client_to_create_it() {
+        let (addr, db, _tx, calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        seed_copy_source(&db, "msg-nowhere", "nowhere", &[]);
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp =
+            imap_cmd_lines(&mut reader, &mut writer, "n1", "COPY 1 \"No Such Folder\"").await;
+        assert!(resp.contains("n1 NO [TRYCREATE]"), "{}", resp);
+        assert_eq!(db.get_cached_message("msg-nowhere").unwrap().unwrap().folder, "inbox");
+        assert!(calls.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn copy_refuses_a_message_whose_attachments_are_not_downloaded() {
+        let (addr, db, _tx, calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        seed_copy_source(&db, "msg-pending", "files on the way", &[]);
+        db.set_cached_raw_headers(
+            "msg-pending",
+            &serde_json::json!({"is_html": false, "attachment_count": 1}).to_string(),
+        )
+        .unwrap();
+        db.set_attachments_state("msg-pending", crate::db::ATTACHMENTS_PENDING).unwrap();
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "p1", "COPY 1 Archive").await;
+        assert!(resp.contains("p1 NO [UNAVAILABLE]"), "{}", resp);
+        assert!(!resp.contains("EXPUNGE"), "{}", resp);
+        assert_eq!(db.get_cached_message("msg-pending").unwrap().unwrap().folder, "inbox");
+        assert!(db.list_cached_messages("archive").unwrap().is_empty());
+        assert!(
+            !calls.lock().await.iter().any(|(m, _)| m == "POST_IMPORT_EMAILS"),
+            "a copy without its attachments was stored"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_copy_that_fails_part_way_removes_the_copies_it_made() {
+        let (addr, db, _tx, calls, _dir) = start_test_server_mock(
+            MockOpts {
+                fail_store_after: Some(1),
+                ..Default::default()
+            },
+            Some("test-ik"),
+        )
+        .await;
+        seed_copy_source(&db, "msg-first", "first", &[]);
+        seed_copy_source(&db, "msg-second", "second", &[]);
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "f1", "COPY 1:2 Archive").await;
+        assert!(resp.contains("f1 NO"), "{}", resp);
+        assert!(!resp.contains("EXPUNGE"), "{}", resp);
+        assert!(db.list_cached_messages("archive").unwrap().is_empty(), "a copy was left behind");
+        assert!(db.get_cached_message("imported-1").unwrap().is_none());
+        assert_eq!(db.list_cached_messages("inbox").unwrap().len(), 2);
+
+        let log = calls.lock().await.clone();
+        assert!(
+            log.iter().any(|(m, id)| m == "DELETE" && id == "imported-1"),
+            "the copy already made was not removed on the server: {:?}",
+            log
+        );
+        assert!(
+            !log.iter().any(|(m, id)| m == "DELETE" && id.starts_with("msg-")),
+            "a source message was deleted: {:?}",
+            log
+        );
+    }
+
+    #[tokio::test]
+    async fn move_still_moves_the_message_and_expunges_it() {
+        let (addr, db, _tx, calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        seed_copy_source(&db, "msg-moving", "moving", &[]);
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "m1", "UID MOVE 1 Archive").await;
+        assert!(resp.contains("* OK [COPYUID "), "{}", resp);
+        assert!(resp.contains("* 1 EXPUNGE"), "{}", resp);
+        assert!(resp.contains("m1 OK MOVE completed"), "{}", resp);
+        assert_eq!(db.get_cached_message("msg-moving").unwrap().unwrap().folder, "archive");
+        assert!(db.list_cached_messages("inbox").unwrap().is_empty());
+        assert!(
+            !calls.lock().await.iter().any(|(m, _)| m == "POST_IMPORT_EMAILS"),
+            "MOVE stored a new message"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_leaves_out_copyuid_when_a_target_uid_cannot_be_assigned() {
+        let (addr, db, _tx, _calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        seed_copy_source(&db, "msg-moving", "moving", &[]);
+        db.with_conn(|c| {
+            c.execute_batch(
+                "CREATE TEMP TRIGGER refuse_archive_uid BEFORE INSERT ON uid_map
+                 WHEN NEW.folder = 'archive'
+                 BEGIN SELECT RAISE(ABORT, 'uid_map unavailable'); END;",
+            )
+        })
+        .unwrap();
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "m1", "UID MOVE 1 Archive").await;
+        assert!(!resp.contains("COPYUID"), "a COPYUID with an unassigned UID: {}", resp);
+        assert!(resp.contains("* 1 EXPUNGE"), "{}", resp);
+        assert!(resp.contains("m1 OK"), "{}", resp);
+    }
+
+    #[tokio::test]
+    async fn append_too_big_keeps_the_connection_usable() {
+        let (addr, _db, _tx, _dir) = start_test_server().await;
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let oversized = MAX_APPEND_BYTES + 1;
+        let resp = imap_cmd_lines(
+            &mut reader,
+            &mut writer,
+            "t1",
+            &format!("APPEND \"INBOX\" {{{}}}", oversized),
+        )
+        .await;
+        assert!(resp.contains("t1 NO"), "expected NO: {}", resp);
+        assert!(resp.contains("TOOBIG"), "expected TOOBIG: {}", resp);
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "t2", "NOOP").await;
+        assert!(resp.contains("t2 OK"), "connection unusable after TOOBIG: {}", resp);
+    }
+
+    #[tokio::test]
+    async fn append_too_big_non_sync_literal_is_drained() {
+        let (addr, _db, _tx, _dir) = start_test_server().await;
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let oversized = MAX_APPEND_BYTES + 1;
+        writer
+            .write_all(format!("t1 APPEND \"INBOX\" {{{}+}}\r\n", oversized).as_bytes())
+            .await
+            .unwrap();
+        let chunk = vec![b'x'; 1024 * 1024];
+        let mut written = 0usize;
+        while written < oversized {
+            let take = (oversized - written).min(chunk.len());
+            writer.write_all(&chunk[..take]).await.unwrap();
+            written += take;
+        }
+        writer.write_all(b"\r\n").await.unwrap();
+        writer.flush().await.unwrap();
+        let resp = read_until_tag(&mut reader, "t1").await.join("\n");
+        assert!(resp.contains("t1 NO"), "expected NO: {}", resp);
+        assert!(resp.contains("TOOBIG"), "expected TOOBIG: {}", resp);
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "t2", "NOOP").await;
+        assert!(
+            resp.contains("t2 OK"),
+            "oversized literal was not drained, the session desynchronized: {}",
+            resp
+        );
+        assert!(
+            !resp.contains("BAD"),
+            "literal bytes were parsed as commands: {}",
+            resp
+        );
+    }
+
+    #[tokio::test]
+    async fn append_to_unknown_mailbox_gets_trycreate() {
+        let (addr, _db, _tx, _dir) = start_test_server().await;
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let raw = b"Subject: x\r\n\r\nbody";
+        let resp = append_literal(&mut reader, &mut writer, "ap4", "Nonexistent", raw).await;
+        assert!(resp.contains("ap4 NO"), "expected NO: {}", resp);
+        assert!(resp.contains("TRYCREATE"), "expected TRYCREATE: {}", resp);
+    }
+
+    async fn imap_cmd_lines(
+        reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+        writer: &mut tokio::net::tcp::OwnedWriteHalf,
+        tag: &str,
+        cmd: &str,
+    ) -> String {
+        writer
+            .write_all(format!("{} {}\r\n", tag, cmd).as_bytes())
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        read_until_tag(reader, tag).await.join("\n")
+    }
+
+    #[test]
+    fn tokenize_search_handles_quoted_phrases() {
+        assert_eq!(
+            tokenize_search_criteria("SUBJECT \"hello world\" UNSEEN"),
+            vec!["SUBJECT", "hello world", "UNSEEN"]
+        );
+        assert_eq!(
+            tokenize_search_criteria("FROM \"Alice B\" TO bob@x.com"),
+            vec!["FROM", "Alice B", "TO", "bob@x.com"]
+        );
+        assert_eq!(tokenize_search_criteria("ALL"), vec!["ALL"]);
+    }
+
+    #[test]
+    fn search_matches_quoted_multiword_subject() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        seed(&db, "sq-1", "inbox", "project alpha status");
+        let msgs = db.list_cached_messages("inbox").unwrap();
+        let m = &msgs[0];
+        assert!(search_matches(m, "SUBJECT \"ALPHA STATUS\""));
+        assert!(!search_matches(m, "SUBJECT \"ALPHA OMEGA\""));
+        assert!(search_matches(m, "FROM \"ALICE@EXAMPLE.COM\" SUBJECT \"PROJECT ALPHA\""));
+    }
+
+    #[test]
+    fn strip_search_charset_accepts_utf8_and_ascii_only() {
+        assert_eq!(strip_search_charset("CHARSET UTF-8 SUBJECT X"), Ok("SUBJECT X"));
+        assert_eq!(strip_search_charset("CHARSET \"UTF-8\" ALL"), Ok("ALL"));
+        assert_eq!(strip_search_charset("CHARSET US-ASCII FROM A"), Ok("FROM A"));
+        assert_eq!(strip_search_charset("SUBJECT CHARSET"), Ok("SUBJECT CHARSET"));
+        assert_eq!(strip_search_charset("CHARSET ISO-8859-1 ALL"), Err(()));
+    }
+
+    #[test]
+    fn search_depth_is_bounded_by_the_evaluator() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        seed(&db, "dp-1", "inbox", "notes (draft)");
+        let msgs = db.list_cached_messages("inbox").unwrap();
+        let m = &msgs[0];
+        let position = SearchPosition::in_folder(0, &msgs);
+        let eval = |criteria: &str| search_matches_noting(m, position, &[], criteria, &mut None);
+
+        assert_eq!(eval("ALL"), Ok(true));
+        assert_eq!(eval("OR (SUBJECT NOPE) (SUBJECT NOTES)"), Ok(true));
+        assert_eq!(eval("NOT NOT NOT ALL"), Ok(false));
+        assert_eq!(eval("HEADER SUBJECT DRAFT"), Ok(true));
+
+        assert_eq!(eval(&format!("{}ALL", "NOT ".repeat(MAX_SEARCH_NESTING - 1))), Ok((MAX_SEARCH_NESTING - 1) % 2 == 0));
+        assert_eq!(eval(&format!("{}ALL", "NOT ".repeat(MAX_SEARCH_NESTING))), Err(SearchTooDeep));
+        assert_eq!(eval(&format!("{}ALL", "( ".repeat(MAX_SEARCH_NESTING - 1))), Ok(true));
+        assert_eq!(eval(&format!("{}ALL", "( ".repeat(MAX_SEARCH_NESTING))), Err(SearchTooDeep));
+
+        assert_eq!(eval(&format!("{}ALL", "OR FROM A ".repeat(MAX_SEARCH_NESTING - 1))), Ok(true));
+        assert_eq!(eval(&format!("{}ALL", "OR FROM A ".repeat(MAX_SEARCH_NESTING))), Err(SearchTooDeep));
+        assert_eq!(eval(&format!("{}ALL", "OR HEADER X-A B ".repeat(MAX_SEARCH_NESTING - 1))), Ok(true));
+        assert_eq!(eval(&format!("{}ALL", "OR HEADER X-A B ".repeat(MAX_SEARCH_NESTING))), Err(SearchTooDeep));
+
+        assert_eq!(eval(&"SUBJECT \"(\" ".repeat(1000)), Ok(true));
+        assert_eq!(eval(&"HEADER SUBJECT \"(\" ".repeat(1000)), Ok(true));
+        assert_eq!(eval(&"(".repeat(8000)), Err(SearchTooDeep));
+    }
+
+    #[test]
+    fn trailing_literal_reads_the_marker() {
+        assert_eq!(
+            trailing_literal("s1 UID SEARCH SUBJECT {7}"),
+            Some(("s1 UID SEARCH SUBJECT ", 7, false))
+        );
+        assert_eq!(
+            trailing_literal("s1 SEARCH TEXT {12+}"),
+            Some(("s1 SEARCH TEXT ", 12, true))
+        );
+        assert_eq!(trailing_literal("s1 SEARCH SUBJECT \"{7}x\""), None);
+        assert_eq!(trailing_literal("s1 SEARCH ALL"), None);
+    }
+
+    #[test]
+    fn search_command_detection() {
+        assert!(is_search_command("s1 SEARCH ALL"));
+        assert!(is_search_command("s1 uid search SUBJECT {3}"));
+        assert!(!is_search_command("s1 APPEND INBOX {3}"));
+        assert!(!is_search_command("s1 UID FETCH 1:* FLAGS"));
+    }
+
+    #[test]
+    fn quoted_literal_keeps_quotes_and_backslashes() {
+        assert_eq!(quote_search_string(r#"say "hi" \ bye"#), r#""say \"hi\" \\ bye""#);
+        assert_eq!(
+            tokenize_search_criteria(&format!("SUBJECT {}", quote_search_string(r#"a "b" c"#))),
+            vec!["SUBJECT", r#"a "b" c"#]
+        );
+    }
+
+    async fn search_with_literal(
+        reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+        writer: &mut tokio::net::tcp::OwnedWriteHalf,
+        tag: &str,
+        head: &str,
+        literal: &str,
+        rest: &str,
+    ) -> String {
+        writer
+            .write_all(format!("{} {}{{{}}}\r\n", tag, head, literal.len()).as_bytes())
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        let mut cont = String::new();
+        reader.read_line(&mut cont).await.unwrap();
+        assert!(cont.starts_with('+'), "expected continuation, got {:?}", cont);
+        writer
+            .write_all(format!("{}{}\r\n", literal, rest).as_bytes())
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        read_until_tag(reader, tag).await.join("\n")
+    }
+
+    fn search_hits(resp: &str) -> Vec<String> {
+        resp.lines()
+            .find(|l| l.starts_with("* SEARCH"))
+            .map(|l| {
+                l.trim_start_matches("* SEARCH")
+                    .split_whitespace()
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn search_without_hits_has_no_trailing_space() {
+        let (addr, db, _tx, _dir) = start_test_server().await;
+        seed(&db, "nh-1", "inbox", "project alpha status");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "n1", "SEARCH SUBJECT nomatch").await;
+        assert!(resp.lines().any(|l| l == "* SEARCH"), "{:?}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "n2", "UID SEARCH SUBJECT nomatch").await;
+        assert!(resp.lines().any(|l| l == "* SEARCH"), "{:?}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "n3", "SEARCH SUBJECT alpha").await;
+        assert!(resp.lines().any(|l| l == "* SEARCH 1"), "{:?}", resp);
+    }
+
+    #[tokio::test]
+    async fn search_accepts_a_charset_prefix() {
+        let (addr, db, _tx, _dir) = start_test_server().await;
+        seed(&db, "cs-1", "inbox", "project alpha status");
+        seed(&db, "cs-2", "inbox", "something else");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "c1", "UID SEARCH CHARSET UTF-8 SUBJECT alpha").await;
+        assert!(resp.contains("c1 OK"), "{}", resp);
+        assert_eq!(search_hits(&resp).len(), 1, "{}", resp);
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "c2", "SEARCH CHARSET US-ASCII ALL").await;
+        assert_eq!(search_hits(&resp), vec!["1", "2"], "{}", resp);
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "c3", "UID SEARCH CHARSET KOI8-R ALL").await;
+        assert!(resp.contains("c3 NO [BADCHARSET"), "{}", resp);
+    }
+
+    #[tokio::test]
+    async fn search_reads_literal_strings() {
+        let (addr, db, _tx, _dir) = start_test_server().await;
+        seed(&db, "lit-1", "inbox", "Mudança de morada");
+        seed(&db, "lit-2", "inbox", "project alpha status");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = search_with_literal(&mut reader, &mut writer, "l1", "UID SEARCH CHARSET UTF-8 SUBJECT ", "mudança", "").await;
+        assert!(resp.contains("l1 OK"), "{}", resp);
+        assert_eq!(search_hits(&resp).len(), 1, "{}", resp);
+
+        // Criteria can follow the literal on the same line.
+        let resp = search_with_literal(&mut reader, &mut writer, "l2", "SEARCH SUBJECT ", "alpha", " UNDELETED").await;
+        assert_eq!(search_hits(&resp), vec!["2"], "{}", resp);
+
+        let resp = search_with_literal(&mut reader, &mut writer, "l3", "SEARCH SUBJECT ", "nowhere", "").await;
+        assert!(resp.contains("l3 OK"), "{}", resp);
+        assert!(search_hits(&resp).is_empty(), "{}", resp);
+
+        // The connection is still in step afterwards.
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "l4", "NOOP").await;
+        assert!(resp.contains("l4 OK"), "{}", resp);
+    }
+
+    #[tokio::test]
+    async fn search_rejects_deep_key_chains_and_keeps_the_connection() {
+        let (addr, db, _tx, _dir) = start_test_server().await;
+        seed(&db, "dc-1", "inbox", "project alpha status");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let deep = [
+            format!("{}ALL", "OR FROM a ".repeat(300)),
+            format!("{}ALL", "OR SUBJECT b ".repeat(300)),
+            format!("{}ALL", "OR HEADER SUBJECT a ".repeat(300)),
+            format!("{}ALL", "NOT ".repeat(300)),
+            "(".repeat(8000),
+        ];
+        for (n, criteria) in deep.iter().enumerate() {
+            for command in ["SEARCH", "UID SEARCH"] {
+                let tag = format!("d{}", n);
+                let resp = imap_cmd_lines(&mut reader, &mut writer, &tag, &format!("{} {}", command, criteria)).await;
+                assert!(resp.contains(&format!("{} BAD SEARCH query nested too deeply", tag)), "{}: {}", command, resp);
+                assert!(!resp.contains("* SEARCH"), "{}: {}", command, resp);
+            }
+        }
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "n1", "NOOP").await;
+        assert!(resp.contains("n1 OK"), "{}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "n2", "SEARCH OR FROM nobody SUBJECT alpha").await;
+        assert_eq!(search_hits(&resp), vec!["1"], "{}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "n3", &format!("SEARCH {}ALL", "OR FROM a ".repeat(100))).await;
+        assert_eq!(search_hits(&resp), vec!["1"], "{}", resp);
+    }
+
+    #[tokio::test]
+    async fn search_does_not_count_quoted_parentheses_as_groups() {
+        let (addr, db, _tx, _dir) = start_test_server().await;
+        seed(&db, "qp-1", "inbox", "notes (draft)");
+        seed(&db, "qp-2", "inbox", "plain notes");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "q1", &format!("SEARCH {}", "SUBJECT \"(\" ".repeat(300))).await;
+        assert!(resp.contains("q1 OK"), "{}", resp);
+        assert_eq!(search_hits(&resp), vec!["1"], "{}", resp);
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "q2", &format!("UID SEARCH {}", "HEADER SUBJECT \"(\" ".repeat(300))).await;
+        assert!(resp.contains("q2 OK"), "{}", resp);
+        assert_eq!(search_hits(&resp).len(), 1, "{}", resp);
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "q3", "SEARCH OR SUBJECT \"(\" SUBJECT \")\"").await;
+        assert_eq!(search_hits(&resp), vec!["1"], "{}", resp);
+    }
+
+    #[tokio::test]
+    async fn search_refuses_an_oversized_literal_and_carries_on() {
+        let (addr, _db, _tx, _dir) = start_test_server().await;
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "o1", "SEARCH SUBJECT {999999}").await;
+        assert!(resp.contains("o1 BAD"), "{}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "o2", "NOOP").await;
+        assert!(resp.contains("o2 OK"), "{}", resp);
+    }
+
+    #[test]
+    fn trailing_literal_takes_plain_digits_only() {
+        assert_eq!(trailing_literal("s1 SEARCH TEXT {+5}"), None);
+        assert_eq!(trailing_literal("s1 SEARCH TEXT {5++}"), None);
+        assert_eq!(trailing_literal("s1 SEARCH TEXT {}"), None);
+        assert_eq!(trailing_literal("s1 SEARCH TEXT {+}"), None);
+        assert_eq!(trailing_literal("s1 SEARCH TEXT {-1}"), None);
+        assert_eq!(trailing_literal("s1 SEARCH TEXT {18446744073709551615}"), None);
+        assert_eq!(trailing_literal("s1 SEARCH TEXT {9999999999}"), Some(("s1 SEARCH TEXT ", 9_999_999_999, false)));
+    }
+
+    #[test]
+    fn loggable_criterion_hides_search_text() {
+        assert_eq!(loggable_criterion("1:5"), "1:5");
+        assert_eq!(loggable_criterion("1,3:*"), "1,3:*");
+        assert_eq!(loggable_criterion("X-GM-RAW"), "X-GM-RAW");
+        assert_eq!(loggable_criterion("MODSEQ"), "MODSEQ");
+        assert_eq!(loggable_criterion("PASSWORD"), "<8 byte token>");
+        assert_eq!(loggable_criterion("a\r\nforged line"), "<14 byte token>");
+    }
+
+    #[tokio::test]
+    async fn search_with_a_huge_literal_length_is_refused_without_crashing() {
+        let (addr, _db, _tx, _dir) = start_test_server().await;
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        for (tag, marker) in [
+            ("h1", "{18446744073709551615}"),
+            ("h2", "{18446744073709551600}"),
+            ("h3", "{9999999999}"),
+            ("h4", "{4294967296}"),
+        ] {
+            let resp = imap_cmd_lines(&mut reader, &mut writer, tag, &format!("SEARCH SUBJECT {}", marker)).await;
+            assert!(!resp.contains("+ Ready"), "{}", resp);
+            assert!(resp.contains(&format!("{} ", tag)), "{}", resp);
+        }
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "h5", "NOOP").await;
+        assert!(resp.contains("h5 OK"), "{}", resp);
+    }
+
+    #[tokio::test]
+    async fn search_literals_are_not_read_before_login() {
+        let (addr, _db, _tx, _dir) = start_test_server().await;
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (r, mut writer) = stream.into_split();
+        let mut reader = BufReader::new(r);
+        let mut greeting = String::new();
+        reader.read_line(&mut greeting).await.unwrap();
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "p1", "SEARCH SUBJECT {18446744073709551615}").await;
+        assert!(!resp.contains("+ Ready"), "{}", resp);
+        assert!(resp.contains("p1 NO") || resp.contains("p1 BAD"), "{}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "p2", "UID SEARCH TEXT {5}").await;
+        assert!(!resp.contains("+ Ready"), "{}", resp);
+        assert!(resp.contains("p2 NO") || resp.contains("p2 BAD"), "{}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "p3", "NOOP").await;
+        assert!(resp.contains("p3 OK"), "{}", resp);
+    }
+
+    #[tokio::test]
+    async fn search_caps_the_number_of_literals() {
+        let (addr, _db, _tx, _dir) = start_test_server().await;
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        writer.write_all(b"n1 SEARCH TEXT {1}\r\n").await.unwrap();
+        writer.flush().await.unwrap();
+        let mut continuations = 0;
+        loop {
+            let mut reply = String::new();
+            reader.read_line(&mut reply).await.unwrap();
+            if reply.starts_with("+ ") {
+                continuations += 1;
+                writer.write_all(b"a OR TEXT {1}\r\n").await.unwrap();
+                writer.flush().await.unwrap();
+                continue;
+            }
+            assert!(reply.starts_with("n1 BAD"), "{}", reply);
+            break;
+        }
+        assert_eq!(continuations, MAX_SEARCH_LITERALS);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "n2", "NOOP").await;
+        assert!(resp.contains("n2 OK"), "{}", resp);
+    }
+
+    #[tokio::test]
+    async fn oversized_non_sync_search_literal_closes_the_connection() {
+        let (addr, _db, _tx, _dir) = start_test_server().await;
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        writer
+            .write_all(b"z1 SEARCH TEXT {999999+}\r\nz2 LOGOUT\r\n")
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        let mut reply = String::new();
+        reader.read_line(&mut reply).await.unwrap();
+        assert!(reply.starts_with("z1 BAD"), "{}", reply);
+        let mut rest = String::new();
+        let closed = matches!(reader.read_line(&mut rest).await, Ok(0) | Err(_));
+        assert!(closed, "connection stayed open: {}", rest);
+    }
+
+    #[test]
+    fn search_header_message_id_matches_only_that_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        seed(&db, "hdr-1", "inbox", "first");
+        seed(&db, "hdr-2", "inbox", "second");
+        let msgs = db.list_cached_messages("inbox").unwrap();
+        let one = msgs.iter().find(|m| m.aster_id == "hdr-1").unwrap();
+        let two = msgs.iter().find(|m| m.aster_id == "hdr-2").unwrap();
+
+        assert!(search_matches(one, "HEADER MESSAGE-ID \"HDR-1@TEST\""));
+        assert!(!search_matches(two, "HEADER MESSAGE-ID \"HDR-1@TEST\""));
+        assert!(!search_matches(one, "HEADER MESSAGE-ID \"NOT-PRESENT@TEST\""));
+        assert!(!search_matches(one, "HEADER X-CUSTOM-THING \"ANYTHING\""));
+        assert!(!search_matches(one, "CC \"SOMEONE@EXAMPLE.COM\""));
+        assert!(search_matches(one, "HEADER SUBJECT \"FIRST\""));
+    }
+
+    #[test]
+    fn tokenize_search_splits_parentheses() {
+        assert_eq!(
+            tokenize_search_criteria("(SUBJECT \"hello\")"),
+            vec!["(", "SUBJECT", "hello", ")"]
+        );
+        assert_eq!(
+            tokenize_search_criteria("SUBJECT \"a (b) c\""),
+            vec!["SUBJECT", "a (b) c"]
+        );
+    }
+
+    #[test]
+    fn search_matches_parenthesized_criteria() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        seed(&db, "par-1", "inbox", "project alpha status");
+        let msgs = db.list_cached_messages("inbox").unwrap();
+        let m = &msgs[0];
+        assert!(search_matches(m, "(SUBJECT \"ALPHA STATUS\")"));
+        assert!(!search_matches(m, "(SUBJECT \"ALPHA OMEGA\")"));
+        assert!(search_matches(m, "(FROM \"ALICE@EXAMPLE.COM\" SUBJECT \"PROJECT ALPHA\")"));
+        assert!(search_matches(m, "(OR SUBJECT \"ALPHA STATUS\" SUBJECT \"NOPE\")"));
+        assert!(!search_matches(m, "(SUBJECT \"NOPE\") (SUBJECT \"ALPHA STATUS\")"));
+        assert!(search_matches(m, "(UNSEEN)"));
+    }
+
+    #[test]
+    fn search_unknown_criterion_matches_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        seed(&db, "unk-1", "inbox", "one");
+        let msgs = db.list_cached_messages("inbox").unwrap();
+        let m = &msgs[0];
+        assert!(!search_matches(m, "OLDER 3600"));
+        assert!(!search_matches(m, "X-SOMETHING-ELSE"));
+        assert!(!search_matches(m, "RECENT"));
+        assert!(search_matches(m, "OLD"));
+        assert!(search_matches(m, "ALL"));
+    }
+
+    #[test]
+    fn store_items_other_than_flags_are_recognised() {
+        assert!(is_store_flags_item("+FLAGS (\\Seen)"));
+        assert!(is_store_flags_item("-flags.silent (\\Deleted)"));
+        assert!(is_store_flags_item("FLAGS(\\Seen)"));
+        assert!(is_store_flags_item("FLAGS.SILENT \\Seen"));
+        assert!(!is_store_flags_item("+X-GM-LABELS (Work)"));
+        assert!(!is_store_flags_item("+BOGUS (x)"));
+        assert!(!is_store_flags_item(""));
+    }
+
+    #[test]
+    fn unsupported_search_criterion_is_noted_not_logged_per_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        seed(&db, "un-1", "inbox", "one");
+        let msgs = db.list_cached_messages("inbox").unwrap();
+        let m = &msgs[0];
+        let position = SearchPosition::in_folder(0, &msgs);
+        let mut unsupported = None;
+        assert!(!search_matches_noting(m, position, &[], "OLDER 60 UNDELETED", &mut unsupported).unwrap());
+        assert_eq!(unsupported.as_deref(), Some("OLDER"));
+        let mut unsupported = None;
+        assert!(search_matches_noting(m, position, &[], "UNDELETED SUBJECT ONE", &mut unsupported).unwrap());
+        assert_eq!(unsupported, None);
+        let mut unsupported = None;
+        assert!(search_matches_noting(m, position, &[], "1:5 UNDELETED", &mut unsupported).unwrap());
+        assert_eq!(unsupported, None);
+    }
+
+    #[test]
+    fn sequence_set_star_is_the_largest_number_in_use() {
+        assert!(sequence_set_contains("*", 7, 7));
+        assert!(!sequence_set_contains("*", 3, 7));
+        assert!(sequence_set_contains("5:*", 6, 7));
+        assert!(!sequence_set_contains("5:*", 4, 7));
+        assert!(sequence_set_contains("*:5", 6, 7));
+        assert!(sequence_set_contains("9:*", 7, 7));
+        assert!(!sequence_set_contains("9:*", 6, 7));
+        assert!(sequence_set_contains("1,3:4", 4, 7));
+        assert!(!sequence_set_contains("1,3:4", 2, 7));
+        assert!(!sequence_set_contains("x:4", 2, 7));
+    }
+
+    #[test]
+    fn is_sequence_set_accepts_only_well_formed_sets() {
+        for set in ["1", "*", "1:*", "2,4:6,9", "*:3"] {
+            assert!(is_sequence_set(set), "{}", set);
+        }
+        for token in ["", "0", "1:", ":2", "1,,2", "ALL", "1:5X", "-1"] {
+            assert!(!is_sequence_set(token), "{}", token);
+        }
+    }
+
+    #[tokio::test]
+    async fn search_accepts_a_bare_sequence_set() {
+        let (addr, db, _tx, _dir) = start_test_server().await;
+        for n in 1..=4 {
+            seed(&db, &format!("sq-{}", n), "inbox", &format!("note {}", n));
+        }
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "s1", "SEARCH 1:* UNSEEN").await;
+        assert_eq!(search_hits(&resp), vec!["1", "2", "3", "4"], "{}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "s2", "SEARCH 2:3").await;
+        assert_eq!(search_hits(&resp), vec!["2", "3"], "{}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "s3", "SEARCH *").await;
+        assert_eq!(search_hits(&resp), vec!["4"], "{}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "s4", "UID SEARCH UID *").await;
+        assert_eq!(search_hits(&resp), vec!["4"], "{}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "s5", "UID SEARCH 1,3 SUBJECT note").await;
+        assert_eq!(search_hits(&resp), vec!["1", "3"], "{}", resp);
+    }
+
+    #[tokio::test]
+    async fn move_star_moves_only_the_last_message() {
+        let (addr, db, _tx, _calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        for n in 1..=3 {
+            seed(&db, &format!("mv-star-{}", n), "inbox", &format!("m{}", n));
+        }
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "m1", "MOVE * Archive").await;
+        assert!(resp.contains("m1 OK"), "move failed: {}", resp);
+        let inbox: Vec<String> = db
+            .list_cached_messages("inbox")
+            .unwrap()
+            .into_iter()
+            .map(|m| m.aster_id)
+            .collect();
+        assert_eq!(inbox, vec!["mv-star-1", "mv-star-2"]);
+        let archive: Vec<String> = db
+            .list_cached_messages("archive")
+            .unwrap()
+            .into_iter()
+            .map(|m| m.aster_id)
+            .collect();
+        assert_eq!(archive, vec!["mv-star-3"]);
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = CapturedLog;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_search_criterion_is_logged_once_per_command() {
+        let log = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(log.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let (addr, db, _tx, _dir) = start_test_server().await;
+        for i in 0..20 {
+            seed(&db, &format!("lg-{}", i), "inbox", "one");
+        }
+        let (mut reader, mut writer) = login_and_select(addr).await;
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "s1", "SEARCH OLDER 60 UNDELETED").await;
+        assert!(resp.contains("s1 OK"), "{}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "s2", "UID SEARCH X-UNKNOWN").await;
+        assert!(resp.contains("s2 OK"), "{}", resp);
+
+        let text = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            text.matches("unsupported SEARCH criterion").count(),
+            2,
+            "expected one warning per command: {}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    async fn uid_store_of_gm_labels_leaves_flags_alone() {
+        let (addr, db, _tx, calls, _dir) = start_test_server_with_backend(false).await;
+        seed(&db, "gl-1", "inbox", "one");
+        db.set_message_flags_by_id("gl-1", 5).unwrap(); // \Seen \Flagged
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "g1", "UID STORE 1 +X-GM-LABELS (Work)").await;
+        assert!(resp.contains("g1 OK"), "{}", resp);
+        assert!(resp.contains("* 1 FETCH (UID 1 X-GM-LABELS ("), "{}", resp);
+        assert!(!resp.contains("FLAGS ()"), "flags must not be touched: {}", resp);
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "g2", "UID STORE 1 -X-GM-LABELS.SILENT (Work)").await;
+        assert!(!resp.contains("* 1 FETCH"), "silent store must not answer: {}", resp);
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "g3", "FETCH 1 (FLAGS)").await;
+        assert!(resp.contains("\\Seen") && resp.contains("\\Flagged"), "flags lost: {}", resp);
+
+        // Other unknown items are refused instead of clearing the flags.
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "g4", "UID STORE 1 +BOGUS (x)").await;
+        assert!(resp.contains("g4 BAD"), "{}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "g5", "STORE 1 BOGUS (x)").await;
+        assert!(resp.contains("g5 BAD"), "{}", resp);
+        assert_eq!(db.get_message_flags_by_id("gl-1").unwrap(), 5);
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let captured = calls.lock().await.clone();
+        assert!(
+            !captured.iter().any(|(m, _)| m == "PATCH"),
+            "no read-status change may reach the server: {:?}",
+            captured
+        );
+    }
+
+    #[test]
+    fn search_keyword_does_not_match_everything() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        seed(&db, "kw-1", "inbox", "one");
+        let msgs = db.list_cached_messages("inbox").unwrap();
+        let m = &msgs[0];
+        assert!(!search_matches(m, "KEYWORD $LABEL1"));
+        assert!(search_matches(m, "UNKEYWORD $LABEL1"));
+    }
+
+    #[test]
+    fn store_keywords_are_parsed_from_flag_lists() {
+        assert_eq!(
+            parse_store_keywords("+FLAGS ($label1 \\Seen NonJunk)"),
+            Some(vec!["$label1".to_string(), "NonJunk".to_string()])
+        );
+        assert_eq!(parse_store_keywords("-FLAGS.SILENT ($label2)"), Some(vec!["$label2".to_string()]));
+        assert_eq!(parse_store_keywords("+FLAGS $label3"), Some(vec!["$label3".to_string()]));
+        assert_eq!(parse_store_keywords("FLAGS (\\Seen)"), Some(vec![]));
+        assert_eq!(parse_store_keywords("+X-GM-LABELS (Work)"), None);
+        // Not atoms: dropped rather than stored.
+        assert_eq!(parse_store_keywords("+FLAGS (bad]name *)"), Some(vec![]));
+    }
+
+    #[test]
+    fn keywords_add_remove_and_replace_case_insensitively() {
+        let current = vec!["$label1".to_string(), "Work".to_string()];
+        let given = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            apply_keywords(&current, 1, &given(&["$LABEL1", "$label2"])),
+            given(&["$label1", "Work", "$label2"])
+        );
+        assert_eq!(apply_keywords(&current, -1, &given(&["work"])), given(&["$label1"]));
+        assert_eq!(apply_keywords(&current, 0, &given(&["$label5"])), given(&["$label5"]));
+        assert_eq!(apply_keywords(&current, 0, &[]), Vec::<String>::new());
+        assert_eq!(flags_to_str(1, &current), "\\Seen $label1 Work");
+    }
+
+    #[test]
+    fn search_keyword_matches_stored_keywords() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        seed(&db, "kw-2", "inbox", "one");
+        let msgs = db.list_cached_messages("inbox").unwrap();
+        let m = &msgs[0];
+        let keywords = vec!["$label1".to_string()];
+        let position = SearchPosition::in_folder(0, &msgs);
+        assert!(search_matches_noting(m, position, &keywords, "KEYWORD $LABEL1", &mut None).unwrap());
+        assert!(!search_matches_noting(m, position, &keywords, "UNKEYWORD $LABEL1", &mut None).unwrap());
+        assert!(!search_matches_noting(m, position, &keywords, "KEYWORD $LABEL2", &mut None).unwrap());
+        assert!(search_matches_noting(m, position, &keywords, "UNKEYWORD $LABEL2", &mut None).unwrap());
+    }
+
+    #[tokio::test]
+    async fn thunderbird_tags_survive_selecting_another_message() {
+        let (addr, db, _tx, _dir) = start_test_server().await;
+        seed(&db, "tag-1", "inbox", "first");
+        seed(&db, "tag-2", "inbox", "second");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        // Thunderbird tags a message...
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "t1", "UID STORE 1 +FLAGS ($label1)").await;
+        assert!(resp.contains("t1 OK"), "{}", resp);
+        assert!(resp.contains("$label1"), "STORE response must carry the tag: {}", resp);
+
+        // ...and reads flags back when the selection changes.
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "t2", "UID FETCH 1:* (FLAGS)").await;
+        let first = resp.lines().find(|l| l.contains("UID 1") || l.starts_with("* 1 FETCH")).unwrap_or("");
+        assert!(first.contains("$label1"), "tag lost on FETCH: {}", resp);
+        let second = resp.lines().find(|l| l.starts_with("* 2 FETCH")).unwrap_or("");
+        assert!(!second.contains("$label1"), "tag leaked to another message: {}", resp);
+
+        // Setting \Seen with +FLAGS keeps the tag; searching finds it.
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "t3", "STORE 1 +FLAGS (\\Seen)").await;
+        assert!(resp.contains("\\Seen") && resp.contains("$label1"), "{}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "t4", "UID SEARCH KEYWORD $label1").await;
+        assert!(resp.lines().any(|l| l.trim() == "* SEARCH 1"), "{}", resp);
+
+        // A new connection sees it too.
+        let (mut reader2, mut writer2) = login_and_select(addr).await;
+        let resp = imap_cmd_lines(&mut reader2, &mut writer2, "n1", "FETCH 1 (FLAGS)").await;
+        assert!(resp.contains("$label1"), "{}", resp);
+
+        // Removing the tag, and FLAGS replacing the whole set.
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "t5", "UID STORE 1 -FLAGS ($label1)").await;
+        assert!(!resp.contains("$label1"), "{}", resp);
+        imap_cmd_lines(&mut reader, &mut writer, "t6", "STORE 2 +FLAGS ($label2 Work)").await;
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "t7", "STORE 2 FLAGS (\\Seen)").await;
+        assert!(!resp.contains("$label2") && !resp.contains("Work"), "{}", resp);
+        assert_eq!(db.message_keywords("tag-2").unwrap(), Vec::<String>::new());
+    }
+
+    fn label_named(token: &str, name: &str) -> crate::db::CustomTag {
+        crate::db::CustomTag {
+            tag_token: token.to_string(),
+            server_id: format!("id-{}", token),
+            name: name.to_string(),
+            keyword: crate::tags::keyword_for_name(name),
+            position: 0,
+        }
+    }
+
+    fn fetched_line(resp: &str, seq: u32) -> &str {
+        let prefix = format!("* {} FETCH", seq);
+        resp.lines().find(|l| l.starts_with(&prefix)).unwrap_or("")
+    }
+
+    #[tokio::test]
+    async fn builtin_tags_reach_the_matching_labels_end_to_end() {
+        let (addr, db, _tx, calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        seed(&db, "bt-1", "inbox", "first");
+        seed(&db, "bt-2", "inbox", "second");
+        db.replace_custom_tags(&[
+            label_named("tok-attention", "\u{26A0}\u{FE0F} Aten\u{E7}\u{E3}o"),
+            label_named("tok-later", "\u{23F0} Mais tarde"),
+            label_named("tok-spend", "\u{1F4B8} Despesas"),
+        ])
+        .unwrap();
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "b1", "UID STORE 1 +FLAGS ($label5)").await;
+        assert!(resp.contains("b1 OK"), "{}", resp);
+        assert!(resp.contains("$label5"), "{}", resp);
+        assert_eq!(db.messages_with_tag("tok-later").unwrap(), vec!["bt-1".to_string()]);
+        let log = calls.lock().await.clone();
+        assert!(log.iter().any(|(m, v)| m == "ADD_TAG" && v == "tok-later|1"), "{:?}", log);
+        assert!(!log.iter().any(|(m, _)| m == "CREATE_TAG"), "{:?}", log);
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "b2", "STORE 1 +FLAGS ($label1)").await;
+        assert!(resp.contains("b2 OK"), "{}", resp);
+        assert!(db.messages_with_tag("tok-attention").unwrap().is_empty());
+        assert!(db.message_keywords("bt-1").unwrap().contains(&"$label1".to_string()));
+
+        db.set_builtin_tag_slot(1, Some(&crate::tags::SlotOverride::Label("tok-attention".to_string())))
+            .unwrap();
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "b3", "STORE 2 +FLAGS ($label1)").await;
+        assert!(resp.contains("b3 OK"), "{}", resp);
+        assert_eq!(db.messages_with_tag("tok-attention").unwrap(), vec!["bt-2".to_string()]);
+        let log = calls.lock().await.clone();
+        assert!(log.iter().any(|(m, v)| m == "ADD_TAG" && v == "tok-attention|1"), "{:?}", log);
+
+        let (mut reader2, mut writer2) = login_and_select(addr).await;
+        let resp = imap_cmd_lines(&mut reader2, &mut writer2, "n1", "FETCH 1:2 (FLAGS)").await;
+        assert!(fetched_line(&resp, 1).contains("$label5"), "{}", resp);
+        assert!(fetched_line(&resp, 2).contains("$label1"), "{}", resp);
+        assert!(!fetched_line(&resp, 2).contains("$label5"), "{}", resp);
+        let resp = imap_cmd_lines(&mut reader2, &mut writer2, "n2", "SEARCH KEYWORD $label5").await;
+        assert!(resp.lines().any(|l| l.trim() == "* SEARCH 1"), "{}", resp);
+        let resp = imap_cmd_lines(&mut reader2, &mut writer2, "n3", "SEARCH KEYWORD $LABEL1").await;
+        assert!(resp.lines().any(|l| l.trim() == "* SEARCH 1 2"), "{}", resp);
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "b4", "STORE 1 -FLAGS ($label5)").await;
+        assert!(resp.contains("b4 OK"), "{}", resp);
+        assert!(!resp.contains("$label5"), "{}", resp);
+        assert!(db.messages_with_tag("tok-later").unwrap().is_empty());
+        let log = calls.lock().await.clone();
+        assert!(log.iter().any(|(m, v)| m == "REMOVE_TAG" && v == "tok-later|1"), "{:?}", log);
+        assert!(!log.iter().any(|(m, _)| m == "CREATE_TAG"), "{:?}", log);
+        assert_eq!(db.list_custom_tags().unwrap().len(), 3);
+    }
+
+    fn work_label() -> crate::db::CustomTag {
+        crate::db::CustomTag {
+            tag_token: "tok-work".to_string(),
+            server_id: "id-work".to_string(),
+            name: "Work".to_string(),
+            keyword: Some("Work".to_string()),
+            position: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_label_write_answers_no_and_is_not_stored_locally() {
+        let (addr, db, _tx, calls, _dir) =
+            start_test_server_with_backend_opts(true, Some("test-ik")).await;
+        seed(&db, "lab-1", "inbox", "first");
+        db.replace_custom_tags(&[work_label()]).unwrap();
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp =
+            imap_cmd_lines(&mut reader, &mut writer, "s1", "STORE 1 +FLAGS (Fresh Work $label1)").await;
+        assert!(resp.contains("s1 NO [UNAVAILABLE]"), "{}", resp);
+        assert!(!resp.contains("s1 OK"), "{}", resp);
+        let fetch_at = resp.find("* 1 FETCH (FLAGS (").unwrap_or_else(|| panic!("no FETCH in {}", resp));
+        assert!(fetch_at < resp.find("s1 NO").unwrap(), "{}", resp);
+        assert!(resp.contains("Work") && resp.contains("$label1"), "{}", resp);
+        assert!(!resp.contains("Fresh"), "{}", resp);
+
+        let stored = db.message_keywords("lab-1").unwrap();
+        assert!(stored.contains(&"Work".to_string()), "{:?}", stored);
+        assert!(stored.contains(&"$label1".to_string()), "{:?}", stored);
+        assert!(!stored.contains(&"Fresh".to_string()), "{:?}", stored);
+        assert_eq!(db.list_custom_tags().unwrap().len(), 1);
+        let log = calls.lock().await.clone();
+        assert!(log.iter().any(|(m, _)| m == "CREATE_TAG"), "{:?}", log);
+        assert!(log.iter().any(|(m, v)| m == "ADD_TAG" && v == "tok-work|1"), "{:?}", log);
+
+        let uid = db.get_cached_message("lab-1").unwrap().unwrap().imap_uid;
+        let resp = imap_cmd_lines(
+            &mut reader,
+            &mut writer,
+            "s2",
+            &format!("UID STORE {} +FLAGS (Other)", uid),
+        )
+        .await;
+        assert!(resp.contains("s2 NO [UNAVAILABLE]"), "{}", resp);
+        assert!(resp.contains(&format!("* 1 FETCH (UID {} FLAGS (", uid)), "{}", resp);
+        assert!(!resp.contains("Other"), "{}", resp);
+        assert!(!db.message_keywords("lab-1").unwrap().contains(&"Other".to_string()));
+    }
+
+    #[tokio::test]
+    async fn client_internal_keywords_are_stored_without_a_label_call() {
+        let (addr, db, _tx, calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        seed(&db, "lab-2", "inbox", "first");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(
+            &mut reader,
+            &mut writer,
+            "s1",
+            "STORE 1 +FLAGS (NonJunk $Forwarded forwarded MDNSent)",
+        )
+        .await;
+        assert!(resp.contains("s1 OK"), "{}", resp);
+        assert!(resp.contains("NonJunk") && resp.contains("MDNSent"), "{}", resp);
+
+        let stored = db.message_keywords("lab-2").unwrap();
+        for keyword in ["NonJunk", "$Forwarded", "forwarded", "MDNSent"] {
+            assert!(stored.contains(&keyword.to_string()), "{:?}", stored);
+        }
+        assert!(db.list_custom_tags().unwrap().is_empty());
+        let log = calls.lock().await.clone();
+        assert!(
+            !log.iter().any(|(m, _)| m == "CREATE_TAG" || m == "ADD_TAG" || m == "REMOVE_TAG"),
+            "{:?}",
+            log
+        );
+    }
+
+    #[tokio::test]
+    async fn one_store_creates_at_most_ten_labels() {
+        let (addr, db, _tx, calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        seed(&db, "lab-3", "inbox", "first");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let names: Vec<String> = (0..12).map(|n| format!("New{}", n)).collect();
+        let resp = imap_cmd_lines(
+            &mut reader,
+            &mut writer,
+            "s1",
+            &format!("STORE 1 +FLAGS ({})", names.join(" ")),
+        )
+        .await;
+        assert!(resp.contains("s1 NO [LIMIT]"), "{}", resp);
+        assert!(resp.contains("New9"), "{}", resp);
+        assert!(!resp.contains("New10") && !resp.contains("New11"), "{}", resp);
+
+        assert_eq!(db.list_custom_tags().unwrap().len(), 10);
+        let stored = db.message_keywords("lab-3").unwrap();
+        assert_eq!(stored.len(), 10, "{:?}", stored);
+        let log = calls.lock().await.clone();
+        assert_eq!(log.iter().filter(|(m, _)| m == "CREATE_TAG").count(), 10, "{:?}", log);
+    }
+
+    fn appended_mail(name: &str) -> Vec<u8> {
+        format!(
+            "Message-ID: <{}@old.example>\r\nFrom: alice@old.example\r\nTo: tester@aster.test\r\nSubject: {}\r\nDate: Fri, 12 Jul 2024 13:04:05 +0000\r\n\r\nbody of {}",
+            name, name, name
+        )
+        .into_bytes()
+    }
+
+    fn append_uid(resp: &str) -> Option<(u32, u32)> {
+        let rest = resp.split("[APPENDUID ").nth(1)?;
+        let mut parts = rest.split(']').next()?.split(' ');
+        Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
+    }
+
+    #[tokio::test]
+    async fn append_applies_label_keywords_like_store() {
+        let (addr, db, _tx, calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        db.replace_custom_tags(&[work_label()]).unwrap();
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = append_literal(
+            &mut reader,
+            &mut writer,
+            "k1",
+            "INBOX (\\Seen Work Fresh $label1 \\Recent)",
+            &appended_mail("labelled-append"),
+        )
+        .await;
+        assert!(resp.contains("k1 OK [APPENDUID "), "{}", resp);
+        assert!(!resp.contains("* NO"), "{}", resp);
+
+        let stored = db.message_keywords("imported-1").unwrap();
+        for keyword in ["Work", "Fresh", "$label1"] {
+            assert!(stored.contains(&keyword.to_string()), "{:?}", stored);
+        }
+        assert_eq!(stored.len(), 3, "{:?}", stored);
+        assert_eq!(db.list_custom_tags().unwrap().len(), 2);
+        let log = calls.lock().await.clone();
+        assert_eq!(log.iter().filter(|(m, _)| m == "CREATE_TAG").count(), 1, "{:?}", log);
+        assert!(log.iter().any(|(m, v)| m == "ADD_TAG" && v == "tok-work|1"), "{:?}", log);
+
+        let (_, uid) = append_uid(&resp).unwrap();
+        imap_cmd_lines(&mut reader, &mut writer, "k2", "NOOP").await;
+        let resp = imap_cmd_lines(
+            &mut reader,
+            &mut writer,
+            "k3",
+            &format!("UID FETCH {} (FLAGS)", uid),
+        )
+        .await;
+        assert!(resp.contains("k3 OK"), "{}", resp);
+        for keyword in ["Work", "Fresh", "$label1", "\\Seen"] {
+            assert!(resp.contains(keyword), "{} missing from {}", keyword, resp);
+        }
+    }
+
+    #[tokio::test]
+    async fn append_with_a_failed_label_write_still_stores_the_message() {
+        let (addr, db, _tx, calls, _dir) = start_test_server_mock(
+            MockOpts {
+                fail_tags: true,
+                ..Default::default()
+            },
+            Some("test-ik"),
+        )
+        .await;
+        db.replace_custom_tags(&[work_label()]).unwrap();
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = append_literal(
+            &mut reader,
+            &mut writer,
+            "k1",
+            "INBOX (Work Fresh)",
+            &appended_mail("half-labelled"),
+        )
+        .await;
+        let warned = resp.find("* NO [UNAVAILABLE]").unwrap_or_else(|| panic!("no warning in {}", resp));
+        let done = resp.find("k1 OK [APPENDUID ").unwrap_or_else(|| panic!("not stored: {}", resp));
+        assert!(warned < done, "{}", resp);
+        assert!(!resp.contains("k1 NO"), "{}", resp);
+
+        let (_, uid) = append_uid(&resp).unwrap();
+        let cached = db.get_cached_message("imported-1").unwrap().unwrap();
+        assert_eq!(cached.folder, "inbox");
+        assert_eq!(cached.imap_uid, uid);
+        assert_eq!(db.message_keywords("imported-1").unwrap(), vec!["Work".to_string()]);
+        let log = calls.lock().await.clone();
+        assert!(log.iter().any(|(m, _)| m == "CREATE_TAG"), "{:?}", log);
+        assert!(!log.iter().any(|(m, _)| m == "DELETE"), "{:?}", log);
+    }
+
+    #[tokio::test]
+    async fn one_append_creates_at_most_ten_labels() {
+        let (addr, db, _tx, calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let names: Vec<String> = (0..12).map(|n| format!("New{}", n)).collect();
+        let resp = append_literal(
+            &mut reader,
+            &mut writer,
+            "k1",
+            &format!("INBOX ({})", names.join(" ")),
+            &appended_mail("many-labels"),
+        )
+        .await;
+        assert!(resp.contains("* NO [LIMIT]"), "{}", resp);
+        assert!(resp.contains("k1 OK [APPENDUID "), "{}", resp);
+
+        assert_eq!(db.list_custom_tags().unwrap().len(), 10);
+        assert_eq!(db.message_keywords("imported-1").unwrap().len(), 10);
+        let log = calls.lock().await.clone();
+        assert_eq!(log.iter().filter(|(m, _)| m == "CREATE_TAG").count(), 10, "{:?}", log);
+    }
+
+    #[tokio::test]
+    async fn a_repeated_append_answers_with_the_uid_of_the_stored_message() {
+        let (addr, db, _tx, _calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        let (mut reader, mut writer) = login_and_select(addr).await;
+        let raw = appended_mail("sent-twice");
+
+        let first = append_literal(&mut reader, &mut writer, "d1", "Archive", &raw).await;
+        let stored = append_uid(&first).unwrap_or_else(|| panic!("no APPENDUID in {}", first));
+
+        let second = append_literal(&mut reader, &mut writer, "d2", "Archive", &raw).await;
+        assert!(second.contains("d2 OK"), "{}", second);
+        assert_eq!(append_uid(&second), Some(stored), "{}", second);
+
+        let elsewhere = append_literal(&mut reader, &mut writer, "d3", "INBOX", &raw).await;
+        assert!(elsewhere.contains("d3 OK"), "{}", elsewhere);
+        assert_eq!(append_uid(&elsewhere), None, "{}", elsewhere);
+
+        assert_eq!(db.list_cached_messages("archive").unwrap().len(), 1);
+        assert!(db.list_cached_messages("inbox").unwrap().is_empty());
+        let cached = db.get_cached_message("imported-1").unwrap().unwrap();
+        assert_eq!(cached.imap_uid, stored.1);
+    }
+
+    fn label_calls(log: &[(String, String)]) -> usize {
+        log.iter()
+            .filter(|(m, _)| m == "CREATE_TAG" || m == "ADD_TAG")
+            .count()
+    }
+
+    #[tokio::test]
+    async fn a_repeated_append_adds_its_keywords_to_the_stored_message() {
+        let (addr, db, _tx, calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        db.replace_custom_tags(&[work_label()]).unwrap();
+        let (mut reader, mut writer) = login_and_select(addr).await;
+        let raw = appended_mail("two-labels");
+
+        let first = append_literal(&mut reader, &mut writer, "r1", "Archive (Work)", &raw).await;
+        let stored = append_uid(&first).unwrap_or_else(|| panic!("no APPENDUID in {}", first));
+        assert_eq!(db.message_keywords("imported-1").unwrap(), vec!["Work".to_string()]);
+
+        let second =
+            append_literal(&mut reader, &mut writer, "r2", "Archive (\\Seen Fresh)", &raw).await;
+        assert!(second.contains("r2 OK"), "{}", second);
+        assert!(!second.contains("* NO"), "{}", second);
+        assert_eq!(append_uid(&second), Some(stored), "{}", second);
+
+        let mut keywords = db.message_keywords("imported-1").unwrap();
+        keywords.sort();
+        assert_eq!(keywords, vec!["Fresh".to_string(), "Work".to_string()]);
+        assert_eq!(db.list_cached_messages("archive").unwrap().len(), 1);
+        let log = calls.lock().await.clone();
+        assert_eq!(log.iter().filter(|(m, _)| m == "CREATE_TAG").count(), 1, "{:?}", log);
+        assert_eq!(log.iter().filter(|(m, _)| m == "ADD_TAG").count(), 2, "{:?}", log);
+    }
+
+    #[tokio::test]
+    async fn a_repeated_append_labels_the_copy_held_in_another_mailbox() {
+        let (addr, db, _tx, calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        db.replace_custom_tags(&[work_label()]).unwrap();
+        let (mut reader, mut writer) = login_and_select(addr).await;
+        let raw = appended_mail("filed-elsewhere");
+
+        let first = append_literal(&mut reader, &mut writer, "x1", "Archive", &raw).await;
+        let stored = append_uid(&first).unwrap_or_else(|| panic!("no APPENDUID in {}", first));
+
+        let second =
+            append_literal(&mut reader, &mut writer, "x2", "INBOX (Work Fresh)", &raw).await;
+        assert!(second.contains("x2 OK"), "{}", second);
+        assert!(!second.contains("* NO"), "{}", second);
+        assert_eq!(append_uid(&second), None, "{}", second);
+
+        let mut keywords = db.message_keywords("imported-1").unwrap();
+        keywords.sort();
+        assert_eq!(keywords, vec!["Fresh".to_string(), "Work".to_string()]);
+        assert!(db.list_cached_messages("inbox").unwrap().is_empty());
+        let cached = db.get_cached_message("imported-1").unwrap().unwrap();
+        assert_eq!(cached.folder, "archive");
+        assert_eq!(cached.imap_uid, stored.1);
+        let log = calls.lock().await.clone();
+        assert!(log.iter().any(|(m, v)| m == "ADD_TAG" && v == "tok-work|1"), "{:?}", log);
+        assert_eq!(log.iter().filter(|(m, _)| m == "CREATE_TAG").count(), 1, "{:?}", log);
+    }
+
+    #[tokio::test]
+    async fn a_repeated_append_without_a_local_copy_drops_its_keywords() {
+        let (addr, db, _tx, calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        db.replace_custom_tags(&[work_label()]).unwrap();
+        let (mut reader, mut writer) = login_and_select(addr).await;
+        let raw = appended_mail("not-cached");
+
+        let first = append_literal(&mut reader, &mut writer, "n1", "Archive", &raw).await;
+        assert!(first.contains("n1 OK [APPENDUID "), "{}", first);
+        db.delete_message_by_aster_id("imported-1").unwrap();
+
+        let second =
+            append_literal(&mut reader, &mut writer, "n2", "Archive (Work Fresh)", &raw).await;
+        assert!(second.contains("n2 OK"), "{}", second);
+        assert!(!second.contains("* NO"), "{}", second);
+        assert_eq!(append_uid(&second), None, "{}", second);
+
+        assert!(db.message_keywords("imported-1").unwrap().is_empty());
+        assert_eq!(db.list_custom_tags().unwrap().len(), 1);
+        assert!(db.list_cached_messages("archive").unwrap().is_empty());
+        let log = calls.lock().await.clone();
+        assert_eq!(label_calls(&log), 0, "{:?}", log);
+    }
+
+    #[tokio::test]
+    async fn a_repeated_append_with_a_failed_label_write_warns_and_completes() {
+        let (addr, db, _tx, _calls, _dir) = start_test_server_mock(
+            MockOpts {
+                fail_tags: true,
+                ..Default::default()
+            },
+            Some("test-ik"),
+        )
+        .await;
+        db.replace_custom_tags(&[work_label()]).unwrap();
+        let (mut reader, mut writer) = login_and_select(addr).await;
+        let raw = appended_mail("half-labelled-twice");
+
+        let first = append_literal(&mut reader, &mut writer, "w1", "Archive", &raw).await;
+        let stored = append_uid(&first).unwrap_or_else(|| panic!("no APPENDUID in {}", first));
+
+        let second =
+            append_literal(&mut reader, &mut writer, "w2", "Archive (Work Fresh)", &raw).await;
+        let warned = second
+            .find("* NO [UNAVAILABLE]")
+            .unwrap_or_else(|| panic!("no warning in {}", second));
+        let done = second
+            .find("w2 OK [APPENDUID ")
+            .unwrap_or_else(|| panic!("not completed: {}", second));
+        assert!(warned < done, "{}", second);
+        assert_eq!(append_uid(&second), Some(stored), "{}", second);
+        assert_eq!(db.message_keywords("imported-1").unwrap(), vec!["Work".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_repeated_append_to_sent_adds_its_keywords_to_the_stored_message() {
+        let (addr, db, _tx, _calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        db.replace_custom_tags(&[work_label()]).unwrap();
+        let (mut reader, mut writer) = login_and_select(addr).await;
+        let raw = appended_mail("sent-under-two-labels");
+
+        let first = append_literal(&mut reader, &mut writer, "s1", "Sent (Work)", &raw).await;
+        let stored = append_uid(&first).unwrap_or_else(|| panic!("no APPENDUID in {}", first));
+
+        let second = append_literal(&mut reader, &mut writer, "s2", "Sent (Fresh)", &raw).await;
+        assert!(second.contains("s2 OK"), "{}", second);
+        assert!(!second.contains("* NO"), "{}", second);
+        assert_eq!(append_uid(&second), Some(stored), "{}", second);
+
+        let mut keywords = db.message_keywords("imported-1").unwrap();
+        keywords.sort();
+        assert_eq!(keywords, vec!["Fresh".to_string(), "Work".to_string()]);
+        assert_eq!(db.list_cached_messages("sent").unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn append_files_the_message_in_the_import_request_itself() {
+        let (addr, _db, _tx, calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        for (tag, mailbox) in [
+            ("p1", "Archive (\\Seen)"),
+            ("p2", "Junk"),
+            ("p3", "Trash (\\Flagged)"),
+            ("p4", "INBOX"),
+        ] {
+            let resp =
+                append_literal(&mut reader, &mut writer, tag, mailbox, &appended_mail(tag)).await;
+            assert!(resp.contains(&format!("{} OK [APPENDUID ", tag)), "{}", resp);
+        }
+
+        let log = calls.lock().await.clone();
+        let placements: Vec<&str> = log
+            .iter()
+            .filter(|(m, _)| m == "IMPORT_PLACEMENT")
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(
+            placements,
+            vec![
+                "archived=Some(true) spam=Some(false) trashed=Some(false) read=Some(true) starred=Some(false)",
+                "archived=Some(false) spam=Some(true) trashed=Some(false) read=Some(false) starred=Some(false)",
+                "archived=Some(false) spam=Some(false) trashed=Some(true) read=Some(false) starred=Some(true)",
+                "archived=Some(false) spam=Some(false) trashed=Some(false) read=Some(false) starred=Some(false)",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn append_that_cannot_be_filed_answers_no_and_leaves_nothing_behind() {
+        let (addr, db, _tx, calls, _dir) = start_test_server_mock(
+            MockOpts {
+                fail_metadata: true,
+                ..Default::default()
+            },
+            Some("test-ik"),
+        )
+        .await;
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = append_literal(
+            &mut reader,
+            &mut writer,
+            "f1",
+            "Archive",
+            &appended_mail("unfiled"),
+        )
+        .await;
+        assert!(resp.contains("f1 NO"), "{}", resp);
+        assert!(!resp.contains("APPENDUID"), "{}", resp);
+        assert!(db.get_cached_message("imported-1").unwrap().is_none());
+        assert!(db.list_cached_messages("inbox").unwrap().is_empty());
+        let log = calls.lock().await.clone();
+        assert!(
+            log.iter().any(|(m, id)| m == "DELETE" && id == "imported-1"),
+            "{:?}",
+            log
+        );
+    }
+
+    #[tokio::test]
+    async fn a_copy_keeps_the_label_keywords_of_its_source() {
+        let (addr, db, _tx, calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        seed_copy_source(&db, "msg-labelled", "labelled", &[]);
+        db.replace_custom_tags(&[work_label()]).unwrap();
+        db.add_message_tag(&["msg-labelled".to_string()], "tok-work").unwrap();
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "c1", "UID COPY 1 Archive").await;
+        assert!(resp.contains("c1 OK [COPYUID "), "{}", resp);
+
+        let archived = db.list_cached_messages("archive").unwrap();
+        assert_eq!(archived.len(), 1);
+        assert_eq!(
+            db.message_keywords(&archived[0].aster_id).unwrap(),
+            vec!["Work".to_string()],
+            "the copy lost its label"
+        );
+        assert_eq!(db.message_keywords("msg-labelled").unwrap(), vec!["Work".to_string()]);
+        let log = calls.lock().await.clone();
+        assert!(log.iter().any(|(m, v)| m == "ADD_TAG" && v == "tok-work|1"), "{:?}", log);
+    }
+
+    #[test]
+    fn resolve_mailbox_handles_system_and_custom_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        db.upsert_custom_folder(&crate::db::CustomFolder {
+            label_token: "tok_a".to_string(),
+            server_id: "srv-a".to_string(),
+            name: "Caf\u{e9}".to_string(),
+            parent_token: None,
+            sort_order: 0,
+            created_at: None,
+        })
+        .unwrap();
+        let label = |raw: &str| resolve_mailbox(&db, raw).map(|e| e.label);
+        assert_eq!(label("INBOX").as_deref(), Some("inbox"));
+        assert_eq!(label(&parse_imap_atom_or_quoted("\"Archive\"").0).as_deref(), Some("archive"));
+        assert_eq!(label("junk").as_deref(), Some("spam"));
+        assert_eq!(label("Archive/").as_deref(), Some("archive"));
+        assert_eq!(label("Caf&AOk-").as_deref(), Some("folder:tok_a"));
+        assert_eq!(label("Old Mail"), None);
+    }
+
+    #[test]
+    fn parse_message_date_ymd_accepts_rfc2822() {
+        assert_eq!(
+            parse_message_date_ymd("Wed, 21 May 2026 10:00:00 +0000"),
+            Some((2026, 5, 21))
+        );
+        assert_eq!(parse_message_date_ymd("2026-05-21T10:00:00Z"), Some((2026, 5, 21)));
+        assert_eq!(parse_message_date_ymd("garbage"), None);
+    }
+
+    #[test]
+    fn iso_to_imap_date_converts_offset_to_utc() {
+        assert_eq!(
+            iso_to_imap_date("Mon, 05 Oct 2026 09:00:00 -0700"),
+            "05-Oct-2026 16:00:00 +0000"
+        );
+        assert_eq!(
+            iso_to_imap_date("2026-10-06T01:30:00+02:00"),
+            "05-Oct-2026 23:30:00 +0000"
+        );
+    }
+
+    #[test]
+    fn iso_to_imap_date_accepts_rfc2822() {
+        let s = iso_to_imap_date("Wed, 21 May 2026 10:30:00 +0000");
+        assert!(s.starts_with("21-May-2026"), "got {}", s);
+        assert!(!iso_to_imap_date("2026-05-21T10:30:00Z").contains("1970"));
+    }
+
+    #[tokio::test]
+    async fn expunge_in_inbox_moves_to_trash_on_server() {
+        let (addr, db, _tx, calls, _dir) = start_test_server_with_backend(false).await;
+        seed(&db, "ex-1", "inbox", "one");
+        seed(&db, "ex-2", "inbox", "two");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "e1", "STORE 1 +FLAGS (\\Deleted)").await;
+        assert!(resp.contains("e1 OK"));
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "e2", "EXPUNGE").await;
+        assert!(resp.contains("* 1 EXPUNGE"), "missing expunge: {}", resp);
+        assert!(resp.contains("e2 OK"));
+
+        assert!(db.get_cached_message("ex-1").unwrap().is_none());
+        assert!(db.get_cached_message("ex-2").unwrap().is_some());
+        let captured = calls.lock().await.clone();
+        assert!(
+            captured.iter().any(|(m, id)| m == "PATCH" && id == "ex-1"),
+            "trash move missing: {:?}",
+            captured
+        );
+        assert!(
+            !captured.iter().any(|(m, _)| m == "DELETE"),
+            "inbox expunge deleted permanently: {:?}",
+            captured
+        );
+    }
+
+    #[tokio::test]
+    async fn expunge_in_trash_deletes_permanently() {
+        let (addr, db, _tx, calls, _dir) = start_test_server_with_backend(false).await;
+        seed(&db, "tr-1", "trash", "one");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "t1", "SELECT Trash").await;
+        assert!(resp.contains("t1 OK"), "{}", resp);
+        imap_cmd_lines(&mut reader, &mut writer, "t2", "STORE 1 +FLAGS (\\Deleted)").await;
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "t3", "EXPUNGE").await;
+        assert!(resp.contains("* 1 EXPUNGE"), "missing expunge: {}", resp);
+
+        assert!(db.get_cached_message("tr-1").unwrap().is_none());
+        let captured = calls.lock().await.clone();
+        assert!(
+            captured.iter().any(|(m, id)| m == "DELETE" && id == "tr-1"),
+            "server delete missing: {:?}",
+            captured
+        );
+    }
+
+    #[tokio::test]
+    async fn close_in_inbox_moves_deleted_messages_to_trash() {
+        let (addr, db, _tx, calls, _dir) = start_test_server_with_backend(false).await;
+        seed(&db, "cl-1", "inbox", "one");
+        seed(&db, "cl-2", "inbox", "two");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        imap_cmd_lines(&mut reader, &mut writer, "c1", "STORE 2 +FLAGS (\\Deleted)").await;
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "c2", "CLOSE").await;
+        assert!(resp.contains("c2 OK"), "{}", resp);
+
+        assert!(db.get_cached_message("cl-1").unwrap().is_some());
+        assert!(db.get_cached_message("cl-2").unwrap().is_none());
+        let captured = calls.lock().await.clone();
+        assert!(captured.iter().any(|(m, id)| m == "PATCH" && id == "cl-2"), "{:?}", captured);
+        assert!(!captured.iter().any(|(m, _)| m == "DELETE"), "{:?}", captured);
+    }
+
+    #[tokio::test]
+    async fn expunge_after_copy_removes_the_source_without_a_trash_copy() {
+        let (addr, db, _tx, calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        seed_copy_source(&db, "msg-copied", "copied", &[]);
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "k1", "COPY 1 Archive").await;
+        assert!(resp.contains("k1 OK"), "{}", resp);
+        imap_cmd_lines(&mut reader, &mut writer, "k2", "STORE 1 +FLAGS (\\Deleted)").await;
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "k3", "EXPUNGE").await;
+        assert!(resp.contains("* 1 EXPUNGE"), "{}", resp);
+
+        let captured = calls.lock().await.clone();
+        assert!(
+            captured.iter().any(|(m, id)| m == "DELETE" && id == "msg-copied"),
+            "{:?}",
+            captured
+        );
+        assert!(
+            !captured.iter().any(|(m, id)| m == "PATCH" && id == "msg-copied"),
+            "{:?}",
+            captured
+        );
+    }
+
+    #[tokio::test]
+    async fn expunge_backend_failure_keeps_message() {
+        let (addr, db, _tx, _calls, _dir) = start_test_server_mock(
+            MockOpts {
+                fail: true,
+                fail_metadata: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await;
+        seed(&db, "ex-keep", "inbox", "one");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        imap_cmd_lines(&mut reader, &mut writer, "e1", "STORE 1 +FLAGS (\\Deleted)").await;
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "e2", "EXPUNGE").await;
+        assert!(!resp.contains("* 1 EXPUNGE"), "must not expunge on server failure: {}", resp);
+        assert!(db.get_cached_message("ex-keep").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn uid_expunge_honors_uid_set() {
+        let (addr, db, _tx, calls, _dir) = start_test_server_with_backend(false).await;
+        seed(&db, "ux-1", "inbox", "one");
+        seed(&db, "ux-2", "inbox", "two");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        imap_cmd_lines(&mut reader, &mut writer, "u1", "STORE 1:2 +FLAGS (\\Deleted)").await;
+        let uid2 = db.get_cached_message("ux-2").unwrap().unwrap().imap_uid;
+        let resp =
+            imap_cmd_lines(&mut reader, &mut writer, "u2", &format!("UID EXPUNGE {}", uid2)).await;
+        assert!(resp.contains("u2 OK"));
+
+        assert!(
+            db.get_cached_message("ux-1").unwrap().is_some(),
+            "uid outside set must survive"
+        );
+        assert!(db.get_cached_message("ux-2").unwrap().is_none());
+        let captured = calls.lock().await.clone();
+        assert!(!captured.iter().any(|(_, id)| id == "ux-1"));
+        assert!(captured.iter().any(|(m, id)| m == "PATCH" && id == "ux-2"));
+    }
+
+    #[tokio::test]
+    async fn examine_blocks_store_expunge_and_move() {
+        let (addr, db, _tx, calls, _dir) = start_test_server_with_backend(false).await;
+        seed(&db, "ro-1", "inbox", "one");
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (r, w) = stream.into_split();
+        let mut reader = BufReader::new(r);
+        let mut writer = w;
+        let mut greeting = String::new();
+        reader.read_line(&mut greeting).await.unwrap();
+        writer
+            .write_all(b"a1 LOGIN \"tester@aster.test\" \"abcd-efgh-ijkl-mnop\"\r\n")
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        let _ = read_until_tag(&mut reader, "a1").await;
+        let sel = imap_cmd_lines(&mut reader, &mut writer, "a2", "EXAMINE INBOX").await;
+        assert!(sel.contains("READ-ONLY"));
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "r1", "STORE 1 +FLAGS (\\Seen)").await;
+        assert!(resp.contains("r1 NO"), "STORE must fail read-only: {}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "r2", "UID STORE 1 +FLAGS (\\Seen)").await;
+        assert!(resp.contains("r2 NO"), "UID STORE must fail read-only: {}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "r3", "EXPUNGE").await;
+        assert!(resp.contains("r3 NO"), "EXPUNGE must fail read-only: {}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "r4", "UID EXPUNGE 1").await;
+        assert!(resp.contains("r4 NO"), "UID EXPUNGE must fail read-only: {}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "r5", "UID MOVE 1 Trash").await;
+        assert!(resp.contains("r5 NO"), "MOVE must fail read-only: {}", resp);
+        assert!(db.get_cached_message("ro-1").unwrap().is_some());
+        assert!(calls.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn examine_fetch_does_not_mark_messages_read() {
+        let (addr, db, _tx, calls, _dir) = start_test_server_with_backend(false).await;
+        seed(&db, "ro-f1", "inbox", "one");
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (r, w) = stream.into_split();
+        let mut reader = BufReader::new(r);
+        let mut writer = w;
+        let mut greeting = String::new();
+        reader.read_line(&mut greeting).await.unwrap();
+        let _ = imap_cmd_lines(
+            &mut reader,
+            &mut writer,
+            "a1",
+            "LOGIN \"tester@aster.test\" \"abcd-efgh-ijkl-mnop\"",
+        )
+        .await;
+        let sel = imap_cmd_lines(&mut reader, &mut writer, "a2", "EXAMINE INBOX").await;
+        assert!(sel.contains("READ-ONLY"), "{}", sel);
+
+        for (tag, cmd) in [
+            ("f1", "FETCH 1 (BODY[])"),
+            ("f2", "FETCH 1 (BODY[TEXT])"),
+            ("f3", "FETCH 1 (BODY[1])"),
+            ("f4", "FETCH 1 (RFC822)"),
+            ("f5", "UID FETCH 1:* (RFC822.TEXT)"),
+        ] {
+            let resp = imap_cmd_lines(&mut reader, &mut writer, tag, cmd).await;
+            assert!(resp.contains(&format!("{} OK", tag)), "{}", resp);
+            assert!(!resp.contains("\\Seen"), "{} marked the message read: {}", cmd, resp);
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(db.get_cached_message("ro-f1").unwrap().unwrap().flags & 1, 0);
+        assert!(calls.lock().await.is_empty(), "EXAMINE fetch reached the backend");
+    }
+
+    #[tokio::test]
+    async fn uid_store_pushes_read_status_to_backend() {
+        let (addr, db, _tx, calls, _dir) = start_test_server_with_backend(false).await;
+        seed(&db, "rs-1", "inbox", "one");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let uid = db.get_cached_message("rs-1").unwrap().unwrap().imap_uid;
+        let resp = imap_cmd_lines(
+            &mut reader,
+            &mut writer,
+            "s1",
+            &format!("UID STORE {} +FLAGS (\\Seen)", uid),
+        )
+        .await;
+        assert!(resp.contains("s1 OK"));
+
+        let mut pushed = false;
+        for _ in 0..40 {
+            if calls
+                .lock()
+                .await
+                .iter()
+                .any(|(m, id)| m == "PATCH" && id == "rs-1")
+            {
+                pushed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(pushed, "UID STORE \\Seen must reach the backend");
+    }
+
+    #[test]
+    fn date_header_rfc2822_from_rfc3339() {
+        let d = date_header_rfc2822("2026-05-21T10:30:00+00:00");
+        assert!(d.contains("21 May 2026"), "got {}", d);
+        assert!(d.contains("10:30:00"), "got {}", d);
+        assert!(!d.contains("T10:30"), "must not be rfc3339: {}", d);
+        assert_eq!(date_header_rfc2822("garbage"), "garbage");
+    }
+
+    #[test]
+    fn build_rfc822_emits_rfc2822_date_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        db.upsert_cached_message(
+            "d-1",
+            "inbox",
+            Some("s"),
+            Some("a@b.com"),
+            Some("c@d.com"),
+            Some("2026-05-21T10:30:00+00:00"),
+            10,
+            Some("body"),
+            Some("{}"),
+        )
+        .unwrap();
+        let _ = db.assign_uid_if_missing("inbox", "d-1");
+        let m = db.get_cached_message("d-1").unwrap().unwrap();
+        let rfc = build_rfc822(&m);
+        let date_line = rfc.lines().find(|l| l.starts_with("Date:")).unwrap();
+        assert!(date_line.contains("21 May 2026"), "got {}", date_line);
+        assert!(!date_line.contains("2026-05-21T"), "rfc3339 leaked: {}", date_line);
+    }
+
+    #[tokio::test]
+    async fn nonpeek_body_fetch_pushes_read_status() {
+        let (addr, db, _tx, calls, _dir) = start_test_server_with_backend(false).await;
+        seed(&db, "fs-1", "inbox", "one");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "f1", "FETCH 1 (BODY[])").await;
+        assert!(resp.contains("f1 OK"));
+        assert!(resp.contains("\\Seen"), "untagged FLAGS expected: {}", resp);
+
+        let mut pushed = false;
+        for _ in 0..200 {
+            if calls
+                .lock()
+                .await
+                .iter()
+                .any(|(m, id)| m == "PATCH" && id == "fs-1")
+            {
+                pushed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(pushed, "non-peek fetch must push read status to backend");
+    }
+
+    #[test]
+    fn apply_partial_slices_bytes_without_reencoding() {
+        let (suffix, slice) = apply_partial("aé", Some((0, Some(2))));
+        assert_eq!(suffix, "<0>");
+        assert_eq!(slice, b"a\xc3");
+        let (_, rest) = apply_partial("aé", Some((2, None)));
+        assert_eq!(rest, b"\xa9");
+        assert_eq!(literal("BODY[]<0>", slice), b"BODY[]<0> {2}\r\na\xc3".to_vec());
+    }
+
+    async fn fetch_literal_bytes(
+        reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+        writer: &mut tokio::net::tcp::OwnedWriteHalf,
+        tag: &str,
+        cmd: &str,
+    ) -> Vec<u8> {
+        writer
+            .write_all(format!("{} {}\r\n", tag, cmd).as_bytes())
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        let mut head = String::new();
+        reader.read_line(&mut head).await.unwrap();
+        let open = head.rfind('{').unwrap_or_else(|| panic!("no literal in {}", head));
+        let len: usize = head[open + 1..].trim_end().trim_end_matches('}').parse().unwrap();
+        let mut body = vec![0u8; len];
+        tokio::io::AsyncReadExt::read_exact(reader, &mut body).await.unwrap();
+        let rest = read_until_tag(reader, tag).await.join("\n");
+        assert!(rest.starts_with(')'), "literal length was wrong: {}", rest);
+        assert!(rest.contains(&format!("{} OK", tag)), "{}", rest);
+        body
+    }
+
+    #[tokio::test]
+    async fn partial_fetch_splits_multibyte_characters_byte_exactly() {
+        let (addr, db, _tx, _dir) = start_test_server().await;
+        db.upsert_cached_message(
+            "pf-1",
+            "inbox",
+            Some("partial"),
+            Some("alice@example.com"),
+            Some("tester@aster.test"),
+            Some("Wed, 21 May 2026 10:00:00 +0000"),
+            64,
+            Some("olá ünïcödé €"),
+            Some(&serde_json::json!({"is_html": false}).to_string()),
+        )
+        .unwrap();
+        let _ = db.assign_uid_if_missing("inbox", "pf-1");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let full = fetch_literal_bytes(&mut reader, &mut writer, "p0", "FETCH 1 (BODY.PEEK[])").await;
+        let split = full.iter().position(|b| *b >= 0x80).unwrap() + 1;
+        let cmd = format!("FETCH 1 (BODY.PEEK[]<0.{}>)", split);
+        let first = fetch_literal_bytes(&mut reader, &mut writer, "p1", &cmd).await;
+        assert_eq!(first, full[..split]);
+        let cmd = format!("FETCH 1 (BODY.PEEK[]<{}.{}>)", split, full.len());
+        let second = fetch_literal_bytes(&mut reader, &mut writer, "p2", &cmd).await;
+        assert_eq!(second, full[split..]);
+    }
+
+    #[tokio::test]
+    async fn nonpeek_fetch_reports_the_new_flags_once() {
+        let (addr, db, _tx, _calls, _dir) = start_test_server_with_backend(false).await;
+        seed(&db, "sf-1", "inbox", "one");
+        seed(&db, "sf-2", "inbox", "two");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "f1", "FETCH 1 (FLAGS BODY[])").await;
+        assert!(resp.contains("f1 OK"), "{}", resp);
+        let fetches: Vec<&str> = resp.lines().filter(|l| l.starts_with("* 1 FETCH")).collect();
+        assert_eq!(fetches.len(), 1, "one FETCH response expected: {}", resp);
+        assert!(fetches[0].contains("FLAGS (\\Seen)"), "stale FLAGS: {}", resp);
+
+        let uid = db.get_cached_message("sf-2").unwrap().unwrap().imap_uid;
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "f2", &format!("UID FETCH {} (BODY[])", uid)).await;
+        let fetches: Vec<&str> = resp.lines().filter(|l| l.starts_with("* 2 FETCH")).collect();
+        assert_eq!(fetches.len(), 1, "one FETCH response expected: {}", resp);
+        assert!(fetches[0].contains("FLAGS (\\Seen)"), "implicit \\Seen not reported: {}", resp);
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "f3", "FETCH 1:2 (FLAGS)").await;
+        assert_eq!(resp.matches("FLAGS (\\Seen)").count(), 2, "{}", resp);
+    }
+
+    #[tokio::test]
+    async fn fetch_answers_rfc822_items_under_their_own_names() {
+        let (addr, db, _tx, _dir) = start_test_server().await;
+        seed(&db, "rn-1", "inbox", "one");
+        seed(&db, "rn-2", "inbox", "two");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "r1", "FETCH 1 (RFC822.HEADER)").await;
+        assert!(resp.contains("RFC822.HEADER {"), "{}", resp);
+        assert!(resp.contains("Subject: one"), "{}", resp);
+        assert!(!resp.contains("BODY[HEADER]"), "{}", resp);
+        assert_eq!(db.get_cached_message("rn-1").unwrap().unwrap().flags & 1, 0);
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "r2", "FETCH 1 (RFC822.SIZE RFC822)").await;
+        assert!(resp.contains("RFC822.SIZE "), "{}", resp);
+        assert!(resp.contains("RFC822 {"), "{}", resp);
+        assert!(resp.contains("hello body"), "{}", resp);
+        assert!(!resp.contains("BODY[]"), "{}", resp);
+        assert_eq!(db.get_cached_message("rn-1").unwrap().unwrap().flags & 1, 1);
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "r3", "FETCH 2 (RFC822.TEXT)").await;
+        assert!(resp.contains("RFC822.TEXT {"), "{}", resp);
+        assert!(!resp.contains("BODY[TEXT]"), "{}", resp);
+        assert_eq!(db.get_cached_message("rn-2").unwrap().unwrap().flags & 1, 1);
+    }
+
+    #[tokio::test]
+    async fn fetch_applies_partials_to_text_and_header_sections() {
+        let (addr, db, _tx, _dir) = start_test_server().await;
+        seed(&db, "pt-1", "inbox", "one");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "p1", "FETCH 1 (BODY.PEEK[TEXT]<0.5>)").await;
+        assert!(resp.contains("BODY[TEXT]<0> {5}\nhello)"), "{}", resp);
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "p2", "FETCH 1 (BODY.PEEK[HEADER]<0.4>)").await;
+        assert!(resp.contains("BODY[HEADER]<0> {4}\nDate)"), "{}", resp);
+    }
+
+    #[tokio::test]
+    async fn rfc822_fetch_reports_seen_in_the_same_response() {
+        let (addr, db, _tx, _calls, _dir) = start_test_server_with_backend(false).await;
+        seed(&db, "rs-1", "inbox", "one");
+        seed(&db, "rs-2", "inbox", "two");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        for (tag, seq, item) in [("s1", 1, "RFC822"), ("s2", 2, "RFC822.TEXT")] {
+            let resp = imap_cmd_lines(&mut reader, &mut writer, tag, &format!("FETCH {} ({})", seq, item)).await;
+            assert!(resp.contains(&format!("{} OK", tag)), "{}", resp);
+            let fetches: Vec<&str> = resp.lines().filter(|l| l.starts_with(&format!("* {} FETCH", seq))).collect();
+            assert_eq!(fetches.len(), 1, "one FETCH response expected: {}", resp);
+            assert!(fetches[0].contains("FLAGS (\\Seen)"), "{} did not report \\Seen: {}", item, resp);
+        }
+        assert_eq!(db.get_cached_message("rs-1").unwrap().unwrap().flags & 1, 1);
+        assert_eq!(db.get_cached_message("rs-2").unwrap().unwrap().flags & 1, 1);
+    }
+
+    #[tokio::test]
+    async fn rfc822_fetch_from_examine_does_not_set_seen() {
+        let (addr, db, _tx, calls, _dir) = start_test_server_with_backend(false).await;
+        seed(&db, "re-1", "inbox", "one");
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (r, w) = stream.into_split();
+        let mut reader = BufReader::new(r);
+        let mut writer = w;
+        let mut greeting = String::new();
+        reader.read_line(&mut greeting).await.unwrap();
+        let _ = imap_cmd_lines(
+            &mut reader,
+            &mut writer,
+            "a1",
+            "LOGIN \"tester@aster.test\" \"abcd-efgh-ijkl-mnop\"",
+        )
+        .await;
+        let sel = imap_cmd_lines(&mut reader, &mut writer, "a2", "EXAMINE INBOX").await;
+        assert!(sel.contains("READ-ONLY"), "{}", sel);
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "e1", "FETCH 1 (RFC822.SIZE RFC822)").await;
+        assert!(resp.contains("RFC822 {"), "{}", resp);
+        assert!(!resp.contains("\\Seen"), "{}", resp);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(db.get_cached_message("re-1").unwrap().unwrap().flags & 1, 0);
+        assert!(calls.lock().await.is_empty(), "EXAMINE fetch must not push read status");
+    }
+
+    #[tokio::test]
+    async fn peek_fetch_does_not_push_read_status() {
+        let (addr, db, _tx, calls, _dir) = start_test_server_with_backend(false).await;
+        seed(&db, "fs-2", "inbox", "one");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "f1", "FETCH 1 (BODY.PEEK[])").await;
+        assert!(resp.contains("f1 OK"));
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            calls.lock().await.is_empty(),
+            "peek fetch must not mark read"
+        );
+        let m = db.get_cached_message("fs-2").unwrap().unwrap();
+        assert_eq!(m.flags & 1, 0);
+    }
+
+    #[tokio::test]
+    async fn idle_reports_flag_changes() {
+        let (addr, db, tx, _dir) = start_test_server().await;
+        seed(&db, "fl-1", "inbox", "one");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        writer.write_all(b"i1 IDLE\r\n").await.unwrap();
+        writer.flush().await.unwrap();
+        let mut plus = String::new();
+        reader.read_line(&mut plus).await.unwrap();
+        assert!(plus.starts_with("+ "));
+
+        db.set_message_flags_by_id("fl-1", 1).unwrap();
+        let mut changed = HashMap::new();
+        changed.insert("Email".to_string(), "5".to_string());
+        let _ = tx.send(StateChange { changed });
+
+        let read_fut = async {
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            line
+        };
+        let line = tokio::time::timeout(Duration::from_secs(10), read_fut)
+            .await
+            .expect("flag change not delivered");
+        assert!(
+            line.contains("FETCH") && line.contains("\\Seen"),
+            "expected untagged FETCH FLAGS, got: {}",
+            line
+        );
+
+        writer.write_all(b"DONE\r\n").await.unwrap();
+        writer.flush().await.unwrap();
+        let _ = read_until_tag(&mut reader, "i1").await;
+    }
+
+    #[tokio::test]
+    async fn idle_emits_correct_expunge_sequence() {
+        let (addr, db, tx, _dir) = start_test_server().await;
+        seed(&db, "id-1", "inbox", "one");
+        seed(&db, "id-2", "inbox", "two");
+        seed(&db, "id-3", "inbox", "three");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        writer.write_all(b"i1 IDLE\r\n").await.unwrap();
+        writer.flush().await.unwrap();
+        let mut plus = String::new();
+        reader.read_line(&mut plus).await.unwrap();
+        assert!(plus.starts_with("+ "));
+
+        db.delete_message_by_aster_id("id-2").unwrap();
+        let mut changed = HashMap::new();
+        changed.insert("Email".to_string(), "9".to_string());
+        let _ = tx.send(StateChange { changed });
+
+        let read_fut = async {
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            line
+        };
+        let line = tokio::time::timeout(Duration::from_secs(10), read_fut)
+            .await
+            .expect("EXPUNGE not delivered");
+        assert!(
+            line.contains("* 2 EXPUNGE"),
+            "middle message must expunge as seq 2, got: {}",
+            line
+        );
+
+        writer.write_all(b"DONE\r\n").await.unwrap();
+        writer.flush().await.unwrap();
+        let _ = read_until_tag(&mut reader, "i1").await;
+    }
+
+    #[tokio::test]
+    async fn sequence_numbers_follow_the_session_until_expunges_are_reported() {
+        let (addr, db, _tx, _calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        for n in 1..=3 {
+            seed(&db, &format!("sn-{}", n), "inbox", &format!("m{}", n));
+        }
+        let uid = |id: &str| db.get_cached_message(id).unwrap().unwrap().imap_uid;
+        let (uid1, uid2, uid3) = (uid("sn-1"), uid("sn-2"), uid("sn-3"));
+        let (mut a_reader, mut a_writer) = login_and_select(addr).await;
+        let (mut b_reader, mut b_writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut b_reader, &mut b_writer, "b1", &format!("UID MOVE {} Trash", uid1)).await;
+        assert!(resp.contains("b1 OK"), "{}", resp);
+
+        let resp = imap_cmd_lines(&mut a_reader, &mut a_writer, "a3", "STORE 2 +FLAGS (\\Deleted)").await;
+        assert!(resp.contains("* 2 FETCH (FLAGS (\\Deleted))"), "{}", resp);
+        assert!(!resp.contains("EXPUNGE"), "STORE must not report expunges: {}", resp);
+        assert_eq!(db.get_cached_message("sn-2").unwrap().unwrap().flags & 8, 8);
+        assert_eq!(db.get_cached_message("sn-3").unwrap().unwrap().flags & 8, 0);
+
+        let resp = imap_cmd_lines(&mut a_reader, &mut a_writer, "a4", "FETCH 1 (UID)").await;
+        assert!(!resp.contains("* 1 FETCH"), "an expunged message was renumbered: {}", resp);
+
+        let resp = imap_cmd_lines(&mut a_reader, &mut a_writer, "a5", "NOOP").await;
+        assert!(resp.contains("* 1 EXPUNGE"), "NOOP must report the expunge: {}", resp);
+
+        let resp = imap_cmd_lines(&mut a_reader, &mut a_writer, "a6", "FETCH 1:* (UID)").await;
+        assert!(resp.contains(&format!("* 1 FETCH (UID {})", uid2)), "{}", resp);
+        assert!(resp.contains(&format!("* 2 FETCH (UID {})", uid3)), "{}", resp);
+
+        let resp = imap_cmd_lines(&mut a_reader, &mut a_writer, "a7", "EXPUNGE").await;
+        assert!(resp.contains("* 1 EXPUNGE"), "{}", resp);
+        assert!(db.get_cached_message("sn-2").unwrap().is_none());
+        assert_eq!(db.get_cached_message("sn-3").unwrap().unwrap().folder, "inbox");
+    }
+
+    #[tokio::test]
+    async fn noop_and_check_announce_new_messages() {
+        let (addr, db, _tx, _dir) = start_test_server().await;
+        seed(&db, "nw-1", "inbox", "one");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        seed(&db, "nw-2", "inbox", "two");
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "n1", "FETCH 2 (UID)").await;
+        assert!(!resp.contains("* 2 FETCH"), "unannounced message fetched: {}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "n2", "NOOP").await;
+        assert!(resp.contains("* 2 EXISTS"), "{}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "n3", "FETCH 2 (UID)").await;
+        assert!(resp.contains("* 2 FETCH"), "{}", resp);
+
+        seed(&db, "nw-3", "inbox", "three");
+        db.delete_message_by_aster_id("nw-1").unwrap();
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "n4", "CHECK").await;
+        let expunge = resp.find("* 1 EXPUNGE").expect(&resp);
+        let exists = resp.find("* 2 EXISTS").expect(&resp);
+        assert!(expunge < exists, "{}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "n5", "NOOP").await;
+        assert!(!resp.contains("EXPUNGE") && !resp.contains("EXISTS"), "{}", resp);
+    }
+
+    #[tokio::test]
+    async fn idle_reports_expunges_made_before_it_started() {
+        let (addr, db, _tx, _dir) = start_test_server().await;
+        seed(&db, "ip-1", "inbox", "one");
+        seed(&db, "ip-2", "inbox", "two");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        db.delete_message_by_aster_id("ip-1").unwrap();
+        writer.write_all(b"i1 IDLE\r\n").await.unwrap();
+        writer.flush().await.unwrap();
+        let mut plus = String::new();
+        reader.read_line(&mut plus).await.unwrap();
+        assert!(plus.starts_with("+ "));
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(10), reader.read_line(&mut line))
+            .await
+            .expect("no update during IDLE")
+            .unwrap();
+        assert_eq!(line, "* 1 EXPUNGE\r\n");
+
+        writer.write_all(b"DONE\r\n").await.unwrap();
+        writer.flush().await.unwrap();
+        let rest = read_until_tag(&mut reader, "i1").await.join("\n");
+        assert!(!rest.contains("EXISTS"), "{}", rest);
+    }
+
+    #[tokio::test]
+    async fn store_gm_labels_acknowledged() {
+        let (addr, db, _tx, _dir) = start_test_server().await;
+        seed(&db, "msg-store-1", "inbox", "subject one");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        writer
+            .write_all(b"a3 STORE 1 +X-GM-LABELS (\\Important Work)\r\n")
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        let lines = read_until_tag(&mut reader, "a3").await;
+        let combined = lines.join("\n");
+        assert!(combined.contains("a3 OK"), "store failed: {}", combined);
+    }
+
+    #[test]
+    fn search_needs_body_only_for_body_and_text_keys() {
+        assert!(search_needs_body("BODY \"HELLO\""));
+        assert!(search_needs_body("OR SUBJECT X TEXT Y"));
+        assert!(search_needs_body("NOT (BODY X)"));
+        assert!(!search_needs_body("ALL"));
+        assert!(!search_needs_body("UNSEEN SUBJECT \"BODYGUARD\" FROM ALICE"));
+        assert!(!search_needs_body("HEADER MESSAGE-ID X UID 1:*"));
+    }
+
+    #[tokio::test]
+    async fn search_reads_bodies_only_when_the_criteria_need_them() {
+        let (addr, db, _tx, _dir) = start_test_server().await;
+        seed(&db, "srch-1", "inbox", "first");
+        seed(&db, "srch-2", "inbox", "second");
+        db.update_cached_body("srch-2", "a needle in here", None).unwrap();
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "s1", "SEARCH BODY needle").await;
+        assert!(resp.contains("* SEARCH 2\n"), "{}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "s2", "UID SEARCH TEXT needle").await;
+        assert!(resp.contains("* SEARCH 2\n"), "{}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "s3", "SEARCH NOT BODY needle").await;
+        assert!(resp.contains("* SEARCH 1\n"), "{}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "s4", "UID SEARCH SUBJECT second").await;
+        assert!(resp.contains("* SEARCH 2\n"), "{}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "s5", "SEARCH ALL").await;
+        assert!(resp.contains("* SEARCH 1 2\n"), "{}", resp);
+    }
+
+    #[tokio::test]
+    async fn move_keeps_the_cached_body_of_the_moved_message() {
+        let (addr, db, _tx, _calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        seed(&db, "mv-body", "inbox", "keep my body");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "m1", "UID MOVE 1 Archive").await;
+        assert!(resp.contains("m1 OK"), "{}", resp);
+        let moved = db.get_cached_message("mv-body").unwrap().unwrap();
+        assert_eq!(moved.folder, "archive");
+        assert_eq!(moved.body_text.as_deref(), Some("hello body"));
+        assert!(db.body_cached("mv-body"));
+    }
+
+    fn expunges_one_at_a_time(uids: &mut Vec<u32>, present: &[u32]) -> String {
+        let mut out = String::new();
+        let mut i = 0;
+        while i < uids.len() {
+            if present.contains(&uids[i]) {
+                i += 1;
+                continue;
+            }
+            uids.remove(i);
+            out.push_str(&format!("* {} EXPUNGE\r\n", i + 1));
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn many_expunges_at_once_match_one_at_a_time_removal() {
+        let session_uids: Vec<u32> = (1..=200).collect();
+        let current: Vec<u32> = session_uids
+            .iter()
+            .copied()
+            .filter(|u| !(*u == 1 || *u == 200 || (40..=90).contains(u) || u % 7 == 0))
+            .chain([201, 202])
+            .collect();
+        let mut expected_uids = session_uids.clone();
+        let mut expected = expunges_one_at_a_time(&mut expected_uids, &current);
+        expected_uids.extend([201, 202]);
+        expected.push_str(&format!("* {} EXISTS\r\n", expected_uids.len()));
+
+        let mut conn = ImapConnection {
+            state: ImapState::Selected,
+            selected_mailbox: Some("INBOX".to_string()),
+            selected_folder: Some("inbox".to_string()),
+            uids: session_uids,
+            read_only: false,
+            copied_out: std::collections::HashSet::new(),
+        };
+        let mut out: Vec<u8> = Vec::new();
+        report_mailbox_changes(&mut out, &mut conn, &current, true).await.unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), expected);
+        assert_eq!(conn.uids, expected_uids);
+
+        let mut out: Vec<u8> = Vec::new();
+        report_mailbox_changes(&mut out, &mut conn, &[2, 3], false).await.unwrap();
+        assert!(out.is_empty());
+        assert_eq!(conn.uids, expected_uids);
+    }
+
+    #[tokio::test]
+    async fn idle_reports_many_expunges_and_flag_changes_at_once() {
+        let (addr, db, tx, _dir) = start_test_server().await;
+        for n in 1..=12 {
+            seed(&db, &format!("ib-{}", n), "inbox", "s");
+        }
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        writer.write_all(b"i1 IDLE\r\n").await.unwrap();
+        writer.flush().await.unwrap();
+        let mut plus = String::new();
+        reader.read_line(&mut plus).await.unwrap();
+        assert!(plus.starts_with("+ "));
+
+        for n in [2, 3, 4, 8, 12] {
+            db.delete_message_by_aster_id(&format!("ib-{}", n)).unwrap();
+        }
+        db.update_message_flags(9, "inbox", 1).unwrap();
+        db.update_message_flags(11, "inbox", 4).unwrap();
+        let mut changed = HashMap::new();
+        changed.insert("Email".to_string(), "9".to_string());
+        let _ = tx.send(StateChange { changed });
+
+        let mut lines = Vec::new();
+        for _ in 0..7 {
+            let mut line = String::new();
+            tokio::time::timeout(Duration::from_secs(10), reader.read_line(&mut line))
+                .await
+                .expect("update not delivered")
+                .unwrap();
+            lines.push(line.trim_end().to_string());
+        }
+        assert_eq!(
+            lines,
+            vec![
+                "* 2 EXPUNGE",
+                "* 2 EXPUNGE",
+                "* 2 EXPUNGE",
+                "* 5 EXPUNGE",
+                "* 8 EXPUNGE",
+                "* 5 FETCH (UID 9 FLAGS (\\Seen))",
+                "* 7 FETCH (UID 11 FLAGS (\\Flagged))",
+            ]
+        );
+
+        writer.write_all(b"DONE\r\n").await.unwrap();
+        writer.flush().await.unwrap();
+        let rest = read_until_tag(&mut reader, "i1").await.join("\n");
+        assert_eq!(rest, "i1 OK IDLE terminated");
+    }
+
+    async fn imap_cmd_bytes(
+        reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+        writer: &mut tokio::net::tcp::OwnedWriteHalf,
+        tag: &str,
+        cmd: &str,
+    ) -> Vec<u8> {
+        writer.write_all(format!("{} {}\r\n", tag, cmd).as_bytes()).await.unwrap();
+        writer.flush().await.unwrap();
+        let mut out = Vec::new();
+        loop {
+            let start = out.len();
+            let n = reader.read_until(b'\n', &mut out).await.unwrap();
+            if n == 0 || out[start..].starts_with(format!("{} ", tag).as_bytes()) {
+                break;
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn fetching_one_uid_of_many_matches_the_full_folder_render() {
+        let (addr, db, _tx, _dir) = start_test_server().await;
+        for n in 1..=40 {
+            let id = format!("many-{}", n);
+            if n == 17 {
+                seed_copy_source(
+                    &db,
+                    &id,
+                    "with attachment",
+                    &[crate::db::CachedAttachment {
+                        seq: 0,
+                        name: "figures.csv".to_string(),
+                        content_type: "text/csv".to_string(),
+                        content_id: None,
+                        is_inline: false,
+                        size: 11,
+                        data: b"a,b\r\n1,2\r\n".to_vec(),
+                    }],
+                );
+            } else {
+                seed(&db, &id, "inbox", &format!("subject {}", n));
+                db.update_cached_body(&id, &format!("body number {}", n), None).unwrap();
+            }
+        }
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let full = db.list_cached_messages("inbox").unwrap();
+        let render_old = |uid: u32| {
+            let m = full.iter().find(|m| m.imap_uid == uid).unwrap();
+            let atts = if m.attachments_state == crate::db::ATTACHMENTS_STORED {
+                db.get_message_attachments(&m.aster_id).unwrap()
+            } else {
+                Vec::new()
+            };
+            crate::message_render::render(m, &atts, true)
+        };
+
+        for uid in [17u32, 3, 40] {
+            let r = render_old(uid);
+            let resp = imap_cmd_bytes(
+                &mut reader,
+                &mut writer,
+                "f1",
+                &format!("UID FETCH {} (FLAGS RFC822.SIZE BODYSTRUCTURE BODY.PEEK[HEADER.FIELDS (SUBJECT)] BODY.PEEK[])", uid),
+            )
+            .await;
+            let mut expected = format!(
+                "* {} FETCH (FLAGS () UID {} RFC822.SIZE {} BODYSTRUCTURE {} ",
+                uid, uid, r.size, r.bodystructure
+            )
+            .into_bytes();
+            expected.extend(literal(
+                "BODY[HEADER.FIELDS (SUBJECT)]",
+                filter_header_fields(r.header(), &["SUBJECT".to_string()]),
+            ));
+            expected.push(b' ');
+            expected.extend(literal("BODY[]", &r.text));
+            expected.extend_from_slice(b")\r\nf1 OK FETCH completed\r\n");
+            assert_eq!(
+                String::from_utf8_lossy(&resp),
+                String::from_utf8_lossy(&expected),
+                "UID {}",
+                uid
+            );
+        }
+
+        let r = render_old(17);
+        let resp = imap_cmd_bytes(&mut reader, &mut writer, "f2", "FETCH 17 (BODY.PEEK[2])").await;
+        let mut expected = b"* 17 FETCH (".to_vec();
+        expected.extend(literal("BODY[2]", r.part_body("2").unwrap()));
+        expected.extend_from_slice(b")\r\nf2 OK FETCH completed\r\n");
+        assert_eq!(String::from_utf8_lossy(&resp), String::from_utf8_lossy(&expected));
+    }
+
+    #[tokio::test]
+    async fn header_and_structure_fetches_match_the_full_render() {
+        let (addr, db, _tx, _dir) = start_test_server().await;
+        let figures = crate::db::CachedAttachment {
+            seq: 0,
+            name: "figures.csv".to_string(),
+            content_type: "text/csv".to_string(),
+            content_id: None,
+            is_inline: false,
+            size: 11,
+            data: b"a,b\r\n1,2\r\n".to_vec(),
+        };
+        let scan = crate::db::CachedAttachment {
+            seq: 1,
+            name: "scan.pdf".to_string(),
+            content_type: "application/pdf".to_string(),
+            content_id: None,
+            is_inline: false,
+            size: 7,
+            data: vec![0x25; 300_001],
+        };
+        seed_copy_source(&db, "hs-1", "with attachments", &[figures, scan]);
+        seed(&db, "hs-2", "inbox", "no attachments");
+        db.update_cached_body("hs-2", "just text", None).unwrap();
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let full = db.list_cached_messages("inbox").unwrap();
+        for uid in [1u32, 2] {
+            let m = full.iter().find(|m| m.imap_uid == uid).unwrap();
+            let atts = if m.attachments_state == crate::db::ATTACHMENTS_STORED {
+                db.get_message_attachments(&m.aster_id).unwrap()
+            } else {
+                Vec::new()
+            };
+            let r = crate::message_render::render(m, &atts, true);
+            let resp = imap_cmd_bytes(
+                &mut reader,
+                &mut writer,
+                "f1",
+                &format!(
+                    "UID FETCH {} (RFC822.SIZE BODYSTRUCTURE BODY.PEEK[HEADER.FIELDS (SUBJECT FROM)] BODY.PEEK[HEADER] RFC822.HEADER)",
+                    uid
+                ),
+            )
+            .await;
+            let mut expected = format!(
+                "* {} FETCH (UID {} RFC822.SIZE {} BODYSTRUCTURE {} ",
+                uid, uid, r.size, r.bodystructure
+            )
+            .into_bytes();
+            expected.extend(literal(
+                "BODY[HEADER.FIELDS (SUBJECT FROM)]",
+                filter_header_fields(r.header(), &["SUBJECT".to_string(), "FROM".to_string()]),
+            ));
+            expected.push(b' ');
+            expected.extend(literal("BODY[HEADER]", r.header()));
+            expected.push(b' ');
+            expected.extend(literal("RFC822.HEADER", r.header()));
+            expected.extend_from_slice(b")\r\nf1 OK FETCH completed\r\n");
+            assert_eq!(
+                String::from_utf8_lossy(&resp),
+                String::from_utf8_lossy(&expected),
+                "UID {}",
+                uid
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fetching_a_few_messages_matches_the_folder_wide_fetch() {
+        let (addr, db, _tx, _dir) = start_test_server().await;
+        let count = FETCH_TARGETED_MAX as u32 + 20;
+        for n in 1..=count {
+            let id = format!("tf-{}", n);
+            if n % 97 == 0 {
+                seed_copy_source(
+                    &db,
+                    &id,
+                    &format!("subject {}", n),
+                    &[crate::db::CachedAttachment {
+                        seq: 0,
+                        name: "notes.txt".to_string(),
+                        content_type: "text/plain".to_string(),
+                        content_id: None,
+                        is_inline: false,
+                        size: 5,
+                        data: b"notes".to_vec(),
+                    }],
+                );
+            } else {
+                seed(&db, &id, "inbox", &format!("subject {}", n));
+            }
+            if n % 50 == 0 {
+                db.set_message_keywords(&id, &["$label1".to_string(), "Work".to_string()]).unwrap();
+            }
+        }
+        db.update_message_flags(194, "inbox", 1 | 4).unwrap();
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let items = "(FLAGS RFC822.SIZE ENVELOPE)";
+        let all = imap_cmd_bytes(&mut reader, &mut writer, "a1", &format!("FETCH 1:* {}", items)).await;
+        let all = String::from_utf8(all).unwrap();
+        let lines: Vec<&str> = all.split_inclusive("\r\n").collect();
+        assert_eq!(lines.len(), count as usize + 1);
+        assert!(lines[49].contains("FLAGS ($label1 Work)"), "{}", lines[49]);
+        let line = |seq: u32| lines[seq as usize - 1].to_string();
+
+        for (cmd, seqs) in [
+            ("FETCH 50", vec![50u32]),
+            ("FETCH 194,97:100", vec![194u32, 97, 98, 99, 100]),
+            ("FETCH 510:*", (510..=count).collect::<Vec<_>>()),
+        ] {
+            let resp = imap_cmd_bytes(&mut reader, &mut writer, "f1", &format!("{} {}", cmd, items)).await;
+            let expected: String = seqs.iter().map(|s| line(*s)).collect::<String>() + "f1 OK FETCH completed\r\n";
+            assert_eq!(String::from_utf8_lossy(&resp), expected, "{}", cmd);
+        }
+
+        let resp = imap_cmd_bytes(&mut reader, &mut writer, "u1", &format!("UID FETCH 100,194 {}", items)).await;
+        let expected = format!(
+            "{}{}u1 OK FETCH completed\r\n",
+            line(100).replacen(" RFC822.SIZE", " UID 100 RFC822.SIZE", 1),
+            line(194).replacen(" RFC822.SIZE", " UID 194 RFC822.SIZE", 1)
+        );
+        assert_eq!(String::from_utf8_lossy(&resp), expected);
+    }
+
+    #[tokio::test]
+    async fn store_on_many_messages_saves_all_and_pushes_read_status_in_parallel() {
+        let (addr, db, _tx, calls, _dir) = start_test_server_mock(
+            MockOpts {
+                slow_metadata_ms: 300,
+                ..Default::default()
+            },
+            None,
+        )
+        .await;
+        for n in 1..=24 {
+            seed(&db, &format!("bs-{}", n), "inbox", "s");
+        }
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "s1", "STORE 1:24 +FLAGS (\\Seen $Work)").await;
+        let expected: Vec<String> = (1..=24)
+            .map(|n| format!("* {} FETCH (FLAGS (\\Seen $Work))", n))
+            .chain(std::iter::once("s1 OK STORE completed".to_string()))
+            .collect();
+        assert_eq!(resp, expected.join("\n"));
+        for m in db.list_cached_message_meta("inbox").unwrap() {
+            assert_eq!(m.flags & 1, 1, "{}", m.aster_id);
+            assert_eq!(db.message_keywords(&m.aster_id).unwrap(), vec!["$Work".to_string()]);
+        }
+
+        let started = std::time::Instant::now();
+        loop {
+            let pushed = calls.lock().await.iter().filter(|(m, _)| m == "PATCH").count();
+            if pushed == 24 {
+                break;
+            }
+            assert!(started.elapsed() < Duration::from_secs(4), "only {} of 24 pushed", pushed);
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn store_pushes_read_status_in_bulk_chunks() {
+        let (addr, db, _tx, calls, _dir) = start_test_server_mock(
+            MockOpts {
+                bulk_metadata: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await;
+        for n in 1..=150 {
+            seed(&db, &format!("bk-{}", n), "inbox", "s");
+        }
+        let (mut reader, mut writer) = login_and_select(addr).await;
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "s1", "STORE 1:150 +FLAGS.SILENT (\\Seen)").await;
+        assert_eq!(resp, "s1 OK STORE completed");
+
+        let started = std::time::Instant::now();
+        loop {
+            let log = calls.lock().await.clone();
+            let mut bulk: Vec<String> = log
+                .iter()
+                .filter(|(m, _)| m == "BULK_PATCH")
+                .map(|(_, count)| count.clone())
+                .collect();
+            if bulk.len() == 2 {
+                bulk.sort();
+                assert_eq!(bulk, vec!["100".to_string(), "50".to_string()]);
+                assert!(!log.iter().any(|(m, _)| m == "PATCH"), "{:?}", log);
+                break;
+            }
+            assert!(started.elapsed() < Duration::from_secs(4), "{:?}", log);
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn store_flagged_sends_the_star_to_the_server() {
+        let (addr, db, _tx, calls, _dir) = start_test_server_with_backend(false).await;
+        seed(&db, "st-1", "inbox", "s");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+        let star_patches = |log: &[(String, String)]| {
+            log.iter().filter(|(m, id)| m == "PATCH" && id == "st-1").count()
+        };
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "s1", "STORE 1 +FLAGS (\\Flagged)").await;
+        assert!(resp.contains("s1 OK"), "{}", resp);
+        let started = std::time::Instant::now();
+        while star_patches(&calls.lock().await) < 1 {
+            assert!(started.elapsed() < std::time::Duration::from_secs(4), "{:?}", calls.lock().await);
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let uid = db.get_cached_message("st-1").unwrap().unwrap().imap_uid;
+        let resp = imap_cmd_lines(
+            &mut reader,
+            &mut writer,
+            "s2",
+            &format!("UID STORE {} -FLAGS (\\Flagged)", uid),
+        )
+        .await;
+        assert!(resp.contains("s2 OK"), "{}", resp);
+        while star_patches(&calls.lock().await) < 2 {
+            assert!(started.elapsed() < std::time::Duration::from_secs(4), "{:?}", calls.lock().await);
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "s3", "STORE 1 +FLAGS (\\Answered)").await;
+        assert!(resp.contains("s3 OK"), "{}", resp);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(star_patches(&calls.lock().await), 2, "{:?}", calls.lock().await);
+    }
+
+    #[test]
+    fn flag_pushes_retry_transient_failures_only() {
+        use crate::error::BridgeError;
+        assert!(flag_push_should_retry(&BridgeError::Api("429 Too Many Requests: slow".into())));
+        assert!(flag_push_should_retry(&BridgeError::Api("503 Service Unavailable: x".into())));
+        assert!(flag_push_should_retry(&BridgeError::Api("401 Unauthorized: x".into())));
+        assert!(flag_push_should_retry(&BridgeError::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "reset"
+        ))));
+        assert!(!flag_push_should_retry(&BridgeError::Api("404 Not Found: x".into())));
+        assert!(!flag_push_should_retry(&BridgeError::Api("400 Bad Request: x".into())));
+    }
+
+    #[tokio::test]
+    async fn uid_store_reports_each_message_once_in_order() {
+        let (addr, db, _tx, _calls, _dir) = start_test_server_with_backend(false).await;
+        for n in 1..=5 {
+            seed(&db, &format!("us-{}", n), "inbox", "s");
+        }
+        let (mut reader, mut writer) = login_and_select(addr).await;
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "s1", "UID STORE 2:4 FLAGS (\\Flagged)").await;
+        assert_eq!(
+            resp,
+            "* 2 FETCH (UID 2 FLAGS (\\Flagged))\n* 3 FETCH (UID 3 FLAGS (\\Flagged))\n\
+             * 4 FETCH (UID 4 FLAGS (\\Flagged))\ns1 OK UID STORE completed"
+        );
+        let flags: Vec<i64> = db.list_cached_message_meta("inbox").unwrap().iter().map(|m| m.flags).collect();
+        assert_eq!(flags, vec![0, 4, 4, 4, 0]);
+    }
+
+    #[tokio::test]
+    async fn expunge_of_many_messages_reports_shifting_sequence_numbers() {
+        let (addr, db, _tx, _calls, _dir) = start_test_server_with_backend(false).await;
+        for n in 1..=10 {
+            seed(&db, &format!("me-{}", n), "inbox", "s");
+        }
+        let (mut reader, mut writer) = login_and_select(addr).await;
+        imap_cmd_lines(&mut reader, &mut writer, "e1", "UID STORE 2,4,6,8,10 +FLAGS.SILENT (\\Deleted)").await;
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "e2", "UID EXPUNGE 1:8").await;
+        assert_eq!(
+            resp,
+            "* 2 EXPUNGE\n* 3 EXPUNGE\n* 4 EXPUNGE\n* 5 EXPUNGE\ne2 OK UID EXPUNGE completed"
+        );
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "e3", "EXPUNGE").await;
+        assert_eq!(resp, "* 6 EXPUNGE\ne3 OK EXPUNGE completed");
+        let left: Vec<u32> = db.list_cached_message_meta("inbox").unwrap().iter().map(|m| m.imap_uid).collect();
+        assert_eq!(left, vec![1, 3, 5, 7, 9]);
+    }
+
+    #[tokio::test]
+    async fn flags_only_fetch_is_unchanged() {
+        let (addr, db, _tx, _dir) = start_test_server().await;
+        for n in 1..=3 {
+            seed(&db, &format!("fl-{}", n), "inbox", "s");
+        }
+        db.update_message_flags(2, "inbox", 1 | 4).unwrap();
+        let (mut reader, mut writer) = login_and_select(addr).await;
+        let resp = imap_cmd_bytes(&mut reader, &mut writer, "f1", "UID FETCH 1:* (FLAGS)").await;
+        assert_eq!(
+            String::from_utf8_lossy(&resp),
+            "* 1 FETCH (FLAGS () UID 1)\r\n* 2 FETCH (FLAGS (\\Seen \\Flagged) UID 2)\r\n\
+             * 3 FETCH (FLAGS () UID 3)\r\nf1 OK FETCH completed\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn closing_connections_drops_an_open_session() {
+        use tokio::io::AsyncReadExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::open_with_key(dir.path(), &[7u8; 32]).unwrap());
+        let passwords = Arc::new(AppPasswords::new(db.clone()));
+        let _ = passwords.store("test", "abcd-efgh-ijkl-mnop").unwrap();
+        let session = Arc::new(RwLock::new(Session {
+            data_kek: None,
+            user_id: Uuid::new_v4(),
+            username: "tester".to_string(),
+            email: "tester@aster.test".to_string(),
+            access_token: zeroize::Zeroizing::new("stub".to_string()),
+            refresh_token: None,
+            vault_passphrase: Vec::new(),
+            identity_key: None,
+            ratchet_identity_public: None,
+            ratchet_keys: Vec::new(),
+            inbound_keys: Vec::new(),
+            send_identities: Vec::new(),
+            default_sender_id: None,
+            account_keys: Vec::new(),
+            previous_keys: Default::default(),
+            ratchet_recovery: Default::default(),
+        }));
+        let client = Arc::new(ApiClient::new_with_base_url("http://127.0.0.1:1"));
+        let (state_tx, _state_rx) = broadcast::channel(16);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (trigger, shutdown) = crate::shutdown::channel();
+        let listener_task = tokio::spawn(shutdown.scope(async move {
+            let _ = serve(listener, session, db, client, passwords, state_tx, None).await;
+        }));
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (read_half, mut write_half) = stream.into_split();
+        let mut reader = BufReader::new(read_half);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        assert!(line.starts_with("* OK"), "greeting was {:?}", line);
+
+        write_half
+            .write_all(b"a1 LOGIN tester@aster.test abcd-efgh-ijkl-mnop\r\n")
+            .await
+            .unwrap();
+        let login = read_until_tag(&mut reader, "a1").await;
+        assert!(
+            login.last().is_some_and(|l| l.starts_with("a1 OK")),
+            "login reply was {:?}",
+            login
+        );
+
+        let mut rest = Vec::new();
+        let still_open = tokio::time::timeout(
+            Duration::from_millis(200),
+            reader.read_to_end(&mut rest),
+        )
+        .await;
+        assert!(still_open.is_err(), "the session closed before the bridge stopped");
+
+        trigger.close_connections();
+        listener_task.abort();
+
+        tokio::time::timeout(Duration::from_secs(5), reader.read_to_end(&mut rest))
+            .await
+            .expect("a signed-in IMAP session stayed open after connections were closed")
+            .ok();
+
+        write_half.write_all(b"a2 NOOP\r\n").await.ok();
+        line.clear();
+        let after = reader.read_line(&mut line).await.unwrap_or(0);
+        assert_eq!(after, 0, "the closed session still answered {:?}", line);
+        drop(dir);
+    }
+
+    async fn login_reply(username: &str) -> String {
+        use crate::auth::session::{SendIdentity, SendIdentityKind};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::open_with_key(dir.path(), &[7u8; 32]).unwrap());
+        let passwords = Arc::new(AppPasswords::new(db.clone()));
+        let _ = passwords.store("test", "abcd-efgh-ijkl-mnop").unwrap();
+        let identity = |address: &str, kind: SendIdentityKind, enabled: bool, sender_id: &str| {
+            SendIdentity {
+                address: address.to_string(),
+                auth_hash_b64: None,
+                display_name: None,
+                kind,
+                enabled,
+                sender_id: sender_id.to_string(),
+            }
+        };
+        let session = Arc::new(RwLock::new(Session {
+            data_kek: None,
+            user_id: Uuid::new_v4(),
+            username: "tester".to_string(),
+            email: "tester@aster.test".to_string(),
+            access_token: zeroize::Zeroizing::new("stub".to_string()),
+            refresh_token: None,
+            vault_passphrase: Vec::new(),
+            identity_key: None,
+            ratchet_identity_public: None,
+            ratchet_keys: Vec::new(),
+            inbound_keys: Vec::new(),
+            send_identities: vec![
+                identity("tester@aster.test", SendIdentityKind::Primary, true, "primary"),
+                identity("me@custom.test", SendIdentityKind::CustomDomain, true, "domain-1"),
+                identity("old@custom.test", SendIdentityKind::CustomDomain, false, "domain-2"),
+            ],
+            default_sender_id: Some("domain-1".to_string()),
+            account_keys: Vec::new(),
+            previous_keys: Default::default(),
+            ratchet_recovery: Default::default(),
+        }));
+        let client = Arc::new(ApiClient::new_with_base_url("http://127.0.0.1:1"));
+        let (state_tx, _state_rx) = broadcast::channel(16);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let listener_task = tokio::spawn(async move {
+            let _ = serve(listener, session, db, client, passwords, state_tx, None).await;
+        });
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (read_half, mut write_half) = stream.into_split();
+        let mut reader = BufReader::new(read_half);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        write_half
+            .write_all(format!("a1 LOGIN \"{}\" \"abcd-efgh-ijkl-mnop\"\r\n", username).as_bytes())
+            .await
+            .unwrap();
+        let reply = read_until_tag(&mut reader, "a1").await;
+        listener_task.abort();
+        drop(dir);
+        reply.last().cloned().unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn login_accepts_the_account_address_and_its_own_sender_addresses() {
+        for username in ["tester@aster.test", "me@custom.test", "ME@Custom.Test"] {
+            let reply = login_reply(username).await;
+            assert!(reply.starts_with("a1 OK"), "{} got {:?}", username, reply);
+        }
+    }
+
+    #[tokio::test]
+    async fn login_rejects_addresses_the_account_does_not_send_from() {
+        for username in ["old@custom.test", "stranger@custom.test", "tester"] {
+            let reply = login_reply(username).await;
+            assert!(reply.starts_with("a1 NO"), "{} got {:?}", username, reply);
+        }
+    }
+}

@@ -1,0 +1,2259 @@
+//
+// Aster Communications Inc.
+//
+// Copyright (c) 2026 Aster Communications Inc.
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use rusqlite::OptionalExtension;
+use serde_json::{json, Value};
+
+use crate::db::{CachedAttachment, CachedMessage};
+use crate::jmap::dispatcher::MethodError;
+use crate::jmap::state::JmapContext;
+use crate::jmap::store;
+
+pub async fn get(ctx: &Arc<JmapContext>, args: Value) -> Result<Value, MethodError> {
+    let account_id = ctx.require_account(&args).await?;
+    let ids_field = args.get("ids");
+    let want: Vec<String> = if ids_field.map(|v| v.is_null()).unwrap_or(false) {
+        ctx.db.list_all_message_ids().unwrap_or_default()
+    } else {
+        ids_field
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    if want.len() > 500 {
+        return Err(MethodError::new(
+            "requestTooLarge",
+            "ids exceeds maxObjectsInGet (500)",
+        ));
+    }
+    let properties = args
+        .get("properties")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect::<Vec<_>>()
+        });
+    let fetch_text = args
+        .get("fetchTextBodyValues")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        || properties
+            .as_ref()
+            .map(|p| p.iter().any(|s| s == "bodyValues" || s == "textBody" || s == "htmlBody"))
+            .unwrap_or(false);
+
+    let label_to_id = store::label_to_mailbox_id_map(&ctx.db);
+    let mut list = Vec::new();
+    let mut not_found = Vec::new();
+
+    let wants = |name: &str| {
+        properties
+            .as_ref()
+            .map(|p| p.iter().any(|s| s == name))
+            .unwrap_or(true)
+    };
+    let with_body = fetch_text || wants("preview");
+    let mut messages = ctx.db.get_cached_messages(&want, with_body).unwrap_or_default();
+    let stored: Vec<String> = messages
+        .values()
+        .filter(|m| crate::db::attachment_parts_known(m.attachments_state))
+        .map(|m| m.aster_id.clone())
+        .collect();
+    let attachment_meta = ctx
+        .db
+        .get_attachment_meta_for_messages(&stored)
+        .unwrap_or_default();
+    if !with_body && wants("size") {
+        let sized: Vec<String> = attachment_meta.keys().cloned().collect();
+        messages.extend(ctx.db.get_cached_messages(&sized, true).unwrap_or_default());
+    }
+
+    for id in &want {
+        match messages.get(id) {
+            Some(m) => {
+                let attachments = attachment_meta.get(id).map(Vec::as_slice).unwrap_or(&[]);
+                let stored_keywords = ctx.db.message_keywords(id).unwrap_or_default();
+                list.push(serialize_email(m, &label_to_id, &properties, fetch_text, attachments, &stored_keywords))
+            }
+            None => not_found.push(id.clone()),
+        }
+    }
+
+    let state = ctx.db.jmap_state_get("Email").unwrap_or(0);
+    Ok(json!({
+        "accountId": account_id,
+        "state": state.to_string(),
+        "list": list,
+        "notFound": not_found,
+    }))
+}
+
+fn serialize_email(
+    m: &CachedMessage,
+    label_to_id: &HashMap<String, String>,
+    properties: &Option<Vec<String>>,
+    fetch_text: bool,
+    attachments: &[CachedAttachment],
+    stored_keywords: &[String],
+) -> Value {
+    let mailbox_id = label_to_id.get(&m.folder).cloned().unwrap_or_default();
+    let mut mailbox_ids = serde_json::Map::new();
+    mailbox_ids.insert(mailbox_id, json!(true));
+
+    let mut keywords = serde_json::Map::new();
+    if m.flags & 1 != 0 { keywords.insert("$seen".to_string(), json!(true)); }
+    if m.flags & 2 != 0 { keywords.insert("$answered".to_string(), json!(true)); }
+    if m.flags & 4 != 0 { keywords.insert("$flagged".to_string(), json!(true)); }
+    if m.flags & 8 != 0 { keywords.insert("$deleted".to_string(), json!(true)); }
+    if m.flags & 16 != 0 { keywords.insert("$draft".to_string(), json!(true)); }
+    for keyword in stored_keywords {
+        keywords.entry(keyword.clone()).or_insert(json!(true));
+    }
+
+    let meta: Value = m
+        .raw_headers
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or(json!({}));
+    let is_html = meta.get("is_html").and_then(|v| v.as_bool()).unwrap_or(false);
+    let message_id = meta.get("message_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let attachment_count = meta
+        .get("attachment_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    let received_at = m
+        .date
+        .as_deref()
+        .map(|d| {
+            if chrono::DateTime::parse_from_rfc3339(d).is_ok() {
+                d.to_string()
+            } else if let Some(p) = crate::imap::server::parse_datetime_lenient(d) {
+                p.to_rfc3339()
+            } else {
+                chrono::Utc::now().to_rfc3339()
+            }
+        })
+        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+
+    let from = parse_from(&m.sender);
+    let to = parse_address_list(&m.recipients);
+    let subject = m.subject.clone().unwrap_or_default();
+
+    let body_part_id = "1";
+    let body_part = json!({
+        "partId": body_part_id,
+        "blobId": m.aster_id,
+        "size": m.size,
+        "type": if is_html { "text/html" } else { "text/plain" },
+        "charset": "utf-8"
+    });
+
+    let mut body_values = serde_json::Map::new();
+    if fetch_text {
+        if let Some(body) = &m.body_text {
+            body_values.insert(
+                body_part_id.to_string(),
+                json!({
+                    "value": format!(
+                        "{}{}",
+                        body,
+                        crate::message_render::trust_note_suffix(&meta, is_html)
+                    ),
+                    "isEncodingProblem": false,
+                    "isTruncated": false,
+                }),
+            );
+        }
+    }
+
+    let html_body = if is_html { vec![body_part.clone()] } else { vec![] };
+    let text_body = if !is_html { vec![body_part.clone()] } else { vec![] };
+    let attachment_parts: Vec<Value> = attachments
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            let inline = a.is_inline && a.content_id.is_some();
+            json!({
+                "partId": format!("{}", i + 2),
+                "blobId": crate::jmap::blob::attachment_blob_id(&m.aster_id, a.seq),
+                "size": a.size,
+                "name": a.name,
+                "type": a.content_type,
+                "charset": Value::Null,
+                "disposition": if inline { "inline" } else { "attachment" },
+                "cid": a.content_id.as_deref().map(|c| c.trim_start_matches('<').trim_end_matches('>')),
+            })
+        })
+        .collect();
+    let (message_size, body_structure) = if attachment_parts.is_empty() {
+        (json!(m.size), body_part.clone())
+    } else {
+        let mut sub_parts = vec![body_part.clone()];
+        sub_parts.extend(attachment_parts.iter().cloned());
+        (
+            json!(crate::message_render::rendered_size(m, attachments)),
+            json!({
+                "partId": Value::Null,
+                "blobId": Value::Null,
+                "type": "multipart/mixed",
+                "subParts": sub_parts,
+            }),
+        )
+    };
+
+    let include_body_values = fetch_text
+        || properties
+            .as_ref()
+            .map(|p| p.iter().any(|s| s == "bodyValues"))
+            .unwrap_or(false);
+
+    let mut full_map = serde_json::Map::new();
+    full_map.insert("id".to_string(), json!(m.aster_id));
+    full_map.insert("blobId".to_string(), json!(m.aster_id));
+    full_map.insert("threadId".to_string(), json!(m.thread_id.as_deref().unwrap_or(&m.aster_id)));
+    full_map.insert("mailboxIds".to_string(), Value::Object(mailbox_ids));
+    full_map.insert("keywords".to_string(), Value::Object(keywords));
+    full_map.insert("size".to_string(), message_size);
+    full_map.insert("receivedAt".to_string(), json!(received_at));
+    full_map.insert("messageId".to_string(), json!(message_id.map(|m| vec![m])));
+    full_map.insert("inReplyTo".to_string(), Value::Null);
+    full_map.insert("references".to_string(), Value::Null);
+    full_map.insert("sender".to_string(), from.clone());
+    full_map.insert("from".to_string(), from);
+    full_map.insert("to".to_string(), to);
+    full_map.insert("cc".to_string(), meta_addresses(&meta, "cc"));
+    full_map.insert("bcc".to_string(), meta_addresses(&meta, "bcc"));
+    full_map.insert("replyTo".to_string(), meta_addresses(&meta, "reply_to"));
+    full_map.insert("subject".to_string(), json!(subject));
+    full_map.insert("sentAt".to_string(), json!(received_at));
+    full_map.insert("hasAttachment".to_string(), json!(attachment_count > 0 || !attachments.is_empty()));
+    full_map.insert("preview".to_string(), json!(preview_of(m.body_text.as_deref())));
+    if include_body_values {
+        full_map.insert("bodyValues".to_string(), Value::Object(body_values));
+    }
+    full_map.insert("textBody".to_string(), json!(text_body));
+    full_map.insert("htmlBody".to_string(), json!(html_body));
+    full_map.insert("attachments".to_string(), Value::Array(attachment_parts));
+    full_map.insert("bodyStructure".to_string(), body_structure);
+    let full = Value::Object(full_map);
+
+    if let Some(props) = properties {
+        if let Value::Object(map) = &full {
+            let mut filtered = serde_json::Map::new();
+            filtered.insert("id".to_string(), map.get("id").cloned().unwrap_or(Value::Null));
+            for p in props {
+                if let Some(v) = map.get(p) {
+                    filtered.insert(p.clone(), v.clone());
+                }
+            }
+            return Value::Object(filtered);
+        }
+    }
+    full
+}
+
+fn parse_from(s: &Option<String>) -> Value {
+    let Some(s) = s else { return Value::Null };
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Value::Null;
+    }
+    if let (Some(open), Some(close)) = (trimmed.find('<'), trimmed.rfind('>')) {
+        if close > open {
+            let name = trimmed[..open].trim().trim_matches('"').to_string();
+            let email = trimmed[open + 1..close].trim().to_string();
+            return json!([{ "name": if name.is_empty() { Value::Null } else { Value::String(name) }, "email": email }]);
+        }
+    }
+    json!([{ "name": Value::Null, "email": trimmed }])
+}
+
+fn parse_address_list(s: &Option<String>) -> Value {
+    crate::address::jmap_addresses(s.as_deref())
+}
+
+fn meta_addresses(meta: &Value, key: &str) -> Value {
+    crate::address::jmap_addresses(crate::address::meta_address_text(meta, key).as_deref())
+}
+
+fn preview_of(body: Option<&str>) -> String {
+    let Some(b) = body else { return String::new() };
+    let stripped: String = b
+        .chars()
+        .filter(|c| !c.is_control() || *c == ' ')
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    stripped.chars().take(256).collect()
+}
+
+pub async fn query(ctx: &Arc<JmapContext>, args: Value) -> Result<Value, MethodError> {
+    let account_id = ctx.require_account(&args).await?;
+    let id_to_label = store::mailbox_id_to_label_map(&ctx.db);
+
+    let requested_position = args.get("position").and_then(|v| v.as_i64()).unwrap_or(0);
+    let limit = match args.get("limit").and_then(|v| v.as_i64()) {
+        Some(n) if n < 0 => return Err(MethodError::invalid_args("limit must not be negative")),
+        Some(n) => n.min(500),
+        None => 50,
+    };
+
+    if let Some(filter) = args.get("filter") {
+        if let Some(bad) = unsupported_filter_field(filter) {
+            return Err(MethodError::new(
+                "unsupportedFilter",
+                format!("unknown filter property: {}", bad),
+            ));
+        }
+    }
+
+    let (where_sql, params) = build_filter(args.get("filter"), &id_to_label);
+    let sort_sql = format!("{}, m.aster_id", build_sort(args.get("sort")));
+
+    let count_sql = format!("SELECT COUNT(*) FROM message_cache m WHERE 1=1 {}", where_sql);
+    let total: i64 = ctx
+        .db
+        .with_conn(|conn| {
+            conn.query_row(
+                &count_sql,
+                rusqlite::params_from_iter(params.iter()),
+                |r| r.get(0),
+            )
+        })
+        .unwrap_or(0);
+    let position = match args.get("anchor").and_then(|v| v.as_str()) {
+        Some(anchor) => {
+            let offset = args.get("anchorOffset").and_then(|v| v.as_i64()).unwrap_or(0);
+            let index_sql = format!(
+                "SELECT rn FROM (SELECT m.aster_id, ROW_NUMBER() OVER ({}) - 1 AS rn FROM message_cache m WHERE 1=1 {}) WHERE aster_id = ?{}",
+                sort_sql.trim_start(),
+                where_sql,
+                params.len() + 1
+            );
+            let mut bound = params.clone();
+            bound.push(rusqlite::types::Value::Text(anchor.to_string()));
+            let index: Option<i64> = ctx
+                .db
+                .with_conn(|conn| {
+                    conn.query_row(&index_sql, rusqlite::params_from_iter(bound.iter()), |r| r.get(0))
+                        .optional()
+                })
+                .map_err(|e| MethodError::new("serverError", e))?;
+            let index = index.ok_or_else(|| MethodError::new("anchorNotFound", "anchor is not in the results"))?;
+            index.saturating_add(offset).max(0)
+        }
+        None if requested_position < 0 => total.saturating_add(requested_position).max(0),
+        None => requested_position,
+    };
+
+    let sql = format!(
+        "SELECT m.aster_id FROM message_cache m WHERE 1=1 {} {} LIMIT ?{} OFFSET ?{}",
+        where_sql,
+        sort_sql,
+        params.len() + 1,
+        params.len() + 2
+    );
+
+    let ids: Vec<String> = ctx
+        .db
+        .with_conn(|conn| {
+            let mut stmt = conn.prepare(&sql)?;
+            let mut bound: Vec<rusqlite::types::Value> = params.clone();
+            bound.push(rusqlite::types::Value::Integer(limit));
+            bound.push(rusqlite::types::Value::Integer(position));
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(bound.iter()), |row| {
+                    row.get::<_, String>(0)
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .map_err(|e| MethodError::new("serverError", e))?;
+
+    let state = ctx.db.jmap_state_get("Email").unwrap_or(0);
+    Ok(json!({
+        "accountId": account_id,
+        "queryState": state.to_string(),
+        "canCalculateChanges": false,
+        "position": position,
+        "total": total,
+        "limit": limit,
+        "ids": ids,
+    }))
+}
+
+const KNOWN_FILTER_FIELDS: &[&str] = &[
+    "inMailbox", "inMailboxOtherThan", "subject", "from", "to", "body", "text",
+    "minSize", "maxSize", "before", "after",
+];
+
+fn unsupported_filter_field(f: &Value) -> Option<String> {
+    let Some(obj) = f.as_object() else { return None };
+    if obj.contains_key("operator") {
+        let Some(arr) = obj.get("conditions").and_then(|v| v.as_array()) else {
+            return None;
+        };
+        for c in arr {
+            if let Some(bad) = unsupported_filter_field(c) {
+                return Some(bad);
+            }
+        }
+        return None;
+    }
+    for k in obj.keys() {
+        if !KNOWN_FILTER_FIELDS.contains(&k.as_str()) {
+            return Some(k.clone());
+        }
+    }
+    None
+}
+
+fn build_filter(
+    filter: Option<&Value>,
+    id_to_label: &HashMap<String, String>,
+) -> (String, Vec<rusqlite::types::Value>) {
+    let mut params: Vec<rusqlite::types::Value> = Vec::new();
+    let Some(f) = filter else { return (String::new(), params) };
+    let body = build_filter_expr(f, id_to_label, &mut params, 0);
+    if body.is_empty() {
+        (String::new(), params)
+    } else {
+        (format!(" AND ({})", body), params)
+    }
+}
+
+const MAX_FILTER_DEPTH: usize = 32;
+
+fn build_filter_expr(
+    f: &Value,
+    id_to_label: &HashMap<String, String>,
+    params: &mut Vec<rusqlite::types::Value>,
+    depth: usize,
+) -> String {
+    if depth > MAX_FILTER_DEPTH {
+        return String::new();
+    }
+    let Some(obj) = f.as_object() else { return String::new() };
+
+    if let Some(op) = obj.get("operator").and_then(|v| v.as_str()) {
+        let Some(conds) = obj.get("conditions").and_then(|v| v.as_array()) else {
+            return String::new();
+        };
+        let parts: Vec<String> = conds
+            .iter()
+            .map(|c| build_filter_expr(c, id_to_label, params, depth + 1))
+            .filter(|s| !s.is_empty())
+            .map(|s| format!("({})", s))
+            .collect();
+        return match op {
+            "AND" => if parts.is_empty() { "1=1".into() } else { parts.join(" AND ") },
+            "OR" => if parts.is_empty() { "1=0".into() } else { parts.join(" OR ") },
+            "NOT" => if parts.is_empty() { "1=1".into() } else { format!("NOT ({})", parts.join(" OR ")) },
+            _ => String::new(),
+        };
+    }
+
+    build_condition(obj, id_to_label, params)
+}
+
+fn build_condition(
+    obj: &serde_json::Map<String, Value>,
+    id_to_label: &HashMap<String, String>,
+    params: &mut Vec<rusqlite::types::Value>,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+
+    if let Some(mb_id) = obj.get("inMailbox").and_then(|v| v.as_str()) {
+        if let Some(label) = id_to_label.get(mb_id) {
+            parts.push(format!("m.folder = ?{}", params.len() + 1));
+            params.push(rusqlite::types::Value::Text(label.clone()));
+        } else {
+            parts.push("1=0".to_string());
+        }
+    }
+    if let Some(arr) = obj.get("inMailboxOtherThan").and_then(|v| v.as_array()) {
+        let labels: Vec<String> = arr
+            .iter()
+            .filter_map(|v| v.as_str())
+            .filter_map(|s| id_to_label.get(s).cloned())
+            .collect();
+        for lbl in labels {
+            parts.push(format!("m.folder != ?{}", params.len() + 1));
+            params.push(rusqlite::types::Value::Text(lbl));
+        }
+    }
+    if let Some(s) = obj.get("subject").and_then(|v| v.as_str()) {
+        push_fts_clause(&mut parts, params, "subject", s);
+    }
+    if let Some(s) = obj.get("from").and_then(|v| v.as_str()) {
+        push_fts_clause(&mut parts, params, "sender", s);
+    }
+    if let Some(s) = obj.get("to").and_then(|v| v.as_str()) {
+        push_fts_clause(&mut parts, params, "recipients", s);
+    }
+    if let Some(s) = obj.get("body").and_then(|v| v.as_str()) {
+        push_fts_clause(&mut parts, params, "body_text", s);
+    }
+    if let Some(s) = obj.get("text").and_then(|v| v.as_str()) {
+        push_fts_clause(&mut parts, params, "", s);
+    }
+    if let Some(min) = obj.get("minSize").and_then(|v| v.as_i64()) {
+        parts.push(format!("m.size >= ?{}", params.len() + 1));
+        params.push(rusqlite::types::Value::Integer(min));
+    }
+    if let Some(max) = obj.get("maxSize").and_then(|v| v.as_i64()) {
+        parts.push(format!("m.size <= ?{}", params.len() + 1));
+        params.push(rusqlite::types::Value::Integer(max));
+    }
+    if let Some(before) = obj.get("before").and_then(|v| v.as_str()) {
+        parts.push(format!("julianday(m.date) < julianday(?{})", params.len() + 1));
+        params.push(rusqlite::types::Value::Text(before.to_string()));
+    }
+    if let Some(after) = obj.get("after").and_then(|v| v.as_str()) {
+        parts.push(format!("julianday(m.date) >= julianday(?{})", params.len() + 1));
+        params.push(rusqlite::types::Value::Text(after.to_string()));
+    }
+
+    parts.join(" AND ")
+}
+
+fn push_fts_clause(
+    parts: &mut Vec<String>,
+    params: &mut Vec<rusqlite::types::Value>,
+    column: &str,
+    raw: &str,
+) {
+    let q = sanitize_fts_term(raw);
+    if q.is_empty() {
+        return;
+    }
+    let match_expr = if column.is_empty() {
+        q
+    } else {
+        format!("{}: {}", column, q)
+    };
+    parts.push(format!(
+        "m.aster_id IN (SELECT aster_id FROM message_fts WHERE message_fts MATCH ?{})",
+        params.len() + 1
+    ));
+    params.push(rusqlite::types::Value::Text(match_expr));
+}
+
+fn sanitize_fts_term(input: &str) -> String {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let tokens: Vec<String> = trimmed
+        .split_whitespace()
+        .filter_map(|tok| {
+            let cleaned: String = tok
+                .chars()
+                .filter(|c| {
+                    c.is_alphanumeric()
+                        || *c == '\''
+                        || *c == '-'
+                        || *c == '_'
+                        || *c == '@'
+                        || *c == '.'
+                })
+                .collect();
+            if cleaned.is_empty() {
+                None
+            } else {
+                Some(format!("\"{}\"", cleaned.replace('"', "\"\"")))
+            }
+        })
+        .collect();
+    tokens.join(" ")
+}
+
+fn build_sort(sort: Option<&Value>) -> String {
+    let default = " ORDER BY julianday(m.date) DESC".to_string();
+    let Some(arr) = sort.and_then(|v| v.as_array()) else {
+        return default;
+    };
+    if arr.is_empty() {
+        return default;
+    }
+    let mut parts = Vec::new();
+    for item in arr {
+        let prop = item.get("property").and_then(|v| v.as_str()).unwrap_or("");
+        let ascending = item.get("isAscending").and_then(|v| v.as_bool()).unwrap_or(true);
+        let col = match prop {
+            "receivedAt" | "sentAt" => "julianday(m.date)",
+            "from" => "m.sender",
+            "subject" => "m.subject",
+            "size" => "m.size",
+            _ => continue,
+        };
+        parts.push(format!("{} {}", col, if ascending { "ASC" } else { "DESC" }));
+    }
+    if parts.is_empty() {
+        default
+    } else {
+        format!(" ORDER BY {}", parts.join(", "))
+    }
+}
+
+pub async fn query_changes(_ctx: &Arc<JmapContext>, _args: Value) -> Result<Value, MethodError> {
+    Err(MethodError::new(
+        "cannotCalculateChanges",
+        "queryChanges not supported; re-query",
+    ))
+}
+
+pub async fn changes(ctx: &Arc<JmapContext>, args: Value) -> Result<Value, MethodError> {
+    let account_id = ctx.require_account(&args).await?;
+    let since = args
+        .get("sinceState")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<i64>().ok())
+        .ok_or_else(|| MethodError::invalid_args("sinceState required"))?;
+    let (entries, _partial_state, too_old, has_more) = ctx
+        .db
+        .jmap_changes_since("Email", since)
+        .map_err(|e| MethodError::new("serverError", e))?;
+    if too_old {
+        return Err(MethodError::new(
+            "cannotCalculateChanges",
+            "sinceState too old",
+        ));
+    }
+    let new_state = if has_more { _partial_state } else { ctx.db.jmap_state_get("Email").unwrap_or(since) };
+    let (created, updated, destroyed) =
+        crate::jmap::methods::mailbox::partition_ops(entries);
+    Ok(json!({
+        "accountId": account_id,
+        "oldState": since.to_string(),
+        "newState": new_state.to_string(),
+        "hasMoreChanges": has_more,
+        "created": created,
+        "updated": updated,
+        "destroyed": destroyed,
+    }))
+}
+
+fn keyword_bit(kw: &str) -> u32 {
+    match kw {
+        "$seen" => 1,
+        "$answered" => 2,
+        "$flagged" => 4,
+        "$deleted" => 8,
+        "$draft" => 16,
+        "$forwarded" => 32,
+        _ => 0,
+    }
+}
+
+fn move_flags_for_label(label: &str) -> Option<Value> {
+    match label {
+        "archive" => Some(json!({"is_archived": true, "is_trashed": false, "is_spam": false})),
+        "trash" => Some(json!({"is_trashed": true, "is_archived": false})),
+        "spam" => Some(json!({"is_spam": true, "is_archived": false, "is_trashed": false})),
+        "inbox" => Some(json!({"is_archived": false, "is_trashed": false, "is_spam": false})),
+        _ => None,
+    }
+}
+
+// Patch keys are JSON pointers with an implicit leading "/" (RFC 8620 5.3),
+// so "keywords/$seen" and "/keywords/$seen" name the same path. Returns the
+// key as "keywords", "mailboxIds", "/keywords/<kw>" or "/mailboxIds/<id>".
+fn normalize_patch_key(key: &str) -> Option<String> {
+    let path = key.strip_prefix('/').unwrap_or(key);
+    let mut segments = path.split('/').map(|s| s.replace("~1", "/").replace("~0", "~"));
+    let property = segments.next()?;
+    if property != "keywords" && property != "mailboxIds" {
+        return None;
+    }
+    match (segments.next(), segments.next()) {
+        (None, _) => Some(property),
+        (Some(member), None) => Some(format!("/{}/{}", property, member)),
+        _ => None,
+    }
+}
+
+enum PatchOutcome {
+    Applied,
+    Rejected(Value),
+}
+
+fn is_tag_keyword(keyword: &str, slots: &[Option<String>]) -> bool {
+    keyword_bit(keyword) == 0
+        && (!crate::tags::is_local_keyword(keyword) || crate::tags::slot_is_mapped(slots, keyword))
+}
+
+fn tag_error(e: crate::tag_ops::TagOpError) -> Value {
+    use crate::tag_ops::TagOpError;
+    match e {
+        TagOpError::Invalid(description) => json!({
+            "type": "invalidProperties",
+            "properties": ["keywords"],
+            "description": description
+        }),
+        TagOpError::LimitReached => json!({
+            "type": "overQuota",
+            "description": "your plan's label limit is reached"
+        }),
+        TagOpError::TooManyNew => json!({
+            "type": "overQuota",
+            "description": "too many new labels in one request"
+        }),
+        TagOpError::Locked => json!({
+            "type": "forbidden",
+            "description": "unlock Aster Bridge to change labels"
+        }),
+        TagOpError::Busy => json!({
+            "type": "rateLimit",
+            "description": "too many requests; try again shortly"
+        }),
+        TagOpError::AlreadyExists
+        | TagOpError::NotFound
+        | TagOpError::ParentRejected
+        | TagOpError::Server(_) => json!({
+            "type": "serverFail",
+            "description": "could not update labels"
+        }),
+    }
+}
+
+fn invalid_keywords() -> Value {
+    json!({
+        "type": "invalidProperties",
+        "properties": ["keywords"],
+        "description": "a keyword cannot be used as a label"
+    })
+}
+
+fn enabled_tag_keywords(patch_obj: &serde_json::Map<String, Value>, slots: &[Option<String>]) -> Vec<String> {
+    let enabled = |v: &Value| v.as_bool().unwrap_or(false);
+    if let Some(kw_obj) = patch_obj.get("keywords").and_then(|v| v.as_object()) {
+        return kw_obj
+            .iter()
+            .filter(|(k, v)| enabled(v) && is_tag_keyword(k, slots))
+            .map(|(k, _)| k.clone())
+            .collect();
+    }
+    patch_obj
+        .iter()
+        .filter(|(_, v)| enabled(v))
+        .filter_map(|(k, _)| k.strip_prefix("/keywords/"))
+        .filter(|keyword| is_tag_keyword(keyword, slots))
+        .map(|keyword| keyword.to_string())
+        .collect()
+}
+
+fn has_unmappable_keyword(db: &crate::db::Database, patch_obj: &serde_json::Map<String, Value>) -> bool {
+    let slots = db.builtin_tag_slots().unwrap_or_default();
+    let wanted = enabled_tag_keywords(patch_obj, &slots);
+    if wanted.is_empty() {
+        return false;
+    }
+    let tags = db.list_custom_tags().unwrap_or_default();
+    wanted.iter().any(|keyword| {
+        crate::tags::slot_tag(&tags, &slots, keyword).is_none()
+            && crate::tags::find_by_keyword(&tags, keyword).is_none()
+            && crate::tags::name_for_keyword(keyword).is_none()
+    })
+}
+
+async fn apply_tag_keywords(
+    ctx: &Arc<JmapContext>,
+    access_token: &str,
+    id: &str,
+    patch_obj: &serde_json::Map<String, Value>,
+    label_budget: &mut usize,
+) -> Result<(), Value> {
+    let enabled = |v: &Value| v.as_bool().unwrap_or(false);
+    let slots = ctx.db.builtin_tag_slots().unwrap_or_default();
+    let mut steps: Vec<(i8, Vec<String>)> = Vec::new();
+    if let Some(kw_obj) = patch_obj.get("keywords").and_then(|v| v.as_object()) {
+        let given: Vec<String> = kw_obj
+            .iter()
+            .filter(|(k, v)| enabled(v) && is_tag_keyword(k, &slots))
+            .map(|(k, _)| k.clone())
+            .collect();
+        steps.push((0, given));
+    } else {
+        let mut adds: Vec<String> = Vec::new();
+        let mut removes: Vec<String> = Vec::new();
+        for (k, v) in patch_obj {
+            let Some(keyword) = k.strip_prefix("/keywords/").filter(|kw| is_tag_keyword(kw, &slots)) else {
+                continue;
+            };
+            if enabled(v) {
+                adds.push(keyword.to_string());
+            } else {
+                removes.push(keyword.to_string());
+            }
+        }
+        if !adds.is_empty() {
+            steps.push((1, adds));
+        }
+        if !removes.is_empty() {
+            steps.push((-1, removes));
+        }
+    }
+    if steps.is_empty() {
+        return Ok(());
+    }
+    let identity_key = ctx.session.read().await.identity_key.clone();
+    let ids = [id.to_string()];
+    for (op, keywords) in steps {
+        let outcome = crate::tag_ops::apply_keywords(
+            &ctx.db,
+            &ctx.client,
+            access_token,
+            identity_key.as_deref(),
+            &ids,
+            op,
+            &keywords,
+            label_budget,
+        )
+        .await;
+        if !outcome.unmapped.is_empty() || outcome.error.is_some() {
+            if !outcome.changed.is_empty() {
+                let refs: Vec<&str> = outcome.changed.iter().map(|changed| changed.as_str()).collect();
+                let _ = ctx.db.jmap_record_updated_batch("Email", &refs);
+            }
+            if !outcome.unmapped.is_empty() {
+                return Err(invalid_keywords());
+            }
+            if let Some(e) = outcome.error {
+                return Err(tag_error(e));
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn apply_update_patch(
+    ctx: &Arc<JmapContext>,
+    access_token: &str,
+    id_to_label: &HashMap<String, String>,
+    id: &str,
+    patch: &Value,
+    mailbox_counts_touched: &mut bool,
+    label_budget: &mut usize,
+) -> PatchOutcome {
+    let Some(patch_obj) = patch.as_object() else {
+        return PatchOutcome::Rejected(
+            json!({"type": "invalidPatch", "description": "patch must be an object"}),
+        );
+    };
+
+    let mut normalized = serde_json::Map::new();
+    for (k, v) in patch_obj {
+        let Some(key) = normalize_patch_key(k) else {
+            return PatchOutcome::Rejected(json!({
+                "type": "invalidProperties",
+                "properties": [k],
+                "description": "only keywords and mailboxIds updates are supported"
+            }));
+        };
+        normalized.insert(key, v.clone());
+    }
+    let patch_obj = &normalized;
+
+    let existing = match ctx.db.get_cached_message(id) {
+        Ok(Some(m)) => m,
+        _ => {
+            return PatchOutcome::Rejected(json!({"type": "notFound"}));
+        }
+    };
+
+    if has_unmappable_keyword(&ctx.db, patch_obj) {
+        return PatchOutcome::Rejected(invalid_keywords());
+    }
+
+    let mut move_target: Option<String> = None;
+    if let Some(mb_obj) = patch_obj.get("mailboxIds").and_then(|v| v.as_object()) {
+        let targets: Vec<&String> = mb_obj
+            .iter()
+            .filter(|(_, v)| v.as_bool().unwrap_or(false))
+            .map(|(k, _)| k)
+            .collect();
+        if targets.len() != 1 {
+            return PatchOutcome::Rejected(json!({
+                "type": "invalidProperties",
+                "properties": ["mailboxIds"],
+                "description": "message must belong to exactly one mailbox"
+            }));
+        }
+        match id_to_label.get(targets[0]) {
+            Some(l) => move_target = Some(l.clone()),
+            None => {
+                return PatchOutcome::Rejected(json!({
+                    "type": "invalidProperties",
+                    "properties": ["mailboxIds"],
+                    "description": "unknown mailbox id"
+                }));
+            }
+        }
+    } else {
+        let adds: Vec<String> = patch_obj
+            .iter()
+            .filter_map(|(k, v)| {
+                k.strip_prefix("/mailboxIds/")
+                    .filter(|_| v.as_bool().unwrap_or(false))
+                    .map(|s| s.to_string())
+            })
+            .collect();
+        if adds.len() > 1 {
+            return PatchOutcome::Rejected(json!({
+                "type": "invalidProperties",
+                "properties": ["mailboxIds"],
+                "description": "message must belong to exactly one mailbox"
+            }));
+        }
+        if let Some(mbid) = adds.first() {
+            match id_to_label.get(mbid) {
+                Some(l) => move_target = Some(l.clone()),
+                None => {
+                    return PatchOutcome::Rejected(json!({
+                        "type": "invalidProperties",
+                        "properties": ["mailboxIds"],
+                        "description": "unknown mailbox id"
+                    }));
+                }
+            }
+        } else if patch_obj.keys().any(|k| k.starts_with("/mailboxIds/")) {
+            return PatchOutcome::Rejected(json!({
+                "type": "invalidProperties",
+                "properties": ["mailboxIds"],
+                "description": "message must belong to exactly one mailbox"
+            }));
+        }
+    }
+
+    if let Some(target) = &move_target {
+        if target != &existing.folder {
+            let target_token = crate::folders::token_of_label(target);
+            let source_token = crate::folders::token_of_label(&existing.folder);
+            let backend_flags = match (target_token, existing.folder.as_str()) {
+                (Some(_), "drafts") => None,
+                (Some(_), _) => move_flags_for_label("inbox"),
+                (None, _) => move_flags_for_label(target),
+            };
+            let Some(backend_flags) = backend_flags else {
+                return PatchOutcome::Rejected(json!({
+                    "type": "invalidProperties",
+                    "properties": ["mailboxIds"],
+                    "description": "cannot move messages into that mailbox"
+                }));
+            };
+            let ids = vec![id.to_string()];
+            let relabel = match (target_token, source_token) {
+                (Some(label), _) => ctx.client.move_to_folder(access_token, &ids, label).await,
+                (None, Some(label)) => ctx.client.remove_from_folder(access_token, &ids, label).await,
+                (None, None) => Ok(()),
+            };
+            if let Err(e) = relabel {
+                return PatchOutcome::Rejected(
+                    json!({"type": "serverFail", "description": e.to_string()}),
+                );
+            }
+            if let Err(e) = ctx
+                .client
+                .set_mailbox_flags(access_token, id, backend_flags)
+                .await
+            {
+                return PatchOutcome::Rejected(
+                    json!({"type": "serverFail", "description": e.to_string()}),
+                );
+            }
+            let _ = ctx.db.set_folder_if_changed(id, target);
+            let _ = ctx.db.assign_uid_if_missing(target, id);
+            *mailbox_counts_touched = true;
+        }
+    }
+
+    if let Err(rejection) = apply_tag_keywords(ctx, access_token, id, patch_obj, label_budget).await {
+        return PatchOutcome::Rejected(rejection);
+    }
+
+    let old_flags = ctx.db.get_message_flags_by_id(id).unwrap_or(existing.flags) as u32;
+    let mut new_flags = old_flags;
+    if let Some(kw_obj) = patch_obj.get("keywords").and_then(|v| v.as_object()) {
+        new_flags = 0;
+        for (k, v) in kw_obj {
+            if v.as_bool().unwrap_or(false) {
+                new_flags |= keyword_bit(k);
+            }
+        }
+    } else {
+        for (k, v) in patch_obj {
+            if let Some(kw) = k.strip_prefix("/keywords/") {
+                let bit = keyword_bit(kw);
+                if bit != 0 {
+                    if v.as_bool().unwrap_or(false) {
+                        new_flags |= bit;
+                    } else {
+                        new_flags &= !bit;
+                    }
+                }
+            }
+        }
+    }
+
+    if new_flags != old_flags {
+        let seen_changed = (old_flags & 1) != (new_flags & 1);
+        let star_changed = (old_flags & 4) != (new_flags & 4);
+        if seen_changed {
+            if let Err(e) = ctx
+                .client
+                .set_read_status(access_token, id, (new_flags & 1) != 0)
+                .await
+            {
+                return PatchOutcome::Rejected(
+                    json!({"type": "serverFail", "description": e.to_string()}),
+                );
+            }
+            *mailbox_counts_touched = true;
+        }
+        if star_changed {
+            if let Err(e) = ctx
+                .client
+                .set_mailbox_flags(
+                    access_token,
+                    id,
+                    json!({"is_starred": (new_flags & 4) != 0}),
+                )
+                .await
+            {
+                return PatchOutcome::Rejected(
+                    json!({"type": "serverFail", "description": e.to_string()}),
+                );
+            }
+        }
+        if let Err(e) = ctx.db.set_message_flags_by_id(id, new_flags as i64) {
+            return PatchOutcome::Rejected(json!({"type": "serverFail", "description": e}));
+        }
+    }
+
+    PatchOutcome::Applied
+}
+
+pub async fn set(
+    ctx: &Arc<JmapContext>,
+    args: Value,
+    _created_ids_out: &mut HashMap<String, String>,
+) -> Result<Value, MethodError> {
+    let account_id = ctx.require_account(&args).await?;
+    let old_state = ctx.db.jmap_state_get("Email").unwrap_or(0);
+    if let Some(expected) = args.get("ifInState").and_then(|v| v.as_str()) {
+        if expected != old_state.to_string() {
+            return Err(MethodError::new("stateMismatch", "email state has changed"));
+        }
+    }
+
+    let creates = args.get("create").and_then(|v| v.as_object()).cloned().unwrap_or_default();
+    let updates = args.get("update").and_then(|v| v.as_object()).cloned().unwrap_or_default();
+    let destroys: Vec<String> = args
+        .get("destroy")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
+
+    if updates.len() + destroys.len() + creates.len() > 500 {
+        return Err(MethodError::new(
+            "requestTooLarge",
+            "exceeds maxObjectsInSet (500)",
+        ));
+    }
+
+    let access_token = ctx.session.read().await.access_token.clone();
+    let id_to_label = store::mailbox_id_to_label_map(&ctx.db);
+
+    let mut not_created = serde_json::Map::new();
+    for (creation_id, _) in &creates {
+        not_created.insert(
+            creation_id.clone(),
+            json!({
+                "type": "forbidden",
+                "description": "creating messages through the bridge is not supported; use the Aster app"
+            }),
+        );
+    }
+
+    let mut updated = serde_json::Map::new();
+    let mut not_updated = serde_json::Map::new();
+    let mut destroyed: Vec<String> = Vec::new();
+    let mut not_destroyed = serde_json::Map::new();
+    let mut mailbox_counts_touched = false;
+    let mut label_budget = crate::tag_ops::MAX_CREATED_PER_COMMAND;
+
+    for (id, patch) in &updates {
+        match apply_update_patch(
+            ctx,
+            &access_token,
+            &id_to_label,
+            id,
+            patch,
+            &mut mailbox_counts_touched,
+            &mut label_budget,
+        )
+        .await
+        {
+            PatchOutcome::Applied => {
+                updated.insert(id.clone(), Value::Null);
+            }
+            PatchOutcome::Rejected(err) => {
+                not_updated.insert(id.clone(), err);
+            }
+        }
+    }
+
+    for id in &destroys {
+        let cached = match ctx.db.get_cached_message(id).ok().flatten() {
+            Some(m) => m,
+            None => {
+                not_destroyed.insert(id.clone(), json!({"type": "notFound"}));
+                continue;
+            }
+        };
+        if cached.folder == "drafts" {
+            match ctx.client.delete_draft(&access_token, id).await {
+                Ok(_) => {
+                    let _ = ctx.db.delete_message_by_aster_id(id);
+                    destroyed.push(id.clone());
+                    mailbox_counts_touched = true;
+                    continue;
+                }
+                Err(crate::error::BridgeError::Api(ref msg)) if msg.starts_with("404") => {}
+                Err(e) => {
+                    not_destroyed.insert(
+                        id.clone(),
+                        json!({"type": "serverFail", "description": e.to_string()}),
+                    );
+                    continue;
+                }
+            }
+        }
+        match ctx.client.delete_mail_item_permanent(&access_token, id).await {
+            Ok(_) => {
+                let _ = ctx.db.delete_message_by_aster_id(id);
+                destroyed.push(id.clone());
+                mailbox_counts_touched = true;
+            }
+            Err(e) => {
+                not_destroyed.insert(
+                    id.clone(),
+                    json!({"type": "serverFail", "description": e.to_string()}),
+                );
+            }
+        }
+    }
+
+    if !updated.is_empty() {
+        let refs: Vec<&str> = updated.keys().map(|s| s.as_str()).collect();
+        let _ = ctx.db.jmap_record_updated_batch("Email", &refs);
+    }
+    if !destroyed.is_empty() {
+        let refs: Vec<&str> = destroyed.iter().map(|s| s.as_str()).collect();
+        let _ = ctx.db.jmap_record_destroyed_batch("Email", &refs);
+    }
+
+    let new_state = ctx.db.jmap_state_get("Email").unwrap_or(old_state);
+    if !updated.is_empty() || !destroyed.is_empty() {
+        let mut changed = HashMap::new();
+        changed.insert("Email".to_string(), new_state.to_string());
+        if mailbox_counts_touched {
+            let mailbox_state = ctx.db.jmap_state_bump("Mailbox").unwrap_or(0);
+            changed.insert("Mailbox".to_string(), mailbox_state.to_string());
+        }
+        let _ = ctx
+            .broadcaster
+            .send(crate::jmap::state::StateChange { changed });
+    }
+
+    Ok(json!({
+        "accountId": account_id,
+        "oldState": old_state.to_string(),
+        "newState": new_state.to_string(),
+        "created": null,
+        "updated": updated,
+        "destroyed": destroyed,
+        "notCreated": if not_created.is_empty() { Value::Null } else { Value::Object(not_created) },
+        "notUpdated": not_updated,
+        "notDestroyed": not_destroyed,
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::session::Session;
+    use crate::db::{Database, ATTACHMENTS_STORED};
+    use tokio::sync::{broadcast, RwLock};
+    use uuid::Uuid;
+
+    fn cached(aster_id: &str, folder: &str) -> CachedMessage {
+        CachedMessage {
+            aster_id: aster_id.to_string(),
+            folder: folder.to_string(),
+            subject: Some("Hello World".to_string()),
+            sender: Some("Alice <alice@example.com>".to_string()),
+            recipients: Some("Bob <bob@example.com>, carol@example.com".to_string()),
+            date: Some("2026-05-21T10:00:00Z".to_string()),
+            size: 128,
+            flags: 1,
+            body_text: Some("this is the body text here".to_string()),
+            raw_headers: Some(json!({"is_html": false, "message_id": "mid-1@test"}).to_string()),
+            imap_uid: 1,
+            thread_id: Some("thread-1".to_string()),
+            attachments_state: 0,
+        }
+    }
+
+    fn test_ctx() -> (Arc<JmapContext>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::open_with_key(dir.path(), &[9u8; 32]).unwrap());
+        db.seed_jmap_mailboxes().unwrap();
+        let account = Uuid::new_v4();
+        let session = Arc::new(RwLock::new(Session {
+            data_kek: None,
+            user_id: account,
+            username: "tester".to_string(),
+            email: "tester@aster.test".to_string(),
+            access_token: zeroize::Zeroizing::new("stub".to_string()),
+            refresh_token: None,
+            vault_passphrase: Vec::new(),
+            identity_key: None,
+            ratchet_identity_public: None,
+            ratchet_keys: Vec::new(),
+            inbound_keys: Vec::new(),
+            send_identities: Vec::new(),
+            default_sender_id: None,
+            account_keys: Vec::new(),
+            previous_keys: Default::default(),
+            ratchet_recovery: Default::default(),
+        }));
+        let client = Arc::new(crate::api_client::ApiClient::new());
+        let (tx, _rx) = broadcast::channel(8);
+        let ctx = JmapContext::new(session, db, client, tx);
+        (ctx, dir)
+    }
+
+    fn ok(r: Result<Value, MethodError>) -> Value {
+        match r {
+            Ok(v) => v,
+            Err(e) => panic!("expected ok, got error: {} {}", e.kind, e.message),
+        }
+    }
+
+    fn err_kind(r: Result<Value, MethodError>) -> String {
+        match r {
+            Ok(_) => panic!("expected error, got ok"),
+            Err(e) => e.kind,
+        }
+    }
+
+    fn insert_msg(ctx: &Arc<JmapContext>, m: &CachedMessage) {
+        ctx.db
+            .upsert_cached_message(
+                &m.aster_id,
+                &m.folder,
+                m.subject.as_deref(),
+                m.sender.as_deref(),
+                m.recipients.as_deref(),
+                m.date.as_deref(),
+                m.size,
+                m.body_text.as_deref(),
+                m.raw_headers.as_deref(),
+            )
+            .unwrap();
+        ctx.db
+            .set_message_flags_by_id(&m.aster_id, m.flags)
+            .unwrap();
+    }
+
+    #[test]
+    fn parse_from_none_and_empty() {
+        assert_eq!(parse_from(&None), Value::Null);
+        assert_eq!(parse_from(&Some("   ".to_string())), Value::Null);
+    }
+
+    #[test]
+    fn parse_from_named_and_bare() {
+        let named = parse_from(&Some("Alice <a@b.com>".to_string()));
+        assert_eq!(named, json!([{"name": "Alice", "email": "a@b.com"}]));
+        let bare = parse_from(&Some("a@b.com".to_string()));
+        assert_eq!(bare, json!([{"name": Value::Null, "email": "a@b.com"}]));
+    }
+
+    #[test]
+    fn parse_from_quoted_name_stripped() {
+        let v = parse_from(&Some("\"Alice B\" <a@b.com>".to_string()));
+        assert_eq!(v, json!([{"name": "Alice B", "email": "a@b.com"}]));
+    }
+
+    #[test]
+    fn parse_address_list_multiple_and_mixed() {
+        let v = parse_address_list(&Some("A <a@x.com>, b@y.com".to_string()));
+        assert_eq!(
+            v,
+            json!([
+                {"name": "A", "email": "a@x.com"},
+                {"name": Value::Null, "email": "b@y.com"}
+            ])
+        );
+    }
+
+    #[test]
+    fn meta_addresses_reads_cc_and_reply_to() {
+        let meta = json!({"cc": "Carol <carol@example.com>, dan@example.com", "reply_to": "team@example.com"});
+        assert_eq!(
+            meta_addresses(&meta, "cc"),
+            json!([
+                {"name": "Carol", "email": "carol@example.com"},
+                {"name": Value::Null, "email": "dan@example.com"}
+            ])
+        );
+        assert_eq!(
+            meta_addresses(&meta, "reply_to"),
+            json!([{"name": Value::Null, "email": "team@example.com"}])
+        );
+        assert_eq!(meta_addresses(&meta, "bcc"), Value::Null);
+    }
+
+    #[test]
+    fn parse_address_list_empty_yields_null() {
+        assert_eq!(parse_address_list(&None), Value::Null);
+        assert_eq!(parse_address_list(&Some(" , , ".to_string())), Value::Null);
+    }
+
+    #[test]
+    fn preview_collapses_whitespace_and_controls() {
+        let p = preview_of(Some("  hello   world  foo  "));
+        assert_eq!(p, "hello world foo");
+        let stripped = preview_of(Some("a\tb\nc"));
+        assert_eq!(stripped, "abc");
+        assert_eq!(preview_of(None), "");
+    }
+
+    #[test]
+    fn preview_truncates_to_256() {
+        let long = "a ".repeat(400);
+        let p = preview_of(Some(&long));
+        assert!(p.chars().count() <= 256);
+    }
+
+    #[test]
+    fn serialize_email_full_shape() {
+        let m = cached("e1", "inbox");
+        let mut label_to_id = HashMap::new();
+        label_to_id.insert("inbox".to_string(), "mbx_inbox".to_string());
+        let v = serialize_email(&m, &label_to_id, &None, false, &[], &[]);
+        assert_eq!(v.get("id"), Some(&json!("e1")));
+        assert_eq!(v.get("blobId"), Some(&json!("e1")));
+        assert_eq!(v.get("threadId"), Some(&json!("thread-1")));
+        assert_eq!(v.get("subject"), Some(&json!("Hello World")));
+        assert_eq!(
+            v.pointer("/mailboxIds/mbx_inbox"),
+            Some(&json!(true))
+        );
+        assert_eq!(v.pointer("/keywords/$seen"), Some(&json!(true)));
+    }
+
+    #[test]
+    fn serialize_email_threadid_falls_back_to_id() {
+        let mut m = cached("e2", "inbox");
+        m.thread_id = None;
+        let v = serialize_email(&m, &HashMap::new(), &None, false, &[], &[]);
+        assert_eq!(v.get("threadId"), Some(&json!("e2")));
+    }
+
+    #[test]
+    fn serialize_email_property_selection() {
+        let m = cached("e3", "inbox");
+        let props = Some(vec!["subject".to_string()]);
+        let v = serialize_email(&m, &HashMap::new(), &props, false, &[], &[]);
+        let obj = v.as_object().unwrap();
+        assert!(obj.contains_key("id"));
+        assert!(obj.contains_key("subject"));
+        assert!(!obj.contains_key("preview"));
+        assert!(!obj.contains_key("from"));
+    }
+
+    #[test]
+    fn serialize_email_keywords_from_flags() {
+        let mut m = cached("e4", "inbox");
+        m.flags = 1 | 4 | 16;
+        let v = serialize_email(&m, &HashMap::new(), &None, false, &[], &[]);
+        assert_eq!(v.pointer("/keywords/$seen"), Some(&json!(true)));
+        assert_eq!(v.pointer("/keywords/$flagged"), Some(&json!(true)));
+        assert_eq!(v.pointer("/keywords/$draft"), Some(&json!(true)));
+        assert_eq!(v.pointer("/keywords/$answered"), None);
+    }
+
+    #[test]
+    fn serialize_email_html_body_when_html() {
+        let mut m = cached("e5", "inbox");
+        m.raw_headers = Some(json!({"is_html": true}).to_string());
+        let v = serialize_email(&m, &HashMap::new(), &None, false, &[], &[]);
+        assert!(v.get("htmlBody").unwrap().as_array().unwrap().len() == 1);
+        assert!(v.get("textBody").unwrap().as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn serialize_email_reports_attachments_when_the_envelope_had_them() {
+        let mut m = cached("e5a", "inbox");
+        m.raw_headers = Some(json!({"is_html": false, "attachment_count": 2}).to_string());
+        let v = serialize_email(&m, &HashMap::new(), &None, false, &[], &[]);
+        assert_eq!(v.get("hasAttachment"), Some(&json!(true)));
+    }
+
+    #[test]
+    fn serialize_email_reports_no_attachments_when_there_are_none() {
+        let mut m = cached("e5b", "inbox");
+        m.raw_headers = Some(json!({"is_html": false, "attachment_count": 0}).to_string());
+        assert_eq!(
+            serialize_email(&m, &HashMap::new(), &None, false, &[], &[]).get("hasAttachment"),
+            Some(&json!(false))
+        );
+        let legacy = cached("e5c", "inbox");
+        assert_eq!(
+            serialize_email(&legacy, &HashMap::new(), &None, false, &[], &[]).get("hasAttachment"),
+            Some(&json!(false))
+        );
+    }
+
+    #[test]
+    fn serialize_email_fetch_text_populates_body_values() {
+        let m = cached("e6", "inbox");
+        let v = serialize_email(&m, &HashMap::new(), &None, true, &[], &[]);
+        assert_eq!(
+            v.pointer("/bodyValues/1/value"),
+            Some(&json!("this is the body text here"))
+        );
+    }
+
+    #[test]
+    fn serialize_email_marks_unverified_sender_in_body_values() {
+        let mut m = cached("e7", "inbox");
+        m.raw_headers = Some(json!({"is_html": false, "sender_unverified": true}).to_string());
+        let v = serialize_email(&m, &HashMap::new(), &None, true, &[], &[]);
+        let value = v.pointer("/bodyValues/1/value").and_then(|v| v.as_str()).unwrap();
+        assert!(value.starts_with("this is the body text here\r\n\r\n"));
+        assert!(value.ends_with(crate::message_render::SENDER_UNVERIFIED_NOTE));
+    }
+
+    #[test]
+    fn serialize_email_marks_a_message_stored_without_encryption() {
+        let mut m = cached("e8", "inbox");
+        m.raw_headers = Some(json!({"is_html": false, "not_end_to_end_encrypted": true}).to_string());
+        let v = serialize_email(&m, &HashMap::new(), &None, true, &[], &[]);
+        let value = v.pointer("/bodyValues/1/value").and_then(|v| v.as_str()).unwrap();
+        assert!(value.starts_with("this is the body text here\r\n\r\n"));
+        assert!(value.ends_with(crate::message_render::NOT_END_TO_END_ENCRYPTED_NOTE));
+    }
+
+    #[tokio::test]
+    async fn get_returns_found_and_not_found() {
+        let (ctx, _d) = test_ctx();
+        insert_msg(&ctx, &cached("g1", "inbox"));
+        let args = json!({"ids": ["g1", "missing"]});
+        let res = ok(get(&ctx, args).await);
+        assert_eq!(res["list"].as_array().unwrap().len(), 1);
+        assert_eq!(res["notFound"], json!(["missing"]));
+        assert_eq!(res["list"][0]["id"], json!("g1"));
+    }
+
+    async fn get_one_by_one(ctx: &Arc<JmapContext>, args: Value) -> Value {
+        let mut res = ok(get(ctx, args.clone()).await);
+        let properties = args.get("properties").and_then(|v| v.as_array()).map(|a| {
+            a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect::<Vec<_>>()
+        });
+        let fetch_text = args.get("fetchTextBodyValues").and_then(|v| v.as_bool()).unwrap_or(false)
+            || properties
+                .as_ref()
+                .map(|p| p.iter().any(|s| s == "bodyValues" || s == "textBody" || s == "htmlBody"))
+                .unwrap_or(false);
+        let label_to_id = store::label_to_mailbox_id_map(&ctx.db);
+        let mut list = Vec::new();
+        let mut not_found = Vec::new();
+        for id in args["ids"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()) {
+            match ctx.db.get_cached_message(id) {
+                Ok(Some(m)) => {
+                    let attachments = if m.attachments_state == ATTACHMENTS_STORED {
+                        ctx.db.get_message_attachment_meta(&m.aster_id).unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
+                    let stored_keywords = ctx.db.message_keywords(&m.aster_id).unwrap_or_default();
+                    list.push(serialize_email(&m, &label_to_id, &properties, fetch_text, &attachments, &stored_keywords))
+                }
+                _ => not_found.push(json!(id)),
+            }
+        }
+        res["list"] = Value::Array(list);
+        res["notFound"] = Value::Array(not_found);
+        res
+    }
+
+    #[tokio::test]
+    async fn get_batched_matches_one_by_one() {
+        let (ctx, _d) = test_ctx();
+        insert_msg(&ctx, &cached("b1", "inbox"));
+
+        let mut html = cached("b2", "sent");
+        html.raw_headers = Some(json!({"is_html": true, "message_id": "mid-2@test", "attachment_count": 2}).to_string());
+        html.body_text = Some("<p>see the attached files</p>".to_string());
+        insert_msg(&ctx, &html);
+        let att = |seq: i64, name: &str, cid: Option<&str>, inline: bool| CachedAttachment {
+            seq,
+            name: name.to_string(),
+            content_type: "application/pdf".to_string(),
+            content_id: cid.map(str::to_string),
+            is_inline: inline,
+            size: 2048 * (seq + 1),
+            data: vec![b'x'; 16],
+        };
+        ctx.db
+            .replace_message_attachments("b2", &[att(0, "report.pdf", None, false), att(1, "logo.png", Some("<logo@x>"), true)])
+            .unwrap();
+        ctx.db.set_attachments_state("b2", ATTACHMENTS_STORED).unwrap();
+
+        let mut no_body = cached("b3", "inbox");
+        no_body.body_text = None;
+        no_body.thread_id = None;
+        insert_msg(&ctx, &no_body);
+        ctx.db.set_attachments_state("b3", ATTACHMENTS_STORED).unwrap();
+
+        let ids = json!(["b2", "missing", "b1", "b3", "b2"]);
+        let cases = [
+            json!({"ids": ids}),
+            json!({"ids": ids, "properties": ["subject", "size", "receivedAt"]}),
+            json!({"ids": ids, "properties": ["size", "attachments", "hasAttachment"]}),
+            json!({"ids": ids, "properties": ["preview"]}),
+            json!({"ids": ids, "properties": ["bodyValues"]}),
+            json!({"ids": ids, "properties": ["textBody", "htmlBody", "bodyStructure"]}),
+            json!({"ids": ids, "properties": ["subject"], "fetchTextBodyValues": true}),
+            json!({"ids": ids, "properties": []}),
+        ];
+        for args in cases {
+            let batched = ok(get(&ctx, args.clone()).await);
+            let one_by_one = get_one_by_one(&ctx, args.clone()).await;
+            assert_eq!(
+                serde_json::to_string(&batched).unwrap(),
+                serde_json::to_string(&one_by_one).unwrap(),
+                "args: {}",
+                args
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn get_null_ids_lists_all() {
+        let (ctx, _d) = test_ctx();
+        insert_msg(&ctx, &cached("g2", "inbox"));
+        insert_msg(&ctx, &cached("g3", "sent"));
+        let res = ok(get(&ctx, json!({"ids": Value::Null})).await);
+        assert_eq!(res["list"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn get_rejects_too_many_ids() {
+        let (ctx, _d) = test_ctx();
+        let ids: Vec<String> = (0..501).map(|i| format!("id-{}", i)).collect();
+        let err = err_kind(get(&ctx, json!({"ids": ids})).await);
+        assert_eq!(err, "requestTooLarge");
+    }
+
+    #[tokio::test]
+    async fn get_wrong_account_rejected() {
+        let (ctx, _d) = test_ctx();
+        let err = err_kind(get(&ctx, json!({"accountId": "nope", "ids": []})).await);
+        assert_eq!(err, "accountNotFound");
+    }
+
+    #[tokio::test]
+    async fn query_filters_by_mailbox() {
+        let (ctx, _d) = test_ctx();
+        insert_msg(&ctx, &cached("q1", "inbox"));
+        insert_msg(&ctx, &cached("q2", "sent"));
+        let res = ok(query(&ctx, json!({"filter": {"inMailbox": "mbx_inbox"}})).await);
+        assert_eq!(res["ids"], json!(["q1"]));
+        assert_eq!(res["total"], json!(1));
+    }
+
+    #[tokio::test]
+    async fn query_unknown_filter_field_rejected() {
+        let (ctx, _d) = test_ctx();
+        let err = err_kind(query(&ctx, json!({"filter": {"bogus": "x"}})).await);
+        assert_eq!(err, "unsupportedFilter");
+    }
+
+    #[tokio::test]
+    async fn query_empty_when_no_messages() {
+        let (ctx, _d) = test_ctx();
+        let res = ok(query(&ctx, json!({})).await);
+        assert_eq!(res["ids"], json!([]));
+        assert_eq!(res["total"], json!(0));
+    }
+
+    #[tokio::test]
+    async fn query_size_filter() {
+        let (ctx, _d) = test_ctx();
+        let mut small = cached("small", "inbox");
+        small.size = 10;
+        let mut big = cached("big", "inbox");
+        big.body_text = Some("x".repeat(1000));
+        big.size = 1000;
+        insert_msg(&ctx, &small);
+        insert_msg(&ctx, &big);
+        let res = ok(query(&ctx, json!({"filter": {"minSize": 500}})).await);
+        assert_eq!(res["ids"], json!(["big"]));
+    }
+
+    #[tokio::test]
+    async fn query_negative_position_counts_from_the_end() {
+        let (ctx, _d) = test_ctx();
+        for (id, day) in [("p1", "01"), ("p2", "02"), ("p3", "03")] {
+            let mut m = cached(id, "inbox");
+            m.date = Some(format!("2026-05-{}T10:00:00Z", day));
+            insert_msg(&ctx, &m);
+        }
+        let res = ok(query(&ctx, json!({"position": -2})).await);
+        assert_eq!(res["position"], json!(1));
+        assert_eq!(res["ids"], json!(["p2", "p1"]));
+        let res = ok(query(&ctx, json!({"position": -10})).await);
+        assert_eq!(res["position"], json!(0));
+        assert_eq!(res["ids"].as_array().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn query_anchor_overrides_position() {
+        let (ctx, _d) = test_ctx();
+        for (id, day) in [("a1", "01"), ("a2", "02"), ("a3", "03")] {
+            let mut m = cached(id, "inbox");
+            m.date = Some(format!("2026-05-{}T10:00:00Z", day));
+            insert_msg(&ctx, &m);
+        }
+        let res = ok(query(&ctx, json!({"anchor": "a2", "anchorOffset": -1, "position": 2})).await);
+        assert_eq!(res["position"], json!(0));
+        assert_eq!(res["ids"], json!(["a3", "a2", "a1"]));
+        let res = ok(query(&ctx, json!({"anchor": "a2", "anchorOffset": 1})).await);
+        assert_eq!(res["ids"], json!(["a1"]));
+        let err = err_kind(query(&ctx, json!({"anchor": "missing"})).await);
+        assert_eq!(err, "anchorNotFound");
+    }
+
+    #[tokio::test]
+    async fn query_negative_limit_is_invalid() {
+        let (ctx, _d) = test_ctx();
+        let err = err_kind(query(&ctx, json!({"limit": -1})).await);
+        assert_eq!(err, "invalidArguments");
+    }
+
+    #[test]
+    fn unsupported_filter_field_walks_conditions() {
+        let f = json!({"operator": "AND", "conditions": [{"subject": "x"}, {"weird": 1}]});
+        assert_eq!(unsupported_filter_field(&f), Some("weird".to_string()));
+        let ok = json!({"operator": "AND", "conditions": [{"subject": "x"}]});
+        assert_eq!(unsupported_filter_field(&ok), None);
+    }
+
+    #[test]
+    fn sanitize_fts_term_quotes_tokens() {
+        assert_eq!(sanitize_fts_term("hello world"), "\"hello\" \"world\"");
+        assert_eq!(sanitize_fts_term("  "), "");
+        assert_eq!(sanitize_fts_term("a@b.com"), "\"a@b.com\"");
+    }
+
+    #[test]
+    fn sanitize_fts_term_drops_punctuation_only() {
+        assert_eq!(sanitize_fts_term("!!! ???"), "");
+    }
+
+    #[test]
+    fn build_sort_default_and_custom() {
+        assert_eq!(build_sort(None), " ORDER BY julianday(m.date) DESC");
+        let asc = build_sort(Some(&json!([{"property": "subject", "isAscending": true}])));
+        assert_eq!(asc, " ORDER BY m.subject ASC");
+        let unknown = build_sort(Some(&json!([{"property": "bogus"}])));
+        assert_eq!(unknown, " ORDER BY julianday(m.date) DESC");
+    }
+
+    #[tokio::test]
+    async fn query_dates_compare_instants_across_offsets() {
+        let (ctx, _d) = test_ctx();
+        let mut early = cached("early", "inbox");
+        early.date = Some("2026-05-21T11:00:00+02:00".to_string());
+        let mut late = cached("late", "inbox");
+        late.date = Some("2026-05-21T09:30:00Z".to_string());
+        insert_msg(&ctx, &early);
+        insert_msg(&ctx, &late);
+
+        let res = ok(query(&ctx, json!({"filter": {"after": "2026-05-21T09:15:00Z"}})).await);
+        assert_eq!(res["ids"], json!(["late"]));
+        let res = ok(query(&ctx, json!({"filter": {"before": "2026-05-21T09:15:00Z"}})).await);
+        assert_eq!(res["ids"], json!(["early"]));
+        let res = ok(query(
+            &ctx,
+            json!({"sort": [{"property": "receivedAt", "isAscending": false}]}),
+        )
+        .await);
+        assert_eq!(res["ids"], json!(["late", "early"]));
+    }
+
+    #[test]
+    fn build_filter_or_and_not() {
+        let id_to_label = HashMap::new();
+        let f = json!({"operator": "OR", "conditions": []});
+        let (sql, _p) = build_filter(Some(&f), &id_to_label);
+        assert!(sql.contains("1=0"));
+        let f2 = json!({"operator": "NOT", "conditions": []});
+        let (sql2, _p2) = build_filter(Some(&f2), &id_to_label);
+        assert!(sql2.contains("1=1"));
+    }
+
+    #[test]
+    fn build_filter_unknown_mailbox_is_false() {
+        let id_to_label = HashMap::new();
+        let f = json!({"inMailbox": "does-not-exist"});
+        let (sql, params) = build_filter(Some(&f), &id_to_label);
+        assert!(sql.contains("1=0"));
+        assert!(params.is_empty());
+    }
+
+    #[tokio::test]
+    async fn query_changes_unsupported() {
+        let (ctx, _d) = test_ctx();
+        let err = err_kind(query_changes(&ctx, json!({})).await);
+        assert_eq!(err, "cannotCalculateChanges");
+    }
+
+    #[tokio::test]
+    async fn changes_requires_since_state() {
+        let (ctx, _d) = test_ctx();
+        let err = err_kind(changes(&ctx, json!({})).await);
+        assert_eq!(err, "invalidArguments");
+    }
+
+    #[tokio::test]
+    async fn changes_returns_partitioned_ops() {
+        let (ctx, _d) = test_ctx();
+        ctx.db.jmap_change_log_append("Email", 1, "a", "created").unwrap();
+        ctx.db.jmap_change_log_append("Email", 2, "a", "updated").unwrap();
+        ctx.db.jmap_change_log_append("Email", 3, "b", "created").unwrap();
+        let res = ok(changes(&ctx, json!({"sinceState": "0"})).await);
+        let created = res["created"].as_array().unwrap();
+        assert!(created.contains(&json!("a")));
+        assert!(created.contains(&json!("b")));
+        assert!(res["updated"].as_array().unwrap().is_empty());
+    }
+
+    type CapturedCalls = Arc<tokio::sync::Mutex<Vec<(String, String, Value)>>>;
+
+    async fn spawn_mock_backend(fail: bool) -> (String, CapturedCalls) {
+        use axum::extract::Path as AxumPath;
+        use axum::{routing::delete, routing::patch, Json, Router};
+        let calls: CapturedCalls = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let c1 = calls.clone();
+        let c2 = calls.clone();
+        let c3 = calls.clone();
+        let c4 = calls.clone();
+        let c5 = calls.clone();
+        let app = Router::new()
+            .route(
+                "/mail/v1/tags",
+                axum::routing::post(move |Json(body): Json<Value>| {
+                    let calls = c4.clone();
+                    async move {
+                        calls
+                            .lock()
+                            .await
+                            .push(("POST".to_string(), "tags".to_string(), body));
+                        Json(json!({"id": "srv-tag", "success": true})).into_response()
+                    }
+                }),
+            )
+            .route(
+                "/bridge/v1/messages/bulk/tags",
+                axum::routing::post(move |Json(body): Json<Value>| {
+                    let calls = c5.clone();
+                    async move {
+                        calls
+                            .lock()
+                            .await
+                            .push(("POST".to_string(), "bulk/tags".to_string(), body));
+                        Json(json!({"success": true})).into_response()
+                    }
+                }),
+            )
+            .route(
+                "/bridge/v1/messages/bulk/tags/remove",
+                axum::routing::post(move |Json(body): Json<Value>| {
+                    let calls = c3.clone();
+                    async move {
+                        calls
+                            .lock()
+                            .await
+                            .push(("POST".to_string(), "bulk/tags/remove".to_string(), body));
+                        Json(json!({"success": true})).into_response()
+                    }
+                }),
+            )
+            .route(
+                "/bridge/v1/messages/:id/metadata",
+                patch(move |AxumPath(id): AxumPath<String>, Json(body): Json<Value>| {
+                    let calls = c1.clone();
+                    async move {
+                        calls.lock().await.push(("PATCH".to_string(), id, body));
+                        if fail {
+                            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response()
+                        } else {
+                            Json(json!({"success": true})).into_response()
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/mail/v1/messages/:id",
+                delete(move |AxumPath(id): AxumPath<String>| {
+                    let calls = c2.clone();
+                    async move {
+                        calls
+                            .lock()
+                            .await
+                            .push(("DELETE".to_string(), id, Value::Null));
+                        if fail {
+                            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response()
+                        } else {
+                            Json(json!({"success": true})).into_response()
+                        }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://127.0.0.1:{}", port), calls)
+    }
+
+    use axum::response::IntoResponse;
+
+    async fn test_ctx_with_backend(
+        fail: bool,
+    ) -> (Arc<JmapContext>, CapturedCalls, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::open_with_key(dir.path(), &[9u8; 32]).unwrap());
+        db.seed_jmap_mailboxes().unwrap();
+        let session = Arc::new(RwLock::new(Session {
+            data_kek: None,
+            user_id: Uuid::new_v4(),
+            username: "tester".to_string(),
+            email: "tester@aster.test".to_string(),
+            access_token: zeroize::Zeroizing::new("stub".to_string()),
+            refresh_token: None,
+            vault_passphrase: Vec::new(),
+            identity_key: None,
+            ratchet_identity_public: None,
+            ratchet_keys: Vec::new(),
+            inbound_keys: Vec::new(),
+            send_identities: Vec::new(),
+            default_sender_id: None,
+            account_keys: Vec::new(),
+            previous_keys: Default::default(),
+            ratchet_recovery: Default::default(),
+        }));
+        let (base, calls) = spawn_mock_backend(fail).await;
+        let client = Arc::new(crate::api_client::ApiClient::new_with_base_url(&base));
+        let (tx, _rx) = broadcast::channel(8);
+        (JmapContext::new(session, db, client, tx), calls, dir)
+    }
+
+    #[tokio::test]
+    async fn set_updates_keywords_via_full_object() {
+        let (ctx, calls, _d) = test_ctx_with_backend(false).await;
+        let mut m = cached("s1", "inbox");
+        m.flags = 0;
+        insert_msg(&ctx, &m);
+        let args = json!({"update": {"s1": {"keywords": {"$seen": true, "$flagged": true}}}});
+        let res = ok(set(&ctx, args, &mut HashMap::new()).await);
+        assert!(res["updated"].as_object().unwrap().contains_key("s1"));
+        let flags = ctx.db.get_message_flags_by_id("s1").unwrap();
+        assert_eq!(flags, 1 | 4);
+
+        let captured = calls.lock().await.clone();
+        assert!(
+            captured
+                .iter()
+                .any(|(m, id, body)| m == "PATCH" && id == "s1" && body["is_read"] == json!(true)),
+            "read state must be pushed to backend: {:?}",
+            captured
+        );
+        assert!(
+            captured
+                .iter()
+                .any(|(m, id, body)| m == "PATCH" && id == "s1" && body["is_starred"] == json!(true)),
+            "star state must be pushed to backend: {:?}",
+            captured
+        );
+    }
+
+    #[tokio::test]
+    async fn get_reports_label_keywords_and_set_removes_them() {
+        let (ctx, calls, _d) = test_ctx_with_backend(false).await;
+        let mut m = cached("tg1", "inbox");
+        m.flags = 1;
+        insert_msg(&ctx, &m);
+        ctx.db
+            .replace_custom_tags(&[crate::db::CustomTag {
+                tag_token: "tok-work".to_string(),
+                server_id: "tag-1".to_string(),
+                name: "Work Stuff".to_string(),
+                keyword: crate::tags::keyword_for_name("Work Stuff"),
+                position: 0,
+            }])
+            .unwrap();
+        ctx.db.add_message_tag(&["tg1".to_string()], "tok-work").unwrap();
+
+        let res = ok(get(&ctx, json!({"ids": ["tg1"], "properties": ["keywords"]})).await);
+        assert_eq!(res["list"][0]["keywords"]["Work&ACA-Stuff"], json!(true));
+        assert_eq!(res["list"][0]["keywords"]["$seen"], json!(true));
+
+        let args = json!({"update": {"tg1": {"keywords/Work&ACA-Stuff": null}}});
+        let res = ok(set(&ctx, args, &mut HashMap::new()).await);
+        assert!(res["updated"].as_object().unwrap().contains_key("tg1"), "{:?}", res);
+        assert!(ctx.db.message_tags(&["tg1".to_string()]).unwrap().is_empty());
+        assert_eq!(ctx.db.get_message_flags_by_id("tg1").unwrap(), 1);
+        let captured = calls.lock().await.clone();
+        assert!(
+            captured.iter().any(|(m, route, body)| m == "POST"
+                && route == "bulk/tags/remove"
+                && body["tag_token"] == json!("tok-work")
+                && body["ids"] == json!(["tg1"])),
+            "the label removal must be sent to the backend: {:?}",
+            captured
+        );
+    }
+
+    #[tokio::test]
+    async fn set_rejects_a_keyword_that_cannot_name_a_label() {
+        let (ctx, calls, _d) = test_ctx_with_backend(false).await;
+        let mut m = cached("kw1", "inbox");
+        m.flags = 0;
+        insert_msg(&ctx, &m);
+        for patch in [
+            json!({"keywords/broken&shift": true, "keywords/$seen": true}),
+            json!({"keywords": {"$seen": true, "broken&shift": true}}),
+        ] {
+            let res = ok(set(&ctx, json!({"update": {"kw1": patch}}), &mut HashMap::new()).await);
+            assert_eq!(res["notUpdated"]["kw1"]["type"], json!("invalidProperties"), "{:?}", res);
+            assert_eq!(res["notUpdated"]["kw1"]["properties"], json!(["keywords"]), "{:?}", res);
+            assert!(res["updated"].as_object().unwrap().is_empty(), "{:?}", res);
+        }
+        assert!(calls.lock().await.is_empty());
+        assert_eq!(ctx.db.get_message_flags_by_id("kw1").unwrap(), 0);
+        assert!(ctx.db.list_custom_tags().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn full_keyword_replace_leaves_client_internal_keywords_alone() {
+        let (ctx, calls, _d) = test_ctx_with_backend(false).await;
+        let mut m = cached("kw2", "inbox");
+        m.flags = 0;
+        insert_msg(&ctx, &m);
+        ctx.db
+            .set_message_keywords("kw2", &["$label1".to_string(), "NonJunk".to_string()])
+            .unwrap();
+        let args = json!({"update": {"kw2": {"keywords": {"$seen": true, "$label2": true, "Forwarded": true}}}});
+        let res = ok(set(&ctx, args, &mut HashMap::new()).await);
+        assert!(res["updated"].as_object().unwrap().contains_key("kw2"), "{:?}", res);
+        let stored = ctx.db.message_keywords("kw2").unwrap();
+        assert!(stored.contains(&"$label1".to_string()), "{:?}", stored);
+        assert!(stored.contains(&"NonJunk".to_string()), "{:?}", stored);
+        assert!(ctx.db.list_custom_tags().unwrap().is_empty());
+        let captured = calls.lock().await.clone();
+        assert!(
+            !captured.iter().any(|(m, _, _)| m == "POST"),
+            "no label call is expected: {:?}",
+            captured
+        );
+    }
+
+    #[tokio::test]
+    async fn one_set_call_creates_at_most_ten_labels() {
+        let (ctx, calls, _d) = test_ctx_with_backend(false).await;
+        ctx.session.write().await.identity_key = Some("test-ik".to_string());
+        let mut first = cached("cap1", "inbox");
+        first.flags = 0;
+        insert_msg(&ctx, &first);
+        let mut second = cached("cap2", "inbox");
+        second.flags = 0;
+        insert_msg(&ctx, &second);
+        let mut first_patch = serde_json::Map::new();
+        for n in 0..10 {
+            first_patch.insert(format!("keywords/First{}", n), json!(true));
+        }
+        let args = json!({"update": {
+            "cap1": Value::Object(first_patch),
+            "cap2": {"keywords/Extra": true}
+        }});
+        let res = ok(set(&ctx, args, &mut HashMap::new()).await);
+        assert!(res["updated"].as_object().unwrap().contains_key("cap1"), "{:?}", res);
+        assert_eq!(res["notUpdated"]["cap2"]["type"], json!("overQuota"), "{:?}", res);
+        assert_eq!(ctx.db.list_custom_tags().unwrap().len(), 10);
+        assert!(ctx.db.message_tags(&["cap2".to_string()]).unwrap().is_empty());
+        let captured = calls.lock().await.clone();
+        assert_eq!(
+            captured.iter().filter(|(_, route, _)| route == "tags").count(),
+            10,
+            "{:?}",
+            captured
+        );
+    }
+
+    #[tokio::test]
+    async fn set_patch_per_keyword_toggle() {
+        let (ctx, calls, _d) = test_ctx_with_backend(false).await;
+        let mut m = cached("s2", "inbox");
+        m.flags = 1;
+        insert_msg(&ctx, &m);
+        let args = json!({"update": {"s2": {"/keywords/$seen": false}}});
+        ok(set(&ctx, args, &mut HashMap::new()).await);
+        assert_eq!(ctx.db.get_message_flags_by_id("s2").unwrap(), 0);
+        let captured = calls.lock().await.clone();
+        assert!(captured
+            .iter()
+            .any(|(m, id, body)| m == "PATCH" && id == "s2" && body["is_read"] == json!(false)));
+    }
+
+    #[tokio::test]
+    async fn set_patch_accepts_pointer_without_leading_slash() {
+        let (ctx, calls, _d) = test_ctx_with_backend(false).await;
+        let mut m = cached("s5", "inbox");
+        m.flags = 0;
+        insert_msg(&ctx, &m);
+        let args = json!({"update": {"s5": {"keywords/$seen": true, "keywords/$flagged": true}}});
+        let res = ok(set(&ctx, args, &mut HashMap::new()).await);
+        assert!(
+            res["updated"].as_object().unwrap().contains_key("s5"),
+            "patch rejected: {}",
+            res["notUpdated"]
+        );
+        assert_eq!(ctx.db.get_message_flags_by_id("s5").unwrap(), 1 | 4);
+        let captured = calls.lock().await.clone();
+        assert!(captured
+            .iter()
+            .any(|(m, id, body)| m == "PATCH" && id == "s5" && body["is_read"] == json!(true)));
+    }
+
+    #[test]
+    fn normalize_patch_key_handles_both_forms_and_escapes() {
+        assert_eq!(normalize_patch_key("keywords").as_deref(), Some("keywords"));
+        assert_eq!(normalize_patch_key("/mailboxIds").as_deref(), Some("mailboxIds"));
+        assert_eq!(normalize_patch_key("keywords/$seen").as_deref(), Some("/keywords/$seen"));
+        assert_eq!(normalize_patch_key("/keywords/$seen").as_deref(), Some("/keywords/$seen"));
+        assert_eq!(normalize_patch_key("mailboxIds/mbx_inbox").as_deref(), Some("/mailboxIds/mbx_inbox"));
+        assert_eq!(normalize_patch_key("keywords/a~1b~0c").as_deref(), Some("/keywords/a/b~c"));
+        assert_eq!(normalize_patch_key("keywords/~01").as_deref(), Some("/keywords/~1"));
+        assert_eq!(normalize_patch_key("subject"), None);
+        assert_eq!(normalize_patch_key("/keywordsx/$seen"), None);
+        assert_eq!(normalize_patch_key("keywords/a/b"), None);
+    }
+
+    #[tokio::test]
+    async fn set_rejects_non_keyword_patch() {
+        let (ctx, _d) = test_ctx();
+        insert_msg(&ctx, &cached("s3", "inbox"));
+        let args = json!({"update": {"s3": {"subject": "x"}}});
+        let res = ok(set(&ctx, args, &mut HashMap::new()).await);
+        assert!(res["notUpdated"].as_object().unwrap().contains_key("s3"));
+    }
+
+    #[tokio::test]
+    async fn set_destroys_message_on_backend_and_locally() {
+        let (ctx, calls, _d) = test_ctx_with_backend(false).await;
+        insert_msg(&ctx, &cached("s4", "inbox"));
+        let args = json!({"destroy": ["s4"]});
+        let res = ok(set(&ctx, args, &mut HashMap::new()).await);
+        assert_eq!(res["destroyed"], json!(["s4"]));
+        assert!(ctx.db.get_cached_message("s4").unwrap().is_none());
+        let captured = calls.lock().await.clone();
+        assert!(captured
+            .iter()
+            .any(|(m, id, _)| m == "DELETE" && id == "s4"));
+    }
+
+    #[tokio::test]
+    async fn set_destroy_backend_failure_keeps_local_copy() {
+        let (ctx, _calls, _d) = test_ctx_with_backend(true).await;
+        insert_msg(&ctx, &cached("s5", "inbox"));
+        let args = json!({"destroy": ["s5"]});
+        let res = ok(set(&ctx, args, &mut HashMap::new()).await);
+        assert!(res["destroyed"].as_array().unwrap().is_empty());
+        assert_eq!(res["notDestroyed"]["s5"]["type"], json!("serverFail"));
+        assert!(ctx.db.get_cached_message("s5").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn set_destroy_missing_message_not_found() {
+        let (ctx, calls, _d) = test_ctx_with_backend(false).await;
+        let args = json!({"destroy": ["ghost"]});
+        let res = ok(set(&ctx, args, &mut HashMap::new()).await);
+        assert_eq!(res["notDestroyed"]["ghost"]["type"], json!("notFound"));
+        assert!(calls.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn set_moves_message_via_full_mailbox_ids() {
+        let (ctx, calls, _d) = test_ctx_with_backend(false).await;
+        insert_msg(&ctx, &cached("mv1", "inbox"));
+        let args = json!({"update": {"mv1": {"mailboxIds": {"mbx_archive": true}}}});
+        let res = ok(set(&ctx, args, &mut HashMap::new()).await);
+        assert!(res["updated"].as_object().unwrap().contains_key("mv1"));
+        assert_eq!(
+            ctx.db.get_cached_message("mv1").unwrap().unwrap().folder,
+            "archive"
+        );
+        let captured = calls.lock().await.clone();
+        assert!(captured.iter().any(|(m, id, body)| m == "PATCH"
+            && id == "mv1"
+            && body["is_archived"] == json!(true)));
+    }
+
+    #[tokio::test]
+    async fn set_moves_message_via_per_key_patch() {
+        let (ctx, calls, _d) = test_ctx_with_backend(false).await;
+        insert_msg(&ctx, &cached("mv2", "inbox"));
+        let args = json!({"update": {"mv2": {
+            "mailboxIds/mbx_trash": true,
+            "mailboxIds/mbx_inbox": Value::Null
+        }}});
+        let res = ok(set(&ctx, args, &mut HashMap::new()).await);
+        assert!(
+            res["updated"].as_object().unwrap().contains_key("mv2"),
+            "move rejected: {}",
+            res["notUpdated"]
+        );
+        assert_eq!(
+            ctx.db.get_cached_message("mv2").unwrap().unwrap().folder,
+            "trash"
+        );
+        let captured = calls.lock().await.clone();
+        assert!(captured.iter().any(|(m, id, body)| m == "PATCH"
+            && id == "mv2"
+            && body["is_trashed"] == json!(true)));
+    }
+
+    #[tokio::test]
+    async fn set_move_to_drafts_rejected() {
+        let (ctx, calls, _d) = test_ctx_with_backend(false).await;
+        insert_msg(&ctx, &cached("mv3", "inbox"));
+        let args = json!({"update": {"mv3": {"mailboxIds": {"mbx_drafts": true}}}});
+        let res = ok(set(&ctx, args, &mut HashMap::new()).await);
+        assert_eq!(res["notUpdated"]["mv3"]["type"], json!("invalidProperties"));
+        assert!(calls.lock().await.is_empty());
+        assert_eq!(
+            ctx.db.get_cached_message("mv3").unwrap().unwrap().folder,
+            "inbox"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_move_to_unknown_mailbox_rejected() {
+        let (ctx, _calls, _d) = test_ctx_with_backend(false).await;
+        insert_msg(&ctx, &cached("mv4", "inbox"));
+        let args = json!({"update": {"mv4": {"mailboxIds": {"mbx_ghost": true}}}});
+        let res = ok(set(&ctx, args, &mut HashMap::new()).await);
+        assert_eq!(res["notUpdated"]["mv4"]["type"], json!("invalidProperties"));
+    }
+
+    #[tokio::test]
+    async fn set_move_backend_failure_keeps_folder() {
+        let (ctx, _calls, _d) = test_ctx_with_backend(true).await;
+        insert_msg(&ctx, &cached("mv5", "inbox"));
+        let args = json!({"update": {"mv5": {"mailboxIds": {"mbx_archive": true}}}});
+        let res = ok(set(&ctx, args, &mut HashMap::new()).await);
+        assert_eq!(res["notUpdated"]["mv5"]["type"], json!("serverFail"));
+        assert_eq!(
+            ctx.db.get_cached_message("mv5").unwrap().unwrap().folder,
+            "inbox"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_create_reports_not_created() {
+        let (ctx, _calls, _d) = test_ctx_with_backend(false).await;
+        let args = json!({"create": {"draft1": {"subject": "x"}}});
+        let res = ok(set(&ctx, args, &mut HashMap::new()).await);
+        assert_eq!(res["notCreated"]["draft1"]["type"], json!("forbidden"));
+    }
+
+    #[tokio::test]
+    async fn set_rejects_stale_if_in_state() {
+        let (ctx, calls, _d) = test_ctx_with_backend(false).await;
+        let mut m = cached("st1", "inbox");
+        m.flags = 0;
+        insert_msg(&ctx, &m);
+        let args = json!({
+            "ifInState": "999",
+            "update": {"st1": {"/keywords/$seen": true}},
+            "destroy": ["st1"]
+        });
+        assert_eq!(err_kind(set(&ctx, args, &mut HashMap::new()).await), "stateMismatch");
+        assert!(calls.lock().await.is_empty());
+        assert_eq!(ctx.db.get_message_flags_by_id("st1").unwrap(), 0);
+        assert!(ctx.db.get_cached_message("st1").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn set_accepts_matching_if_in_state() {
+        let (ctx, _calls, _d) = test_ctx_with_backend(false).await;
+        let mut m = cached("st2", "inbox");
+        m.flags = 0;
+        insert_msg(&ctx, &m);
+        let state = ctx.db.jmap_state_get("Email").unwrap_or(0).to_string();
+        let args = json!({
+            "ifInState": state,
+            "update": {"st2": {"keywords": {"$seen": true}}}
+        });
+        let res = ok(set(&ctx, args, &mut HashMap::new()).await);
+        assert_eq!(res["oldState"], json!(state));
+        assert!(res["updated"].as_object().unwrap().contains_key("st2"));
+    }
+
+    #[tokio::test]
+    async fn set_records_changes_and_broadcasts() {
+        let (ctx, _calls, _d) = test_ctx_with_backend(false).await;
+        let mut rx = ctx.broadcaster.subscribe();
+        let mut m = cached("bc1", "inbox");
+        m.flags = 0;
+        insert_msg(&ctx, &m);
+        insert_msg(&ctx, &cached("bc2", "inbox"));
+        let args = json!({
+            "update": {"bc1": {"/keywords/$seen": true}},
+            "destroy": ["bc2"]
+        });
+        let old_state = ctx.db.jmap_state_get("Email").unwrap_or(0);
+        ok(set(&ctx, args, &mut HashMap::new()).await);
+
+        let change = rx.try_recv().expect("state change must broadcast");
+        assert!(change.changed.contains_key("Email"));
+        assert!(change.changed.contains_key("Mailbox"));
+
+        let res = ok(changes(&ctx, json!({"sinceState": old_state.to_string()})).await);
+        assert!(res["updated"].as_array().unwrap().contains(&json!("bc1")));
+        assert!(res["destroyed"].as_array().unwrap().contains(&json!("bc2")));
+    }
+}

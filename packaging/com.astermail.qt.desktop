@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Aster Qt
+GenericName=Email Client
+Comment=Native Aster Mail client with local encryption
+Exec=aster-qt
+Icon=mail-message-new
+Terminal=false
+Categories=Network;Email;
+Keywords=email;mail;aster;
+StartupNotify=true
+StartupWMClass=aster-qt

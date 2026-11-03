@@ -1,0 +1,2478 @@
+//
+// Aster Communications Inc.
+//
+// Copyright (c) 2026 Aster Communications Inc.
+//
+// This file is part of this project.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+//
+use std::sync::Arc;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+
+use tokio::sync::RwLock;
+
+use crate::api_client::ApiClient;
+use crate::auth::app_passwords::AppPasswords;
+use crate::auth::session::Session;
+use crate::db::Database;
+use crate::error::{BridgeError, Result};
+
+pub trait AsyncReadWrite: AsyncRead + AsyncWrite {}
+impl<T: AsyncRead + AsyncWrite + ?Sized> AsyncReadWrite for T {}
+
+pub fn is_transient_send_error(err: &BridgeError) -> bool {
+    match err {
+        BridgeError::Network(_) | BridgeError::Io(_) => true,
+        BridgeError::Api(msg) => {
+            for code in ["408", "429", "500", "502", "503", "504"] {
+                if msg.starts_with(code) {
+                    return true;
+                }
+            }
+            msg.starts_with("409") && msg.contains(SEND_IN_PROGRESS_TEXT)
+        }
+        _ => false,
+    }
+}
+
+const SEND_IN_PROGRESS_TEXT: &str = "still being sent";
+
+pub fn send_idempotency_key(raw_message: &[u8], from: Option<&str>, recipients: &[String]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut envelope: Vec<String> = recipients
+        .iter()
+        .flat_map(|r| r.split(','))
+        .map(|r| r.trim().to_ascii_lowercase())
+        .filter(|r| !r.is_empty())
+        .collect();
+    envelope.sort();
+    envelope.dedup();
+    let mut hasher = Sha256::new();
+    hasher.update(b"aster-bridge-send-v1\0");
+    hasher.update(from.unwrap_or("").trim().to_ascii_lowercase().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(envelope.join("\n").as_bytes());
+    hasher.update(b"\0");
+    hasher.update(raw_message);
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    uuid::Builder::from_custom_bytes(bytes).into_uuid().to_string()
+}
+
+const MAX_LINE_LENGTH: usize = 998;
+const MAX_DATA_LINE_LENGTH: usize = 1_000_000;
+const MAX_DATA_SIZE: usize = 70 * 1024 * 1024;
+const MAX_RECIPIENTS: usize = 100;
+const MAX_FAILED_AUTH: u32 = 5;
+
+async fn read_line_bytes<R>(reader: &mut R, out: &mut Vec<u8>, cap: usize) -> std::io::Result<usize>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    out.clear();
+    loop {
+        let avail = reader.fill_buf().await?;
+        if avail.is_empty() {
+            return Ok(out.len());
+        }
+        let (slice_end, done) = match avail.iter().position(|&b| b == b'\n') {
+            Some(i) => (i + 1, true),
+            None => (avail.len(), false),
+        };
+        let take_n = slice_end.min(cap.saturating_sub(out.len()) + 1);
+        out.extend_from_slice(&avail[..take_n]);
+        tokio::io::AsyncBufReadExt::consume(reader, take_n);
+        if out.len() > cap {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "line too long",
+            ));
+        }
+        if done {
+            return Ok(out.len());
+        }
+    }
+}
+
+fn find_ci_prefix(haystack: &str, needle: &str) -> Option<usize> {
+    let h = haystack.as_bytes();
+    let n = needle.as_bytes();
+    if n.is_empty() || h.len() < n.len() {
+        return None;
+    }
+    for i in 0..=(h.len() - n.len()) {
+        if h[i..i + n.len()]
+            .iter()
+            .zip(n.iter())
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+        {
+            return Some(i);
+        }
+    }
+    None
+}
+
+fn extract_addr(s: &str) -> String {
+    let trimmed = s.trim();
+    if let (Some(lt), Some(gt)) = (trimmed.find('<'), trimmed.rfind('>')) {
+        if gt > lt {
+            return trimmed[lt + 1..gt].trim().to_string();
+        }
+    }
+    trimmed
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_matches(&['<', '>'][..])
+        .to_string()
+}
+
+#[derive(Debug, PartialEq)]
+enum SmtpState {
+    Connected,
+    Greeted,
+    Authenticated,
+    MailFrom,
+    RcptTo,
+    Data,
+}
+
+struct SmtpSession {
+    state: SmtpState,
+    authenticated: bool,
+    mail_from: Option<String>,
+    rcpt_to: Vec<String>,
+    data_buffer: Vec<u8>,
+}
+
+pub async fn run(
+    addr: &str,
+    session: Arc<RwLock<Session>>,
+    client: Arc<ApiClient>,
+    passwords: Arc<AppPasswords>,
+    db: Arc<Database>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+) -> Result<()> {
+    let listener = crate::port_picker::bind_loopback_listener(addr).await?;
+    tracing::info!("SMTP server listening on {} (STARTTLS={})", addr, tls_config.is_some());
+    serve(listener, session, client, passwords, db, tls_config).await
+}
+
+pub async fn serve(
+    listener: tokio::net::TcpListener,
+    session: Arc<RwLock<Session>>,
+    client: Arc<ApiClient>,
+    passwords: Arc<AppPasswords>,
+    db: Arc<Database>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+) -> Result<()> {
+    let mut acceptor = crate::accept::ResilientAcceptor::new("SMTP");
+    let shutdown = crate::shutdown::current();
+    loop {
+        let (stream, peer) = acceptor.accept(&listener).await;
+        if !peer.ip().is_loopback() {
+            tracing::warn!("SMTP rejected non-loopback peer {}", peer);
+            drop(stream);
+            continue;
+        }
+        let permit = match crate::conn_limit::try_acquire_connection(crate::conn_limit::Protocol::Smtp) {
+            Some(p) => p,
+            None => {
+                tracing::warn!("SMTP connection limit reached, dropping {}", peer);
+                drop(stream);
+                continue;
+            }
+        };
+        tracing::debug!("SMTP connection from {}", peer);
+
+        let session = session.clone();
+        let client = client.clone();
+        let passwords = passwords.clone();
+        let db = db.clone();
+        let tls_config = tls_config.clone();
+
+        shutdown.spawn(async move {
+            let _permit = permit;
+            if let Err(e) = handle_session(stream, session, client, passwords, db, tls_config, true).await {
+                tracing::error!("SMTP connection error: {}", e);
+            }
+        });
+    }
+}
+
+pub async fn run_implicit_tls(
+    addr: &str,
+    session: Arc<RwLock<Session>>,
+    client: Arc<ApiClient>,
+    passwords: Arc<AppPasswords>,
+    db: Arc<Database>,
+    tls_config: Arc<rustls::ServerConfig>,
+) -> Result<()> {
+    let listener = crate::port_picker::bind_loopback_listener(addr).await?;
+    tracing::info!("SMTPS (implicit TLS) listening on {}", addr);
+
+    let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
+
+    let mut conn_acceptor = crate::accept::ResilientAcceptor::new("SMTPS");
+    let shutdown = crate::shutdown::current();
+    loop {
+        let (stream, peer) = conn_acceptor.accept(&listener).await;
+        if !peer.ip().is_loopback() {
+            tracing::warn!("SMTPS rejected non-loopback peer {}", peer);
+            drop(stream);
+            continue;
+        }
+        let permit = match crate::conn_limit::try_acquire_connection(crate::conn_limit::Protocol::Smtp) {
+            Some(p) => p,
+            None => {
+                tracing::warn!("SMTPS connection limit reached, dropping {}", peer);
+                drop(stream);
+                continue;
+            }
+        };
+        let session = session.clone();
+        let client = client.clone();
+        let passwords = passwords.clone();
+        let db = db.clone();
+        let acceptor = acceptor.clone();
+
+        shutdown.spawn(async move {
+            let _permit = permit;
+            let tls_stream = match crate::tls::accept_with_timeout(&acceptor, stream, "SMTPS").await {
+                Some(s) => s,
+                None => return,
+            };
+            if let Err(e) = handle_session(tls_stream, session, client, passwords, db, None, true).await {
+                tracing::error!("SMTPS connection error: {}", e);
+            }
+        });
+    }
+}
+
+async fn handle_session_erased(
+    stream: Box<dyn AsyncReadWrite + Send + Unpin>,
+    session: Arc<RwLock<Session>>,
+    client: Arc<ApiClient>,
+    passwords: Arc<AppPasswords>,
+    db: Arc<Database>,
+    pre_auth: crate::conn_limit::PreAuthClock,
+) -> Result<()> {
+    handle_session_inner(stream, session, client, passwords, db, None, false, pre_auth).await
+}
+
+async fn handle_session<S>(
+    stream: S,
+    session: Arc<RwLock<Session>>,
+    client: Arc<ApiClient>,
+    passwords: Arc<AppPasswords>,
+    db: Arc<Database>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+    greet: bool,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let pre_auth = crate::conn_limit::PreAuthClock::start();
+    let inner = handle_session_inner(
+        stream,
+        session,
+        client,
+        passwords,
+        db,
+        tls_config,
+        greet,
+        pre_auth.clone(),
+    );
+    match pre_auth.guard(inner).await {
+        Some(result) => result,
+        None => {
+            tracing::debug!("SMTP connection closed: no sign-in before the deadline");
+            Ok(())
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_session_inner<S>(
+    stream: S,
+    session: Arc<RwLock<Session>>,
+    client: Arc<ApiClient>,
+    passwords: Arc<AppPasswords>,
+    db: Arc<Database>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+    greet: bool,
+    pre_auth: crate::conn_limit::PreAuthClock,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (read_half, mut writer) = tokio::io::split(stream);
+    let mut reader = BufReader::new(read_half);
+    let starttls_capable = tls_config.is_some();
+
+    if greet {
+        writer
+            .write_all(b"220 Aster Bridge SMTP ready\r\n")
+            .await?;
+    }
+
+    let mut smtp = SmtpSession {
+        state: SmtpState::Connected,
+        authenticated: false,
+        mail_from: None,
+        rcpt_to: Vec::new(),
+        data_buffer: Vec::new(),
+    };
+    let mut failed_auth: u32 = 0;
+    let mut refreshed_identities = false;
+
+    let mut line_bytes: Vec<u8> = Vec::new();
+
+    loop {
+        let in_data = smtp.state == SmtpState::Data;
+        let cap = if in_data { MAX_DATA_LINE_LENGTH } else { MAX_LINE_LENGTH };
+        let read = pre_auth
+            .bound_until_auth(smtp.authenticated, read_line_bytes(&mut reader, &mut line_bytes, cap))
+            .await;
+        let Some(read) = read else {
+            let _ = tokio::time::timeout(
+                crate::conn_limit::PRE_AUTH_FAREWELL_TIMEOUT,
+                writer.write_all(b"421 4.4.2 Idle timeout, closing connection\r\n"),
+            )
+            .await;
+            break;
+        };
+        let n = match read {
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                writer.write_all(b"500 Line too long\r\n").await?;
+                break;
+            }
+            Err(e) => return Err(e.into()),
+        };
+        if n == 0 {
+            break;
+        }
+
+        if smtp.state == SmtpState::Data {
+            let mut bytes = &line_bytes[..];
+            while bytes.last() == Some(&b'\r') || bytes.last() == Some(&b'\n') {
+                bytes = &bytes[..bytes.len() - 1];
+            }
+            if bytes == b"." {
+                let raw_message = std::mem::take(&mut smtp.data_buffer);
+
+                let header_section = {
+                    let end = raw_message
+                        .windows(4)
+                        .position(|w| w == b"\r\n\r\n")
+                        .unwrap_or(raw_message.len());
+                    std::str::from_utf8(&raw_message[..end]).unwrap_or("").to_ascii_lowercase()
+                };
+                let is_pgp_mime = header_section.contains("content-type: multipart/encrypted")
+                    && header_section.contains("application/pgp-encrypted");
+                if is_pgp_mime {
+                    smtp.state = SmtpState::Authenticated;
+                    smtp.mail_from = None;
+                    smtp.rcpt_to.clear();
+                    writer.write_all(b"550 5.7.0 OpenPGP/MIME messages are not supported; Aster uses built-in end-to-end encryption\r\n").await?;
+                    continue;
+                }
+
+                let outgoing: std::borrow::Cow<[u8]> =
+                    match with_message_id(&raw_message, smtp.mail_from.as_deref()) {
+                        Some(injected) => std::borrow::Cow::Owned(injected),
+                        None => std::borrow::Cow::Borrowed(&raw_message),
+                    };
+                match send_via_api(&session, &client, &db, &smtp.mail_from, &smtp.rcpt_to, &outgoing)
+                    .await
+                {
+                    Ok(stores_sent_copy) => {
+                        if stores_sent_copy {
+                            crate::imap::append::note_outgoing_message(&raw_message);
+                        }
+                        writer
+                            .write_all(b"250 OK Message accepted\r\n")
+                            .await?;
+                    }
+                    Err(e) => {
+                        if is_transient_send_error(&e) {
+                            let envelope_from = smtp
+                                .mail_from
+                                .clone()
+                                .unwrap_or_default();
+                            let envelope_to = smtp.rcpt_to.join(",");
+                            match db.outbox_insert(&outgoing, &envelope_from, &envelope_to) {
+                                Ok(id) => {
+                                    tracing::warn!(
+                                        "SMTP send transient failure, queued to outbox id={}: {}",
+                                        id,
+                                        e
+                                    );
+                                    if session_stores_sent_copy(&session).await {
+                                        crate::imap::append::note_outgoing_message(&raw_message);
+                                    }
+                                    writer
+                                        .write_all(b"250 OK queued\r\n")
+                                        .await?;
+                                }
+                                Err(qe) => {
+                                    tracing::error!("Failed to enqueue outbox: {}", qe);
+                                    writer
+                                        .write_all(b"451 Temporary failure, please retry\r\n")
+                                        .await?;
+                                }
+                            }
+                        } else {
+                            let smtp_reply: String = match &e {
+                                BridgeError::PlanUpgradeRequired(_) => {
+                                    "550 5.7.1 Plan upgrade required to send via Aster Bridge\r\n"
+                                        .to_string()
+                                }
+                                BridgeError::MessageTooLarge(msg) => format!(
+                                    "552 5.3.4 {}\r\n",
+                                    crate::protocol_text::response_text(msg)
+                                ),
+                                BridgeError::RecipientKey(msg) => format!(
+                                    "550 5.7.5 {}\r\n",
+                                    crate::protocol_text::response_text(msg)
+                                ),
+                                _ => "550 Send rejected\r\n".to_string(),
+                            };
+                            tracing::error!("Failed to send mail via API: {}", e);
+                            log_send_failure(&format!("SMTP send failed: {}", e));
+                            writer.write_all(smtp_reply.as_bytes()).await?;
+                        }
+                    }
+                }
+                smtp.state = SmtpState::Authenticated;
+                smtp.mail_from = None;
+                smtp.rcpt_to.clear();
+            } else {
+                let data_line: &[u8] = if let Some(stripped) = bytes.strip_prefix(b".") {
+                    stripped
+                } else {
+                    bytes
+                };
+                let addition = data_line.len() + 2;
+                if smtp.data_buffer.len() + addition > MAX_DATA_SIZE {
+                    smtp.data_buffer.clear();
+                    let mut drain_failed = false;
+                    loop {
+                        let dn = match read_line_bytes(&mut reader, &mut line_bytes, MAX_DATA_LINE_LENGTH).await {
+                            Ok(dn) => dn,
+                            Err(_) => {
+                                drain_failed = true;
+                                break;
+                            }
+                        };
+                        if dn == 0 { break; }
+                        let dl: &[u8] = &line_bytes[..];
+                        let dl = if dl.last() == Some(&b'\n') { &dl[..dl.len()-1] } else { dl };
+                        let dl = if dl.last() == Some(&b'\r') { &dl[..dl.len()-1] } else { dl };
+                        if dl == b"." { break; }
+                    }
+                    if drain_failed {
+                        writer.write_all(b"421 4.3.0 Message exceeds maximum size, closing connection\r\n").await?;
+                        break;
+                    }
+                    smtp.state = SmtpState::Authenticated;
+                    writer.write_all(b"552 Message exceeds maximum size\r\n").await?;
+                    continue;
+                }
+                smtp.data_buffer.extend_from_slice(data_line);
+                smtp.data_buffer.extend_from_slice(b"\r\n");
+            }
+            continue;
+        }
+
+        let line = String::from_utf8_lossy(&line_bytes).into_owned();
+        let trimmed = line.trim_end().to_string();
+
+        let (cmd, args) = if let Some(pos) = trimmed.find(' ') {
+            (&trimmed[..pos], trimmed[pos + 1..].to_string())
+        } else {
+            (trimmed.as_str(), String::new())
+        };
+
+        match cmd.to_uppercase().as_str() {
+            "EHLO" | "HELO" => {
+                smtp.state = SmtpState::Greeted;
+                smtp.mail_from = None;
+                smtp.rcpt_to.clear();
+                smtp.data_buffer.clear();
+                if cmd.to_uppercase() == "HELO" {
+                    writer.write_all(b"250 Aster Bridge\r\n").await?;
+                } else {
+                    writer.write_all(b"250-Aster Bridge\r\n").await?;
+                    writer.write_all(b"250-AUTH PLAIN LOGIN\r\n").await?;
+                    if starttls_capable {
+                        writer.write_all(b"250-STARTTLS\r\n").await?;
+                    }
+                    writer.write_all(b"250-8BITMIME\r\n").await?;
+                    writer
+                        .write_all(format!("250 SIZE {}\r\n", MAX_DATA_SIZE).as_bytes())
+                        .await?;
+                }
+            }
+            "STARTTLS" => {
+                if smtp.authenticated {
+                    writer.write_all(b"503 Bad sequence of commands\r\n").await?;
+                    continue;
+                }
+                let cfg = match tls_config.as_ref() {
+                    Some(c) => c.clone(),
+                    None => {
+                        writer.write_all(b"454 STARTTLS not available\r\n").await?;
+                        continue;
+                    }
+                };
+                writer.write_all(b"220 Ready to start TLS\r\n").await?;
+                writer.flush().await?;
+                let upgraded_session = session.clone();
+                let upgraded_client = client.clone();
+                let upgraded_passwords = passwords.clone();
+                let upgraded_db = db.clone();
+                let rejoined = tokio::io::join(reader.into_inner(), writer);
+                let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
+                let Some(accepted) = pre_auth.bound(acceptor.accept(rejoined)).await else {
+                    return Ok(());
+                };
+                let tls_stream = accepted.map_err(std::io::Error::other)?;
+                let erased: Box<dyn AsyncReadWrite + Send + Unpin> = Box::new(tls_stream);
+                return Box::pin(handle_session_erased(
+                    erased,
+                    upgraded_session,
+                    upgraded_client,
+                    upgraded_passwords,
+                    upgraded_db,
+                    pre_auth.clone(),
+                ))
+                .await;
+            }
+            "AUTH" => {
+                if smtp.state != SmtpState::Greeted {
+                    writer.write_all(b"503 Bad sequence\r\n").await?;
+                    continue;
+                }
+                if starttls_capable {
+                    crate::sign_in_notice::record_insecure("smtp");
+                    writer.write_all(format!("538 5.7.11 {}\r\n", crate::sign_in_notice::TLS_REQUIRED_TEXT).as_bytes()).await?;
+                    continue;
+                }
+
+                let auth_parts: Vec<&str> = args.splitn(2, ' ').collect();
+                let auth_type = auth_parts.first().copied().unwrap_or("");
+
+                let credentials_str: Option<(Option<String>, String)> = if auth_type.eq_ignore_ascii_case("PLAIN") {
+                    let credentials = if auth_parts.len() > 1 {
+                        auth_parts[1].to_string()
+                    } else {
+                        writer.write_all(b"334 \r\n").await?;
+                        let mut cont = Vec::new();
+                        if pre_auth.bound(read_line_bytes(&mut reader, &mut cont, MAX_LINE_LENGTH)).await.and_then(|r| r.ok()).unwrap_or(0) == 0 {
+                            break;
+                        }
+                        std::str::from_utf8(&cont).unwrap_or("").trim_end().to_string()
+                    };
+                    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &credentials)
+                        .ok()
+                        .and_then(|decoded| {
+                            let parts: Vec<&[u8]> = decoded.splitn(3, |&b| b == 0).collect();
+                            let (name_bytes, pw_bytes) = if parts.len() >= 3 { (Some(parts[1]), parts[2]) } else if parts.len() == 2 { (None, parts[1]) } else { return None; };
+                            Some((
+                                name_bytes.map(|n| String::from_utf8_lossy(n).into_owned()),
+                                String::from_utf8_lossy(pw_bytes).into_owned(),
+                            ))
+                        })
+                } else if auth_type.eq_ignore_ascii_case("LOGIN") {
+                    writer.write_all(b"334 VXNlcm5hbWU6\r\n").await?;
+                    let mut line = Vec::new();
+                    if pre_auth.bound(read_line_bytes(&mut reader, &mut line, MAX_LINE_LENGTH)).await.and_then(|r| r.ok()).unwrap_or(0) == 0 { break; }
+                    writer.write_all(b"334 UGFzc3dvcmQ6\r\n").await?;
+                    let mut pw_line = Vec::new();
+                    if pre_auth.bound(read_line_bytes(&mut reader, &mut pw_line, MAX_LINE_LENGTH)).await.and_then(|r| r.ok()).unwrap_or(0) == 0 { break; }
+                    let name_b64 = std::str::from_utf8(&line).unwrap_or("").trim_end();
+                    let pw_b64 = std::str::from_utf8(&pw_line).unwrap_or("").trim_end();
+                    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, name_b64)
+                        .ok()
+                        .zip(base64::Engine::decode(&base64::engine::general_purpose::STANDARD, pw_b64).ok())
+                        .map(|(n, b)| {
+                            (
+                                Some(String::from_utf8_lossy(&n).into_owned()),
+                                String::from_utf8_lossy(&b).into_owned(),
+                            )
+                        })
+                } else {
+                    writer.write_all(b"504 Unrecognized auth type\r\n").await?;
+                    continue;
+                };
+
+                let mut ok = false;
+                if let Some((login_name, password)) = credentials_str {
+                    let mut pw_match = passwords
+                        .verify_and_id_cached(login_name.as_deref().unwrap_or(""), &password)
+                        .await;
+                    if let (Some(_), Some(name)) = (&pw_match, &login_name) {
+                        if !session.read().await.accepts_login_name(name) {
+                            if !refreshed_identities {
+                                refreshed_identities = true;
+                                crate::auth::session::refresh_send_identities(&session, &client).await;
+                            }
+                            if !session.read().await.accepts_login_name(name) {
+                                pw_match = None;
+                            }
+                        }
+                    }
+                    if let Some(pw_id) = pw_match {
+                        smtp.authenticated = true;
+                        pre_auth.mark_signed_in();
+                        smtp.state = SmtpState::Authenticated;
+                        passwords.record_use(&pw_id, Some("smtp"));
+                        crate::sign_in_notice::record_signed_in("smtp");
+                        writer.write_all(b"235 Authentication successful\r\n").await?;
+                        ok = true;
+                    }
+                }
+
+                if !ok {
+                    failed_auth = failed_auth.saturating_add(1);
+                    let backoff_ms = 200u64.saturating_mul(1u64 << failed_auth.min(5));
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                    writer
+                        .write_all(format!("535 5.7.8 {}\r\n", crate::sign_in_notice::BAD_CREDENTIALS_TEXT).as_bytes())
+                        .await?;
+                    if failed_auth >= MAX_FAILED_AUTH {
+                        writer
+                            .write_all(b"421 Too many failed attempts\r\n")
+                            .await?;
+                        break;
+                    }
+                }
+            }
+            "MAIL" => {
+                if !smtp.authenticated {
+                    writer
+                        .write_all(b"530 Authentication required\r\n")
+                        .await?;
+                    continue;
+                }
+                if matches!(smtp.state, SmtpState::MailFrom | SmtpState::RcptTo) {
+                    writer.write_all(b"503 5.5.1 Nested MAIL command\r\n").await?;
+                    continue;
+                }
+
+                if let Some(start) = find_ci_prefix(&args, "FROM:") {
+                    let from_addr = extract_addr(&args[start + 5..]);
+                    let (session_email, mut identity_ok) = {
+                        let s = session.read().await;
+                        let resolved = if from_addr.is_empty() {
+                            s.default_sender_address()
+                        } else {
+                            from_addr.clone()
+                        };
+                        let ok = resolved.eq_ignore_ascii_case(&s.email)
+                            || s.find_send_identity(&resolved)
+                                .is_some_and(|i| i.enabled);
+                        (resolved, ok)
+                    };
+                    // An alias or custom-domain address added after sign-in is not in
+                    // the list yet, so rebuild it once per connection before refusing.
+                    if !identity_ok && !refreshed_identities {
+                        refreshed_identities = true;
+                        tracing::info!(
+                            "unknown sender offered, refreshing the send-as list from the server"
+                        );
+                        crate::auth::session::refresh_send_identities(&session, &client).await;
+                        let s = session.read().await;
+                        identity_ok = session_email.eq_ignore_ascii_case(&s.email)
+                            || s.find_send_identity(&session_email)
+                                .is_some_and(|i| i.enabled);
+                    }
+                    if !identity_ok {
+                        tracing::warn!(
+                            "rejecting MAIL FROM: the address is not one of this account's send identities"
+                        );
+                        writer.write_all(b"553 5.1.8 Sender address rejected: not an enabled address, alias, or domain address of this account\r\n").await?;
+                        continue;
+                    }
+                    smtp.mail_from = Some(session_email);
+                    smtp.rcpt_to.clear();
+                    smtp.data_buffer.clear();
+                    smtp.state = SmtpState::MailFrom;
+                    writer.write_all(b"250 OK\r\n").await?;
+                } else {
+                    writer.write_all(b"501 Syntax error\r\n").await?;
+                }
+            }
+            "RCPT" => {
+                if smtp.state != SmtpState::MailFrom && smtp.state != SmtpState::RcptTo {
+                    writer.write_all(b"503 Bad sequence\r\n").await?;
+                    continue;
+                }
+
+                if smtp.rcpt_to.len() >= MAX_RECIPIENTS {
+                    writer
+                        .write_all(b"452 Too many recipients\r\n")
+                        .await?;
+                    continue;
+                }
+
+                if let Some(start) = find_ci_prefix(&args, "TO:") {
+                    let to_addr = extract_addr(&args[start + 3..]);
+                    if to_addr.is_empty() {
+                        writer.write_all(b"501 Empty recipient\r\n").await?;
+                        continue;
+                    }
+                    smtp.rcpt_to.push(to_addr);
+                    smtp.state = SmtpState::RcptTo;
+                    writer.write_all(b"250 OK\r\n").await?;
+                } else {
+                    writer.write_all(b"501 Syntax error\r\n").await?;
+                }
+            }
+            "DATA" => {
+                if smtp.state != SmtpState::RcptTo {
+                    writer.write_all(b"503 Bad sequence\r\n").await?;
+                    continue;
+                }
+
+                smtp.state = SmtpState::Data;
+                smtp.data_buffer.clear();
+                writer
+                    .write_all(b"354 Start mail input; end with <CRLF>.<CRLF>\r\n")
+                    .await?;
+            }
+            "RSET" => {
+                smtp.mail_from = None;
+                smtp.rcpt_to.clear();
+                smtp.data_buffer.clear();
+                if smtp.authenticated {
+                    smtp.state = SmtpState::Authenticated;
+                } else {
+                    smtp.state = SmtpState::Greeted;
+                }
+                writer.write_all(b"250 OK\r\n").await?;
+            }
+            "QUIT" => {
+                writer.write_all(b"221 Bye\r\n").await?;
+                break;
+            }
+            _ => {
+                writer
+                    .write_all(b"502 Command not implemented\r\n")
+                    .await?;
+            }
+        }
+    }
+
+    let closing = async {
+        let _ = writer.flush().await;
+        let _ = writer.shutdown().await;
+    };
+    match pre_auth.farewell_window() {
+        Some(window) => {
+            let _ = tokio::time::timeout(window, closing).await;
+        }
+        None => closing.await,
+    }
+
+    Ok(())
+}
+
+fn sanitize_display_name(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>()
+        .trim()
+        .chars()
+        .take(128)
+        .collect()
+}
+
+const PGP_MESSAGE_ARMOR: &str = "-----BEGIN PGP MESSAGE-----";
+
+fn has_html_body(parsed: &mail_parser::Message<'_>) -> bool {
+    parsed
+        .html_part(0)
+        .is_some_and(|part| matches!(part.body, mail_parser::PartType::Html(_)))
+}
+
+fn plain_text_to_html_fragment(text: &str) -> String {
+    format!(
+        "<div style=\"white-space: pre-wrap\">{}</div>",
+        crate::smtp::reply_thread::plain_text_to_html(text)
+    )
+}
+
+pub(crate) fn pgp_mime_armor(parsed: &mail_parser::Message<'_>) -> Option<String> {
+    use mail_parser::MimeHeaders;
+    let is_encrypted = parsed.content_type().is_some_and(|ct| {
+        ct.ctype().eq_ignore_ascii_case("multipart")
+            && ct.subtype().is_some_and(|s| s.eq_ignore_ascii_case("encrypted"))
+    });
+    if !is_encrypted {
+        return None;
+    }
+    parsed.parts.iter().find_map(|part| {
+        let ct = part.content_type()?;
+        let is_octet_stream = ct.ctype().eq_ignore_ascii_case("application")
+            && ct.subtype().is_some_and(|s| s.eq_ignore_ascii_case("octet-stream"));
+        if !is_octet_stream {
+            return None;
+        }
+        let text = std::str::from_utf8(part.contents()).ok()?;
+        text.contains(PGP_MESSAGE_ARMOR).then(|| text.to_string())
+    })
+}
+
+pub fn build_send_payload(
+    raw_message: &[u8],
+    from: Option<&str>,
+    recipients: &[String],
+    session_email: &str,
+    sender_identity: Option<&crate::auth::session::SendIdentity>,
+    passphrase: &[u8],
+) -> std::result::Result<serde_json::Value, crate::error::BridgeError> {
+    build_send_payload_with_own_key(
+        raw_message,
+        from,
+        recipients,
+        session_email,
+        sender_identity,
+        passphrase,
+        None,
+    )
+}
+
+pub fn build_send_payload_with_own_key(
+    raw_message: &[u8],
+    from: Option<&str>,
+    recipients: &[String],
+    session_email: &str,
+    sender_identity: Option<&crate::auth::session::SendIdentity>,
+    passphrase: &[u8],
+    own_key: Option<&str>,
+) -> std::result::Result<serde_json::Value, crate::error::BridgeError> {
+    use mail_parser::MessageParser;
+
+    let parsed = MessageParser::default()
+        .parse(raw_message)
+        .ok_or_else(|| crate::error::BridgeError::Smtp("failed to parse outbound message".to_string()))?;
+
+    let envelope_from = from.unwrap_or(session_email);
+    if let Some(from_addrs) = parsed.from() {
+        for a in from_addrs.iter() {
+            if let Some(addr) = a.address() {
+                let matches_session = addr.eq_ignore_ascii_case(session_email);
+                let matches_envelope = addr.eq_ignore_ascii_case(envelope_from);
+                if !matches_session && !matches_envelope {
+                    tracing::debug!("from-header mismatch with session/envelope");
+                }
+            }
+        }
+    }
+
+    let subject = parsed.subject().unwrap_or("").to_string();
+
+    let header_to: Vec<String> = parsed
+        .to()
+        .map(|a| a.iter().filter_map(|x| x.address().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
+    let header_cc: Vec<String> = parsed
+        .cc()
+        .map(|a| a.iter().filter_map(|x| x.address().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
+    let header_bcc: Vec<String> = parsed
+        .bcc()
+        .map(|a| a.iter().filter_map(|x| x.address().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
+
+    let envelope: std::collections::HashSet<String> =
+        recipients.iter().map(|s| s.to_lowercase()).collect();
+    let in_envelope = |addr: &&String| envelope.contains(&addr.to_lowercase());
+
+    let to_list: Vec<String> = header_to.iter().filter(in_envelope).cloned().collect();
+    let cc_list: Vec<String> = header_cc.iter().filter(in_envelope).cloned().collect();
+    let mut bcc_list: Vec<String> = header_bcc.iter().filter(in_envelope).cloned().collect();
+
+    let known: std::collections::HashSet<String> = to_list
+        .iter()
+        .chain(cc_list.iter())
+        .chain(bcc_list.iter())
+        .map(|s| s.to_lowercase())
+        .collect();
+
+    for envelope_rcpt in recipients {
+        if !known.contains(&envelope_rcpt.to_lowercase()) {
+            bcc_list.push(envelope_rcpt.clone());
+        }
+    }
+
+    if to_list.is_empty() && cc_list.is_empty() && bcc_list.is_empty() {
+        for envelope_rcpt in recipients {
+            bcc_list.push(envelope_rcpt.clone());
+        }
+    }
+
+    let custom_domain_sender = sender_identity
+        .is_some_and(|i| i.kind == crate::auth::session::SendIdentityKind::CustomDomain);
+    let sealed_bcc_only = custom_domain_sender
+        && cc_list
+            .iter()
+            .chain(bcc_list.iter())
+            .all(|address| crate::crypto::internal_send::is_internal_address(address));
+    let mut self_to_placeholder = None;
+    let effective_to = if to_list.is_empty() && sealed_bcc_only {
+        Vec::new()
+    } else if to_list.is_empty() {
+        let own_address = sender_identity
+            .filter(|i| i.kind != crate::auth::session::SendIdentityKind::Primary)
+            .map(|i| i.address.clone())
+            .unwrap_or_else(|| session_email.to_string());
+        let addressed_self = cc_list
+            .iter()
+            .chain(bcc_list.iter())
+            .any(|a| a.eq_ignore_ascii_case(&own_address));
+        bcc_list.retain(|a| !a.eq_ignore_ascii_case(&own_address));
+        if custom_domain_sender && !addressed_self {
+            self_to_placeholder = Some(own_address.clone());
+        }
+        vec![own_address]
+    } else {
+        to_list
+    };
+
+    let pgp_mime_body = pgp_mime_armor(&parsed);
+    let body_html = if has_html_body(&parsed) {
+        parsed.body_html(0).map(|s| s.to_string())
+    } else {
+        pgp_mime_body
+            .clone()
+            .or_else(|| parsed.body_text(0).map(|s| s.to_string()))
+            .filter(|text| !text.trim().is_empty())
+            .map(|text| plain_text_to_html_fragment(&text))
+    };
+    let body_plain = parsed.body_text(0).map(|s| s.to_string());
+    let is_html = body_html.is_some();
+    let body = body_html.as_deref()
+        .or(body_plain.as_deref())
+        .unwrap_or(" ")
+        .to_string();
+
+    let final_body = if body.trim().is_empty() {
+        " ".to_string()
+    } else {
+        body
+    };
+
+    // For non-primary identities (alias / custom-domain) we attach the
+    // sender_email + sender_alias_hash + sender_display_name exactly like the
+    // Aster-Mail web client. For the primary address we omit the hash (and let
+    // the backend default the sender), matching the web "primary" path.
+    let non_primary = sender_identity.filter(|i| {
+        i.kind != crate::auth::session::SendIdentityKind::Primary
+    });
+
+    let sender_email = match non_primary {
+        Some(id) => Some(id.address.clone()),
+        None => from.filter(|s| !s.is_empty()).map(|s| s.to_string()),
+    };
+
+    let header_display_name = parsed
+        .from()
+        .and_then(|a| a.iter().next().and_then(|x| x.name()))
+        .map(sanitize_display_name)
+        .filter(|s| !s.is_empty());
+
+    let mut payload = serde_json::json!({
+        "to": effective_to,
+        "cc": if cc_list.is_empty() { serde_json::Value::Null } else { serde_json::json!(cc_list) },
+        "bcc": if bcc_list.is_empty() { serde_json::Value::Null } else { serde_json::json!(bcc_list) },
+        "subject": subject,
+        "body": final_body,
+        "is_html": is_html,
+        "is_e2e_encrypted": false,
+        "sender_email": sender_email,
+        "client_source": "bridge",
+    });
+    if let Some(own_address) = self_to_placeholder {
+        payload[crate::crypto::internal_send::SELF_TO_PLACEHOLDER] = serde_json::json!(own_address);
+    }
+
+    if let Some(id) = non_primary {
+        if let Some(ref hash) = id.auth_hash_b64 {
+            payload["sender_alias_hash"] = serde_json::json!(hash);
+        }
+        let display_name = id.display_name.clone().or_else(|| header_display_name.clone());
+        if let Some(dn) = display_name {
+            payload["sender_display_name"] = serde_json::json!(dn);
+        }
+    } else if let Some(ref dn) = header_display_name {
+        payload["sender_display_name"] = serde_json::json!(dn);
+    }
+
+    if let Some(html) = body_html {
+        payload["body_html"] = serde_json::json!(html);
+    }
+
+    let attachments = if pgp_mime_body.is_some() {
+        Vec::new()
+    } else {
+        crate::crypto::attachment::mime_attachments(&parsed, MAX_DATA_SIZE)
+    };
+    if !attachments.is_empty() {
+        let sealed = crate::crypto::attachment::seal_send_attachments_with_own_key(&attachments, passphrase, own_key)
+            .map_err(|e| crate::error::BridgeError::Smtp(format!("attachment sealing failed: {}", e)))?;
+        payload["attachments"] = serde_json::Value::Array(sealed);
+    }
+
+    Ok(payload)
+}
+
+pub async fn build_send_payload_blocking(
+    raw_message: Vec<u8>,
+    from: Option<String>,
+    recipients: Vec<String>,
+    session_email: String,
+    sender_identity: Option<crate::auth::session::SendIdentity>,
+    passphrase: zeroize::Zeroizing<Vec<u8>>,
+    identity_key: Option<zeroize::Zeroizing<String>>,
+    seal_to_identity: bool,
+) -> std::result::Result<serde_json::Value, crate::error::BridgeError> {
+    tokio::task::spawn_blocking(move || {
+        let own_key = identity_key
+            .as_deref()
+            .map(|k| k.as_str())
+            .filter(|_| seal_to_identity);
+        let mut payload = build_send_payload_with_own_key(
+            &raw_message,
+            from.as_deref(),
+            &recipients,
+            &session_email,
+            sender_identity.as_ref(),
+            &passphrase,
+            own_key,
+        )?;
+        let parsed = mail_parser::MessageParser::default().parse(&raw_message);
+        let plain_text = parsed
+            .as_ref()
+            .and_then(|m| pgp_mime_armor(m).or_else(|| m.body_text(0).map(|s| s.to_string())));
+        let message_id = parsed
+            .as_ref()
+            .and_then(|m| m.message_id())
+            .map(|id| format!("<{}>", id.trim().trim_matches(&['<', '>'][..]).trim()))
+            .filter(|id| id.len() > 2);
+        crate::smtp::reply_thread::attach_sent_copy_with_message_id(
+            &mut payload,
+            &session_email,
+            plain_text.as_deref(),
+            identity_key.as_deref().map(|k| k.as_str()),
+            &passphrase,
+            seal_to_identity,
+            message_id.as_deref(),
+        );
+        Ok(payload)
+    })
+    .await
+    .map_err(|e| crate::error::BridgeError::Smtp(format!("payload build did not finish: {}", e)))?
+}
+
+fn with_message_id(raw_message: &[u8], mail_from: Option<&str>) -> Option<Vec<u8>> {
+    let headers = mail_parser::MessageParser::default().parse_headers(raw_message)?;
+    if headers.header_raw("Message-ID").is_some() {
+        return None;
+    }
+    let domain = mail_from?.rsplit_once('@')?.1.trim();
+    let valid_domain = !domain.is_empty()
+        && domain.len() <= 253
+        && domain.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-');
+    if !valid_domain {
+        return None;
+    }
+    let header = format!("Message-ID: <{}@{}>\r\n", uuid::Uuid::new_v4(), domain.to_ascii_lowercase());
+    let mut out = Vec::with_capacity(header.len() + raw_message.len());
+    out.extend_from_slice(header.as_bytes());
+    out.extend_from_slice(raw_message);
+    Some(out)
+}
+
+fn header_from_address(raw_message: &[u8]) -> Option<String> {
+    let parsed = mail_parser::MessageParser::default().parse_headers(raw_message)?;
+    let from = parsed.from()?;
+    let mut addresses = from.iter().filter_map(|a| a.address());
+    let address = addresses.next()?.trim().to_string();
+    (addresses.next().is_none() && !address.is_empty()).then_some(address)
+}
+
+fn has_enabled_identity(s: &Session, address: &str) -> bool {
+    s.find_send_identity(address).is_some_and(|i| i.enabled)
+}
+
+pub(crate) async fn prefer_header_identity(
+    raw_message: &[u8],
+    from: Option<String>,
+    session: &Arc<RwLock<Session>>,
+    client: &ApiClient,
+) -> Option<String> {
+    let Some(header) = header_from_address(raw_message) else {
+        return from;
+    };
+    let known = {
+        let s = session.read().await;
+        let envelope = from.as_deref().filter(|v| !v.is_empty());
+        let envelope_is_primary = envelope.is_none_or(|v| v.eq_ignore_ascii_case(&s.email));
+        if !envelope_is_primary || header.eq_ignore_ascii_case(&s.email) {
+            return from;
+        }
+        has_enabled_identity(&s, &header)
+    };
+    if !known {
+        crate::auth::session::refresh_send_identities(session, client).await;
+        if !has_enabled_identity(&*session.read().await, &header) {
+            tracing::info!(
+                "the From header names an address this account can't send as, sending from the envelope sender"
+            );
+            return from;
+        }
+    }
+    tracing::info!("sending as the From header identity instead of the primary envelope sender");
+    Some(header)
+}
+
+pub async fn build_threaded_send_payload(
+    raw_message: &[u8],
+    from: Option<String>,
+    recipients: Vec<String>,
+    session: &Arc<RwLock<Session>>,
+    client: &ApiClient,
+    db: &Database,
+) -> std::result::Result<(serde_json::Value, zeroize::Zeroizing<String>), crate::error::BridgeError> {
+    let client_send_id = send_idempotency_key(raw_message, from.as_deref(), &recipients);
+    let from = prefer_header_identity(raw_message, from, session, client).await;
+    let (session_email, sender_identity, access_token, passphrase, identity_key) = {
+        let s = session.read().await;
+        let default_address = s.default_sender_address();
+        let lookup_addr = from
+            .as_deref()
+            .filter(|v| !v.is_empty())
+            .unwrap_or(&default_address);
+        let identity = s.find_send_identity(lookup_addr).cloned();
+        (
+            s.email.clone(),
+            identity,
+            s.access_token.clone(),
+            zeroize::Zeroizing::new(s.vault_passphrase.clone()),
+            s.identity_key.clone().map(zeroize::Zeroizing::new),
+        )
+    };
+    let headers = crate::smtp::reply_thread::ReplyHeaders::from_mime(raw_message);
+    let reply = crate::smtp::reply_thread::resolve_reply(db, &headers);
+    let seal_to_identity =
+        crate::crypto::sent_copy::format_writes_enabled(client, &access_token).await;
+    let mut payload = build_send_payload_blocking(
+        raw_message.to_vec(),
+        from,
+        recipients,
+        session_email,
+        sender_identity,
+        passphrase,
+        identity_key,
+        seal_to_identity,
+    )
+    .await?;
+    crate::smtp::reply_thread::apply_reply_thread(&mut payload, client, &access_token, &reply).await;
+    crate::smtp::branding::apply_branding_preference(&mut payload, session, client, &access_token).await;
+    crate::crypto::internal_send::seal_internal_body(&mut payload, session, client, db, &access_token)
+        .await?;
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("client_send_id".to_string(), serde_json::Value::String(client_send_id));
+    }
+    Ok((payload, access_token))
+}
+
+async fn send_via_api(
+    session: &Arc<RwLock<Session>>,
+    client: &Arc<ApiClient>,
+    db: &Database,
+    from: &Option<String>,
+    recipients: &[String],
+    raw_message: &[u8],
+) -> std::result::Result<bool, crate::error::BridgeError> {
+    let (payload, access_token) = build_threaded_send_payload(
+        raw_message,
+        from.clone(),
+        recipients.to_vec(),
+        session,
+        client,
+        db,
+    )
+    .await?;
+    let stores_sent_copy = crate::smtp::reply_thread::stores_sent_copy(&payload);
+    client.send_mail(&access_token, &payload).await?;
+    Ok(stores_sent_copy)
+}
+
+pub(crate) fn log_send_failure(message: &str) {
+    const MAX_LOG_BYTES: u64 = 1_048_576;
+    let log_line = format!(
+        "[{}] {}\n",
+        chrono::Utc::now().to_rfc3339(),
+        crate::diagnostics::redact_line(message)
+    );
+    let Ok(dir) = crate::config::data_dir() else {
+        return;
+    };
+    let path = dir.join("smtp_errors.log");
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if meta.len() > MAX_LOG_BYTES {
+            let _ = std::fs::rename(&path, dir.join("smtp_errors.log.1"));
+        }
+    }
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, log_line.as_bytes()));
+}
+
+async fn session_stores_sent_copy(session: &Arc<RwLock<Session>>) -> bool {
+    let s = session.read().await;
+    s.identity_key.as_deref().is_some_and(|k| !k.is_empty()) && !s.vault_passphrase.is_empty()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn io_err() -> BridgeError {
+        BridgeError::Io(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset"))
+    }
+
+    #[test]
+    fn io_errors_are_transient() {
+        assert!(is_transient_send_error(&io_err()));
+    }
+
+    #[test]
+    fn a_send_still_in_progress_is_transient() {
+        let in_flight = BridgeError::Api(
+            "409 Conflict: {\"error\":\"This message is still being sent\",\"code\":\"CONFLICT\"}".to_string(),
+        );
+        assert!(is_transient_send_error(&in_flight));
+        let other = BridgeError::Api("409 Conflict: {\"error\":\"duplicate\"}".to_string());
+        assert!(!is_transient_send_error(&other));
+    }
+
+    #[test]
+    fn the_send_key_matches_between_the_direct_send_and_the_outbox_retry() {
+        let raw = b"Message-ID: <a@aster.test>\r\nSubject: hi\r\n\r\nbody\r\n";
+        let direct = vec!["Bob@Example.com".to_string(), "carol@example.com".to_string()];
+        let queued: Vec<String> = direct.join(",").split(',').map(|s| s.to_string()).collect();
+        let key = send_idempotency_key(raw, Some("me@aster.test"), &direct);
+        assert_eq!(key, send_idempotency_key(raw, Some("me@aster.test"), &queued));
+        assert_eq!(
+            key,
+            send_idempotency_key(raw, Some("me@aster.test"), &["carol@example.com,bob@example.com".to_string()])
+        );
+        assert_eq!(
+            send_idempotency_key(raw, Some(""), &direct),
+            send_idempotency_key(raw, None, &direct)
+        );
+        assert!(uuid::Uuid::parse_str(&key).is_ok());
+    }
+
+    #[test]
+    fn different_sends_get_different_keys() {
+        let raw = b"Message-ID: <a@aster.test>\r\nSubject: hi\r\n\r\nbody\r\n";
+        let rcpt = vec!["bob@example.com".to_string()];
+        let key = send_idempotency_key(raw, Some("me@aster.test"), &rcpt);
+        assert_ne!(key, send_idempotency_key(raw, Some("me@aster.test"), &["dan@example.com".to_string()]));
+        assert_ne!(key, send_idempotency_key(raw, Some("alias@aster.test"), &rcpt));
+        let other = b"Message-ID: <b@aster.test>\r\nSubject: hi\r\n\r\nbody\r\n";
+        assert_ne!(key, send_idempotency_key(other, Some("me@aster.test"), &rcpt));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_connection_is_closed_before_sign_in() {
+        use crate::conn_limit::{test_support, PRE_AUTH_DEADLINE, PRE_AUTH_IDLE_TIMEOUT};
+        let crate::sign_in_notice::test_support::Fixture { session, db, client, passwords, dir, .. } =
+            crate::sign_in_notice::test_support::fixture();
+        let started = tokio::time::Instant::now();
+        let (mut reader, _writer) = test_support::connect(move |stream| {
+            handle_session(stream, session, client, passwords, db, None, true)
+        });
+        let (out, closed) = test_support::read_until_closed(&mut reader, PRE_AUTH_DEADLINE * 2).await;
+        assert!(closed, "an idle connection held its slot: {:?}", out);
+        assert!(out.ends_with("421 4.4.2 Idle timeout, closing connection\r\n"), "{:?}", out);
+        assert!(started.elapsed() <= PRE_AUTH_IDLE_TIMEOUT + std::time::Duration::from_secs(1));
+        drop(dir);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_auth_login_exchange_is_closed() {
+        use crate::conn_limit::{test_support, PRE_AUTH_DEADLINE, PRE_AUTH_IDLE_TIMEOUT};
+        use tokio::io::AsyncWriteExt;
+        let crate::sign_in_notice::test_support::Fixture { session, db, client, passwords, dir, .. } =
+            crate::sign_in_notice::test_support::fixture();
+        let (mut reader, mut writer) = test_support::connect(move |stream| {
+            handle_session(stream, session, client, passwords, db, None, true)
+        });
+        writer.write_all(b"EHLO test\r\nAUTH LOGIN\r\n").await.unwrap();
+        writer.flush().await.unwrap();
+        let started = tokio::time::Instant::now();
+        let (out, closed) = test_support::read_until_closed(&mut reader, PRE_AUTH_DEADLINE * 2).await;
+        assert!(closed, "a stalled AUTH exchange held its slot: {:?}", out);
+        assert!(out.ends_with("334 VXNlcm5hbWU6\r\n"), "{:?}", out);
+        assert!(started.elapsed() <= PRE_AUTH_IDLE_TIMEOUT + std::time::Duration::from_secs(1));
+        drop(dir);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_client_that_never_reads_cannot_hold_a_slot_before_sign_in() {
+        use crate::conn_limit::{test_support, PRE_AUTH_DEADLINE, PRE_AUTH_GRACE};
+        let crate::sign_in_notice::test_support::Fixture { session, db, client, passwords, dir, .. } =
+            crate::sign_in_notice::test_support::fixture();
+        let started = tokio::time::Instant::now();
+        let (finished, mut reader) = test_support::flood_without_reading(
+            move |stream| handle_session(stream, session, client, passwords, db, None, true),
+            b"EHLO test\r\n",
+            PRE_AUTH_DEADLINE * 3,
+        )
+        .await;
+        assert!(finished, "a client that never reads held its slot");
+        assert!(
+            started.elapsed()
+                <= PRE_AUTH_DEADLINE + PRE_AUTH_GRACE + std::time::Duration::from_secs(1)
+        );
+        let (_, closed) =
+            test_support::read_until_closed(&mut reader, std::time::Duration::from_secs(2)).await;
+        assert!(closed);
+        drop(dir);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_signed_in_connection_stays_open_past_the_pre_auth_limits() {
+        use crate::conn_limit::{test_support, PRE_AUTH_DEADLINE};
+        use tokio::io::AsyncWriteExt;
+        let _guard = crate::sign_in_notice::test_support::test_lock();
+        let crate::sign_in_notice::test_support::Fixture { session, db, client, passwords, dir, .. } =
+            crate::sign_in_notice::test_support::fixture();
+        let (mut reader, mut writer) = test_support::connect(move |stream| {
+            handle_session(stream, session, client, passwords, db, None, true)
+        });
+        let credentials = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            format!("\0tester@aster.test\0{}", crate::sign_in_notice::test_support::APP_PASSWORD),
+        );
+        writer
+            .write_all(format!("EHLO test\r\nAUTH PLAIN {}\r\n", credentials).as_bytes())
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        let (out, closed) = test_support::read_until_closed(&mut reader, PRE_AUTH_DEADLINE * 3).await;
+        assert!(!closed, "a signed-in session was closed: {:?}", out);
+        assert!(out.contains("235 "), "{:?}", out);
+        writer.write_all(b"RSET\r\n").await.unwrap();
+        writer.flush().await.unwrap();
+        let (out, closed) = test_support::read_until_closed(&mut reader, std::time::Duration::from_secs(5)).await;
+        assert!(!closed);
+        assert!(!out.is_empty() && !out.starts_with("421"), "{:?}", out);
+        drop(dir);
+    }
+
+    #[tokio::test]
+    async fn an_oversized_message_with_an_overlong_line_closes_the_connection() {
+        let _guard = crate::sign_in_notice::test_support::test_lock();
+        let credentials = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            format!("\0tester@aster.test\0{}", crate::sign_in_notice::test_support::APP_PASSWORD),
+        );
+        let mut script = format!(
+            "EHLO test\r\nAUTH PLAIN {}\r\nMAIL FROM:<tester@aster.test>\r\nRCPT TO:<bob@example.com>\r\nDATA\r\n",
+            credentials
+        );
+        let body_line = "a".repeat(999_000);
+        for _ in 0..(MAX_DATA_SIZE / 999_000 + 2) {
+            script.push_str(&body_line);
+            script.push_str("\r\n");
+        }
+        script.push_str(&"b".repeat(MAX_DATA_LINE_LENGTH + 10));
+        script.push_str("\r\nNOOP\r\n.\r\nQUIT\r\n");
+        let out = smtp_transcript(&script, false).await;
+        assert!(
+            out.ends_with("421 4.3.0 Message exceeds maximum size, closing connection\r\n"),
+            "{:?}",
+            out
+        );
+        assert!(!out.contains("\r\n500"), "{:?}", out);
+    }
+
+    #[test]
+    fn a_message_without_a_message_id_gets_one_from_the_sender_domain() {
+        let raw = b"From: tester@aster.test\r\nTo: bob@example.com\r\nSubject: hi\r\n\r\nbody\r\n";
+        let out = with_message_id(raw, Some("tester@Aster.Test")).unwrap();
+        let parsed = mail_parser::MessageParser::default().parse(&out).unwrap();
+        let id = parsed.message_id().unwrap();
+        assert!(id.ends_with("@aster.test"), "{}", id);
+        assert!(out.ends_with(raw));
+        assert_eq!(parsed.subject(), Some("hi"));
+    }
+
+    #[test]
+    fn a_message_with_a_message_id_is_left_unchanged() {
+        let raw = b"Message-ID: <a@client.example>\r\nSubject: hi\r\n\r\nbody\r\n";
+        assert!(with_message_id(raw, Some("tester@aster.test")).is_none());
+        let lower = b"message-id: <a@client.example>\r\nSubject: hi\r\n\r\nbody\r\n";
+        assert!(with_message_id(lower, Some("tester@aster.test")).is_none());
+        let plain = b"Subject: hi\r\n\r\nbody\r\n";
+        assert!(with_message_id(plain, None).is_none());
+        assert!(with_message_id(plain, Some("no-domain")).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_queued_message_without_a_message_id_is_stored_with_one() {
+        let _guard = crate::sign_in_notice::test_support::test_lock();
+        let crate::sign_in_notice::test_support::Fixture { session, db, client, passwords, tls, dir } =
+            crate::sign_in_notice::test_support::fixture();
+        let credentials = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            format!("\0tester@aster.test\0{}", crate::sign_in_notice::test_support::APP_PASSWORD),
+        );
+        let script = format!(
+            "EHLO test\r\nAUTH PLAIN {}\r\nMAIL FROM:<tester@aster.test>\r\nRCPT TO:<bob@example.com>\r\nDATA\r\nFrom: tester@aster.test\r\nTo: bob@example.com\r\nSubject: queued\r\n\r\nbody\r\n.\r\nQUIT\r\n",
+            credentials
+        );
+        let server_db = db.clone();
+        let out = crate::sign_in_notice::test_support::transcript(&script, move |stream| {
+            handle_session(stream, session, client, passwords, server_db, None, true)
+        })
+        .await;
+        assert!(out.contains("\r\n250 OK queued\r\n"), "{:?}", out);
+        let rows = db.outbox_list_pending().unwrap();
+        assert_eq!(rows.len(), 1);
+        let parsed = mail_parser::MessageParser::default().parse(&rows[0].raw_mime).unwrap();
+        assert!(parsed.message_id().is_some_and(|id| id.ends_with("@aster.test")));
+        assert_eq!(parsed.subject(), Some("queued"));
+        drop(tls);
+        drop(dir);
+    }
+
+    async fn smtp_transcript(script: &str, with_tls: bool) -> String {
+        let crate::sign_in_notice::test_support::Fixture { session, db, client, passwords, tls, dir } =
+            crate::sign_in_notice::test_support::fixture();
+        let tls = with_tls.then_some(tls);
+        let out = crate::sign_in_notice::test_support::transcript(script, move |stream| {
+            handle_session(stream, session, client, passwords, db, tls, true)
+        })
+        .await;
+        drop(dir);
+        out
+    }
+
+    #[tokio::test]
+    async fn auth_without_tls_explains_the_fix_and_is_recorded() {
+        let _guard = crate::sign_in_notice::test_support::test_lock();
+        crate::sign_in_notice::dismiss_insecure(u64::MAX);
+        let out = smtp_transcript("EHLO client\r\nAUTH PLAIN AHRlc3RlcgB4\r\nQUIT\r\n", true).await;
+        assert!(
+            out.contains("\r\n538 5.7.11 Turn on SSL/TLS for this account in your mail app, then try again\r\n"),
+            "{:?}",
+            out
+        );
+        assert_eq!(
+            crate::sign_in_notice::last_insecure().map(|l| l.protocol),
+            Some("smtp")
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_binds_the_app_password_to_the_account_address() {
+        let _guard = crate::sign_in_notice::test_support::test_lock();
+        let plain = |name: &str| {
+            base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                format!("\0{}\0{}", name, crate::sign_in_notice::test_support::APP_PASSWORD),
+            )
+        };
+        let out = smtp_transcript(
+            &format!("EHLO client\r\nAUTH PLAIN {}\r\nQUIT\r\n", plain("stranger@aster.test")),
+            false,
+        )
+        .await;
+        assert!(out.contains("\r\n535 5.7.8 "), "{:?}", out);
+        assert!(!out.contains("\r\n235 "), "{:?}", out);
+        let out = smtp_transcript(
+            &format!("EHLO client\r\nAUTH PLAIN {}\r\nQUIT\r\n", plain("Tester@Aster.Test")),
+            false,
+        )
+        .await;
+        assert!(out.contains("\r\n235 "), "{:?}", out);
+        let b64 = |s: &str| base64::Engine::encode(&base64::engine::general_purpose::STANDARD, s);
+        let out = smtp_transcript(
+            &format!(
+                "EHLO client\r\nAUTH LOGIN\r\n{}\r\n{}\r\nQUIT\r\n",
+                b64("stranger@aster.test"),
+                b64(crate::sign_in_notice::test_support::APP_PASSWORD)
+            ),
+            false,
+        )
+        .await;
+        assert!(out.contains("\r\n535 5.7.8 "), "{:?}", out);
+        let out = smtp_transcript(
+            &format!(
+                "EHLO client\r\nAUTH LOGIN\r\n{}\r\n{}\r\nQUIT\r\n",
+                b64("tester@aster.test"),
+                b64(crate::sign_in_notice::test_support::APP_PASSWORD)
+            ),
+            false,
+        )
+        .await;
+        assert!(out.contains("\r\n235 "), "{:?}", out);
+    }
+
+    #[tokio::test]
+    async fn a_wrong_password_points_at_the_app_password_in_bridge() {
+        let out = smtp_transcript("EHLO client\r\nAUTH PLAIN AHRlc3RlcgB3cm9uZw==\r\nQUIT\r\n", false).await;
+        assert!(
+            out.contains("\r\n535 5.7.8 Sign-in failed. Use the username and app password shown in Aster Bridge\r\n"),
+            "{:?}",
+            out
+        );
+    }
+
+    #[test]
+    fn server_5xx_codes_are_transient() {
+        for code in ["500", "502", "503", "504"] {
+            let e = BridgeError::Api(format!("{} upstream broke", code));
+            assert!(is_transient_send_error(&e), "{} should be transient", code);
+        }
+    }
+
+    #[test]
+    fn timeout_and_rate_limit_are_transient() {
+        assert!(is_transient_send_error(&BridgeError::Api("408 request timeout".into())));
+        assert!(is_transient_send_error(&BridgeError::Api("429 too many requests".into())));
+    }
+
+    #[test]
+    fn unauthorized_401_is_permanent() {
+        let e = BridgeError::Api("401 unauthorized".into());
+        assert!(!is_transient_send_error(&e));
+    }
+
+    #[test]
+    fn other_4xx_codes_are_permanent() {
+        for code in ["400", "403", "404", "422"] {
+            let e = BridgeError::Api(format!("{} client error", code));
+            assert!(!is_transient_send_error(&e), "{} should be permanent", code);
+        }
+    }
+
+    #[test]
+    fn non_api_non_io_errors_are_permanent() {
+        assert!(!is_transient_send_error(&BridgeError::Auth("nope".into())));
+        assert!(!is_transient_send_error(&BridgeError::Smtp("bad".into())));
+        assert!(!is_transient_send_error(&BridgeError::PlanUpgradeRequired("upgrade".into())));
+        assert!(!is_transient_send_error(&BridgeError::PlanLimit("limit".into())));
+        assert!(!is_transient_send_error(&BridgeError::Crypto("x".into())));
+        assert!(!is_transient_send_error(&BridgeError::Database("x".into())));
+        assert!(!is_transient_send_error(&BridgeError::Config("x".into())));
+    }
+
+    #[test]
+    fn api_code_must_be_a_prefix_not_substring() {
+        let e = BridgeError::Api("error 500 happened".into());
+        assert!(!is_transient_send_error(&e));
+    }
+
+    #[test]
+    fn empty_api_message_is_permanent() {
+        assert!(!is_transient_send_error(&BridgeError::Api(String::new())));
+    }
+
+    #[test]
+    fn extract_addr_angle_brackets() {
+        assert_eq!(extract_addr("<alice@example.com>"), "alice@example.com");
+        assert_eq!(extract_addr("  <bob@x.org> "), "bob@x.org");
+    }
+
+    #[test]
+    fn extract_addr_display_name_and_angle() {
+        assert_eq!(extract_addr("Alice <alice@example.com>"), "alice@example.com");
+    }
+
+    #[test]
+    fn extract_addr_bare_address() {
+        assert_eq!(extract_addr("carol@example.com"), "carol@example.com");
+        assert_eq!(extract_addr("  dave@x.org  extra"), "dave@x.org");
+    }
+
+    #[test]
+    fn extract_addr_empty_angle_pair() {
+        assert_eq!(extract_addr("<>"), "");
+    }
+
+    #[test]
+    fn extract_addr_empty_input() {
+        assert_eq!(extract_addr(""), "");
+        assert_eq!(extract_addr("   "), "");
+    }
+
+    #[test]
+    fn extract_addr_inner_trimmed() {
+        assert_eq!(extract_addr("<  spaced@x.org  >"), "spaced@x.org");
+    }
+
+    #[test]
+    fn find_ci_prefix_basic() {
+        assert_eq!(find_ci_prefix("FROM:<a@b>", "FROM:"), Some(0));
+        assert_eq!(find_ci_prefix("from:<a@b>", "FROM:"), Some(0));
+        assert_eq!(find_ci_prefix("  TO:<a@b>", "TO:"), Some(2));
+    }
+
+    #[test]
+    fn find_ci_prefix_not_found() {
+        assert_eq!(find_ci_prefix("RCPT", "TO:"), None);
+        assert_eq!(find_ci_prefix("", "TO:"), None);
+    }
+
+    #[test]
+    fn find_ci_prefix_empty_needle() {
+        assert_eq!(find_ci_prefix("anything", ""), None);
+    }
+
+    #[test]
+    fn find_ci_prefix_needle_longer_than_haystack() {
+        assert_eq!(find_ci_prefix("ab", "abcdef"), None);
+    }
+
+    #[test]
+    fn mail_from_argument_parsing() {
+        let args = "FROM:<sender@aster.test> SIZE=100";
+        let start = find_ci_prefix(args, "FROM:").unwrap();
+        let addr = extract_addr(&args[start + 5..]);
+        assert_eq!(addr, "sender@aster.test");
+    }
+
+    #[test]
+    fn rcpt_to_argument_parsing() {
+        let args = "TO:<rcpt@aster.test>";
+        let start = find_ci_prefix(args, "TO:").unwrap();
+        let addr = extract_addr(&args[start + 3..]);
+        assert_eq!(addr, "rcpt@aster.test");
+    }
+
+    #[test]
+    fn mail_from_empty_address_is_extractable_as_empty() {
+        let args = "FROM:<>";
+        let start = find_ci_prefix(args, "FROM:").unwrap();
+        let addr = extract_addr(&args[start + 5..]);
+        assert_eq!(addr, "");
+    }
+
+    #[test]
+    fn line_length_limits_are_distinct() {
+        assert!(MAX_DATA_LINE_LENGTH > MAX_LINE_LENGTH);
+        assert_eq!(MAX_LINE_LENGTH, 998);
+    }
+
+    #[tokio::test]
+    async fn read_line_bytes_reads_single_line() {
+        let data = b"hello world\r\n".to_vec();
+        let mut reader = BufReader::new(&data[..]);
+        let mut out = Vec::new();
+        let n = read_line_bytes(&mut reader, &mut out, MAX_LINE_LENGTH).await.unwrap();
+        assert_eq!(n, data.len());
+        assert_eq!(out, data);
+    }
+
+    #[tokio::test]
+    async fn read_line_bytes_rejects_overlong_line() {
+        let mut data = vec![b'a'; MAX_LINE_LENGTH + 5];
+        data.push(b'\n');
+        let mut reader = BufReader::new(&data[..]);
+        let mut out = Vec::new();
+        let err = read_line_bytes(&mut reader, &mut out, MAX_LINE_LENGTH).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn read_line_bytes_empty_input_returns_zero() {
+        let data: Vec<u8> = Vec::new();
+        let mut reader = BufReader::new(&data[..]);
+        let mut out = Vec::new();
+        let n = read_line_bytes(&mut reader, &mut out, MAX_LINE_LENGTH).await.unwrap();
+        assert_eq!(n, 0);
+    }
+
+    const ATTACHED_RAW: &[u8] = concat!(
+        "From: sender@aster.test\r\n",
+        "To: rcpt@example.com\r\n",
+        "Subject: with files\r\n",
+        "MIME-Version: 1.0\r\n",
+        "Content-Type: multipart/mixed; boundary=\"OUTER\"\r\n",
+        "\r\n",
+        "--OUTER\r\n",
+        "Content-Type: multipart/related; boundary=\"INNER\"\r\n",
+        "\r\n",
+        "--INNER\r\n",
+        "Content-Type: text/html; charset=utf-8\r\n",
+        "\r\n",
+        "<p>see <img src=\"cid:pic@aster\"></p>\r\n",
+        "--INNER\r\n",
+        "Content-Type: image/png; name=\"pic.png\"\r\n",
+        "Content-ID: <pic@aster>\r\n",
+        "Content-Disposition: inline; filename=\"pic.png\"\r\n",
+        "Content-Transfer-Encoding: base64\r\n",
+        "\r\n",
+        "iVBORw0=\r\n",
+        "--INNER--\r\n",
+        "--OUTER\r\n",
+        "Content-Type: application/pdf; name=\"report.pdf\"\r\n",
+        "Content-Disposition: attachment; filename=\"report.pdf\"\r\n",
+        "Content-Transfer-Encoding: base64\r\n",
+        "\r\n",
+        "aGVsbG8gcGRm\r\n",
+        "--OUTER--\r\n"
+    )
+    .as_bytes();
+
+    fn open_send_attachment(value: &serde_json::Value) -> (Vec<u8>, serde_json::Value) {
+        use aes_gcm::aead::Aead;
+        use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine as _;
+        let meta_bytes = STANDARD
+            .decode(value["recipient_encrypted_meta"].as_str().unwrap())
+            .unwrap();
+        let meta: serde_json::Value = serde_json::from_slice(&meta_bytes).unwrap();
+        let key = STANDARD.decode(meta["session_key"].as_str().unwrap()).unwrap();
+        let nonce = STANDARD.decode(value["data_nonce"].as_str().unwrap()).unwrap();
+        let ct = STANDARD.decode(value["encrypted_data"].as_str().unwrap()).unwrap();
+        let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+        (cipher.decrypt(Nonce::from_slice(&nonce), ct.as_ref()).unwrap(), meta)
+    }
+
+    #[test]
+    fn build_send_payload_carries_sealed_attachments() {
+        let recipients = vec!["rcpt@example.com".to_string()];
+        let payload = build_send_payload(
+            ATTACHED_RAW,
+            Some("sender@aster.test"),
+            &recipients,
+            "sender@aster.test",
+            None,
+            b"vault-pass",
+        )
+        .unwrap();
+        assert_eq!(payload["is_html"], true);
+        assert!(payload["body"].as_str().unwrap().contains("cid:pic@aster"));
+        let list = payload["attachments"].as_array().unwrap();
+        assert_eq!(list.len(), 2);
+        for entry in list {
+            for key in [
+                "encrypted_data",
+                "data_nonce",
+                "sender_encrypted_meta",
+                "sender_meta_nonce",
+                "recipient_encrypted_meta",
+            ] {
+                assert!(entry[key].is_string(), "missing {}", key);
+            }
+        }
+        let opened: Vec<(Vec<u8>, serde_json::Value)> =
+            list.iter().map(open_send_attachment).collect();
+        let pdf = opened
+            .iter()
+            .find(|(_, m)| m["filename"] == "report.pdf")
+            .unwrap();
+        assert_eq!(pdf.0, b"hello pdf");
+        assert_eq!(pdf.1["content_type"], "application/pdf");
+        assert_eq!(pdf.1["is_inline"], false);
+        let pic = opened
+            .iter()
+            .find(|(_, m)| m["filename"] == "pic.png")
+            .unwrap();
+        assert_eq!(pic.0, b"\x89PNG\r");
+        assert_eq!(pic.1["content_id"], "pic@aster");
+        assert_eq!(pic.1["is_inline"], true);
+    }
+
+    #[test]
+    fn build_send_payload_omits_attachments_key_without_parts() {
+        let raw = b"From: sender@aster.test\r\nTo: rcpt@example.com\r\nSubject: hi\r\n\r\nbody\r\n";
+        let recipients = vec!["rcpt@example.com".to_string()];
+        let payload = build_send_payload(raw, Some("sender@aster.test"), &recipients, "sender@aster.test", None, b"pass").unwrap();
+        assert!(payload.get("attachments").is_none());
+    }
+
+    #[test]
+    fn build_send_payload_sender_copy_meta_opens_with_the_vault_passphrase() {
+        let recipients = vec!["rcpt@example.com".to_string()];
+        let payload = build_send_payload(
+            ATTACHED_RAW,
+            Some("sender@aster.test"),
+            &recipients,
+            "sender@aster.test",
+            None,
+            b"vault-pass",
+        )
+        .unwrap();
+        let entry = &payload["attachments"][0];
+        let row = crate::api_client::AttachmentResponse {
+            id: "att-0".to_string(),
+            mail_item_id: "sent-1".to_string(),
+            encrypted_data: entry["encrypted_data"].as_str().unwrap().to_string(),
+            data_nonce: entry["data_nonce"].as_str().unwrap().to_string(),
+            encrypted_meta: entry["sender_encrypted_meta"].as_str().unwrap().to_string(),
+            meta_nonce: entry["sender_meta_nonce"].as_str().unwrap().to_string(),
+            size_bytes: 0,
+            seq_num: 0,
+            created_at: None,
+        };
+        let opened = crate::crypto::attachment::decrypt_attachment(&row, None, b"vault-pass", None, &[]).unwrap();
+        assert!(!opened.data.is_empty());
+        assert!(crate::crypto::attachment::decrypt_attachment(&row, None, b"wrong", None, &[]).is_err());
+    }
+
+    #[tokio::test]
+    async fn build_send_payload_blocking_matches_the_sync_builder() {
+        let recipients = vec!["rcpt@example.com".to_string()];
+        let payload = build_send_payload_blocking(
+            ATTACHED_RAW.to_vec(),
+            Some("sender@aster.test".to_string()),
+            recipients,
+            "sender@aster.test".to_string(),
+            None,
+            zeroize::Zeroizing::new(b"pass".to_vec()),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(payload["attachments"].as_array().unwrap().len(), 2);
+        assert_eq!(payload["client_source"], "bridge");
+    }
+
+    async fn blocking_payload(seal_to_identity: bool, key: &str) -> serde_json::Value {
+        build_send_payload_blocking(
+            ATTACHED_RAW.to_vec(),
+            Some("sender@aster.test".to_string()),
+            vec!["rcpt@example.com".to_string()],
+            "sender@aster.test".to_string(),
+            None,
+            zeroize::Zeroizing::new(b"correct horse battery staple".to_vec()),
+            Some(zeroize::Zeroizing::new(key.to_string())),
+            seal_to_identity,
+        )
+        .await
+        .unwrap()
+    }
+
+    fn sender_metas(payload: &serde_json::Value) -> Vec<(Vec<u8>, Vec<u8>)> {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        payload["attachments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| {
+                (
+                    b64.decode(a["sender_encrypted_meta"].as_str().unwrap()).unwrap(),
+                    b64.decode(a["sender_meta_nonce"].as_str().unwrap()).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn build_send_payload_blocking_seals_attachment_meta_when_enabled() {
+        let key = crate::crypto::account_key::tests::protected_keypair("correct horse battery staple")
+            .to_armored()
+            .unwrap();
+        let metas = sender_metas(&blocking_payload(true, &key).await);
+        assert_eq!(metas.len(), 2);
+        for (meta, nonce) in metas {
+            assert!(meta.starts_with(b"-----BEGIN PGP MESSAGE-----"));
+            assert_eq!(nonce, vec![0u8; 12]);
+        }
+    }
+
+    #[tokio::test]
+    async fn build_send_payload_blocking_keeps_legacy_attachment_meta_when_disabled() {
+        let key = crate::crypto::account_key::tests::protected_keypair("correct horse battery staple")
+            .to_armored()
+            .unwrap();
+        for (meta, nonce) in sender_metas(&blocking_payload(false, &key).await) {
+            assert!(!meta.starts_with(b"-----BEGIN PGP MESSAGE-----"));
+            assert!(nonce.iter().any(|b| *b != 0));
+        }
+    }
+
+    #[test]
+    fn build_send_payload_uses_envelope_recipients_as_bcc_when_no_headers() {
+        let raw = b"From: sender@aster.test\r\nSubject: hi\r\n\r\nbody here\r\n";
+        let recipients = vec!["rcpt@example.com".to_string()];
+        let payload = build_send_payload(raw, Some("sender@aster.test"), &recipients, "sender@aster.test", None, b"pass").unwrap();
+        assert_eq!(payload["subject"], "hi");
+        assert_eq!(payload["to"], serde_json::json!(["sender@aster.test"]));
+        assert_eq!(payload["bcc"], serde_json::json!(["rcpt@example.com"]));
+        assert_eq!(payload["client_source"], "bridge");
+        assert_eq!(payload["is_e2e_encrypted"], false);
+    }
+
+    #[test]
+    fn build_send_payload_prefers_header_to() {
+        let raw = b"From: sender@aster.test\r\nTo: named@example.com\r\nSubject: hi\r\n\r\nbody\r\n";
+        let recipients = vec!["named@example.com".to_string()];
+        let payload = build_send_payload(raw, Some("sender@aster.test"), &recipients, "sender@aster.test", None, b"pass").unwrap();
+        assert_eq!(payload["to"][0], "named@example.com");
+        assert!(payload["bcc"].is_null());
+    }
+
+    #[test]
+    fn build_send_payload_envelope_only_recipient_added_as_bcc() {
+        let raw = b"From: sender@aster.test\r\nTo: visible@example.com\r\nSubject: hi\r\n\r\nbody\r\n";
+        let recipients = vec!["visible@example.com".to_string(), "hidden@example.com".to_string()];
+        let payload = build_send_payload(raw, Some("sender@aster.test"), &recipients, "sender@aster.test", None, b"pass").unwrap();
+        assert_eq!(payload["bcc"][0], "hidden@example.com");
+    }
+
+    #[test]
+    fn build_send_payload_drops_header_recipients_not_in_envelope() {
+        let raw = b"From: sender@aster.test\r\nTo: Kept@Example.com, header-only@example.com\r\nCc: cc-only@example.com\r\nSubject: hi\r\n\r\nbody\r\n";
+        let recipients = vec!["kept@example.com".to_string()];
+        let payload = build_send_payload(raw, Some("sender@aster.test"), &recipients, "sender@aster.test", None, b"pass").unwrap();
+        assert_eq!(payload["to"], serde_json::json!(["Kept@Example.com"]));
+        assert!(payload["cc"].is_null());
+        assert!(payload["bcc"].is_null());
+    }
+
+    #[test]
+    fn build_send_payload_keeps_blind_recipients_out_of_to() {
+        let raw = b"From: sender@aster.test\r\nTo: list@example.com\r\nSubject: hi\r\n\r\nbody\r\n";
+        let recipients = vec!["alice@example.com".to_string(), "bob@example.com".to_string()];
+        let payload = build_send_payload(raw, Some("sender@aster.test"), &recipients, "sender@aster.test", None, b"pass").unwrap();
+        assert_eq!(payload["to"], serde_json::json!(["sender@aster.test"]));
+        assert!(payload["cc"].is_null());
+        assert_eq!(payload["bcc"], serde_json::json!(["alice@example.com", "bob@example.com"]));
+    }
+
+    #[test]
+    fn build_send_payload_does_not_repeat_the_sender_in_bcc() {
+        let raw = b"From: sender@aster.test\r\nTo: undisclosed-recipients:;\r\nSubject: hi\r\n\r\nbody\r\n";
+        let recipients = vec!["alice@example.com".to_string(), "Sender@aster.test".to_string()];
+        let payload = build_send_payload(raw, Some("sender@aster.test"), &recipients, "sender@aster.test", None, b"pass").unwrap();
+        assert_eq!(payload["to"], serde_json::json!(["sender@aster.test"]));
+        assert_eq!(payload["bcc"], serde_json::json!(["alice@example.com"]));
+    }
+
+    #[test]
+    fn build_send_payload_keeps_three_blind_recipients_out_of_to_and_cc() {
+        let raw = b"From: sender@aster.test\r\nTo: undisclosed-recipients:;\r\nSubject: hi\r\n\r\nbody\r\n";
+        let recipients = vec![
+            "alice@example.com".to_string(),
+            "bob@example.com".to_string(),
+            "carol@example.com".to_string(),
+        ];
+        let payload = build_send_payload(raw, Some("sender@aster.test"), &recipients, "sender@aster.test", None, b"pass").unwrap();
+        assert_eq!(payload["to"], serde_json::json!(["sender@aster.test"]));
+        assert!(payload["cc"].is_null());
+        assert_eq!(
+            payload["bcc"],
+            serde_json::json!(["alice@example.com", "bob@example.com", "carol@example.com"])
+        );
+    }
+
+    #[test]
+    fn build_send_payload_keeps_blind_recipients_out_of_to_when_only_cc_is_set() {
+        let raw = b"From: sender@aster.test\r\nCc: cc@example.com\r\nSubject: hi\r\n\r\nbody\r\n";
+        let recipients = vec!["cc@example.com".to_string(), "hidden@example.com".to_string()];
+        let payload = build_send_payload(raw, Some("sender@aster.test"), &recipients, "sender@aster.test", None, b"pass").unwrap();
+        assert_eq!(payload["to"], serde_json::json!(["sender@aster.test"]));
+        assert_eq!(payload["cc"], serde_json::json!(["cc@example.com"]));
+        assert_eq!(payload["bcc"], serde_json::json!(["hidden@example.com"]));
+    }
+
+    #[test]
+    fn build_send_payload_never_lists_a_blind_recipient_as_visible() {
+        let headers: [&[u8]; 5] = [
+            b"",
+            b"To: undisclosed-recipients:;\r\n",
+            b"To: visible@example.com\r\n",
+            b"Cc: visible@example.com\r\n",
+            b"To: visible@example.com\r\nBcc: hidden@example.com\r\n",
+        ];
+        for header in headers {
+            let mut raw = b"From: sender@aster.test\r\n".to_vec();
+            raw.extend_from_slice(header);
+            raw.extend_from_slice(b"Subject: hi\r\n\r\nbody\r\n");
+            let recipients = vec!["visible@example.com".to_string(), "hidden@example.com".to_string()];
+            let payload = build_send_payload(&raw, Some("sender@aster.test"), &recipients, "sender@aster.test", None, b"pass").unwrap();
+            for field in ["to", "cc"] {
+                let visible = payload[field].as_array().cloned().unwrap_or_default();
+                assert!(
+                    !visible.iter().any(|a| a == "hidden@example.com"),
+                    "{} lists the blind recipient for headers {:?}",
+                    field,
+                    String::from_utf8_lossy(header)
+                );
+            }
+            let blind = payload["bcc"].as_array().cloned().unwrap_or_default();
+            assert!(blind.iter().any(|a| a == "hidden@example.com"));
+        }
+    }
+
+    #[test]
+    fn build_send_payload_keeps_header_cc_that_is_in_envelope() {
+        let raw = b"From: sender@aster.test\r\nTo: to@example.com, stale@example.com\r\nCc: cc@example.com, old-cc@example.com\r\nSubject: hi\r\n\r\nbody\r\n";
+        let recipients = vec!["to@example.com".to_string(), "CC@example.com".to_string()];
+        let payload = build_send_payload(raw, Some("sender@aster.test"), &recipients, "sender@aster.test", None, b"pass").unwrap();
+        assert_eq!(payload["to"], serde_json::json!(["to@example.com"]));
+        assert_eq!(payload["cc"], serde_json::json!(["cc@example.com"]));
+        assert!(payload["bcc"].is_null());
+    }
+
+    const PATCH_RAW: &[u8] = b"From: Dev Person <dev@example.com>
+To: rcpt@example.com
+Subject: [PATCH] fix parser
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+From: Dev Person <dev@example.com>
+
+Fix it & more.
+---
+ src/lib.rs | 2 +-
+
+diff --git a/src/lib.rs b/src/lib.rs
+@@ -1,3 +1,3 @@
+ fn main() {
+-    let a = 1 &lt; 2;
++    let a = 1 < 2 && b > c;
+ }
+-- 
+2.43.0
+";
+
+    fn payload_for(raw: &[u8]) -> serde_json::Value {
+        let recipients = vec!["rcpt@example.com".to_string()];
+        build_send_payload(raw, Some("sender@aster.test"), &recipients, "sender@aster.test", None, b"pass").unwrap()
+    }
+
+    #[test]
+    fn plain_text_patch_is_sent_as_an_escaped_fragment() {
+        let payload = payload_for(PATCH_RAW);
+        let body = payload["body"].as_str().unwrap();
+        assert!(!body.to_ascii_lowercase().contains("<html"));
+        assert!(!body.to_ascii_lowercase().contains("<body"));
+        assert!(body.starts_with("<div style=\"white-space: pre-wrap\">From: Dev Person &lt;dev@example.com&gt;<br>"));
+        assert!(body.contains("Fix it &amp; more."));
+        assert!(body.contains("<br> fn main() {<br>-    let a = 1 &amp;lt; 2;<br>+    let a = 1 &lt; 2 &amp;&amp; b &gt; c;<br> }<br>-- <br>2.43.0"));
+        assert_eq!(payload["is_html"], true);
+        assert_eq!(payload["body_html"], payload["body"]);
+    }
+
+    #[test]
+    fn real_html_part_is_still_sent_as_html() {
+        let raw = b"From: sender@aster.test
+To: rcpt@example.com
+Subject: hi
+MIME-Version: 1.0
+Content-Type: multipart/alternative; boundary=\"a1\"
+
+--a1
+Content-Type: text/plain
+
+plain
+--a1
+Content-Type: text/html
+
+<p>rich</p>
+--a1--
+";
+        let payload = payload_for(raw);
+        assert!(payload["body"].as_str().unwrap().contains("<p>rich</p>"));
+        assert_eq!(payload["is_html"], true);
+    }
+
+    #[test]
+    fn inline_pgp_message_body_keeps_its_lines() {
+        let raw = b"From: sender@aster.test
+To: rcpt@example.com
+Subject: enc
+Content-Type: text/plain; charset=us-ascii
+
+-----BEGIN PGP MESSAGE-----
+
+hQEMA1234567890ABCDEF
+=AbCd
+-----END PGP MESSAGE-----
+";
+        let payload = payload_for(raw);
+        let body = payload["body"].as_str().unwrap();
+        assert!(body.contains("-----BEGIN PGP MESSAGE-----<br><br>hQEMA1234567890ABCDEF<br>=AbCd<br>-----END PGP MESSAGE-----"));
+        assert!(payload.get("attachments").is_none());
+    }
+
+    #[test]
+    fn pgp_mime_submission_sends_the_armor_as_the_body() {
+        let raw = b"From: sender@aster.test
+To: rcpt@example.com
+Subject: enc
+MIME-Version: 1.0
+Content-Type: multipart/encrypted; protocol=\"application/pgp-encrypted\"; boundary=\"e1\"
+
+--e1
+Content-Type: application/pgp-encrypted
+
+Version: 1
+
+--e1
+Content-Type: application/octet-stream; name=\"encrypted.asc\"
+Content-Disposition: inline; filename=\"encrypted.asc\"
+
+-----BEGIN PGP MESSAGE-----
+
+hQEMA1234567890ABCDEF
+-----END PGP MESSAGE-----
+
+--e1--
+";
+        let payload = payload_for(raw);
+        let body = payload["body"].as_str().unwrap();
+        assert!(body.contains("-----BEGIN PGP MESSAGE-----<br><br>hQEMA1234567890ABCDEF<br>-----END PGP MESSAGE-----"));
+        assert_eq!(payload["is_html"], true);
+        assert!(payload.get("attachments").is_none());
+    }
+
+    #[test]
+    fn pgp_signed_submission_keeps_the_text_body() {
+        let raw = b"From: sender@aster.test
+To: rcpt@example.com
+Subject: signed
+MIME-Version: 1.0
+Content-Type: multipart/signed; micalg=pgp-sha256; protocol=\"application/pgp-signature\"; boundary=\"s1\"
+
+--s1
+Content-Type: text/plain; charset=UTF-8
+
+signed hello
+  indented
+
+--s1
+Content-Type: application/pgp-signature; name=\"signature.asc\"
+
+-----BEGIN PGP SIGNATURE-----
+
+iQEz
+-----END PGP SIGNATURE-----
+
+--s1--
+";
+        let payload = payload_for(raw);
+        let body = payload["body"].as_str().unwrap();
+        assert!(body.contains("signed hello<br>  indented"));
+        assert!(!body.contains("BEGIN PGP SIGNATURE"));
+    }
+
+    #[test]
+    fn build_send_payload_body_is_never_empty() {
+        let raw = b"From: sender@aster.test\r\nSubject: hi\r\n\r\n";
+        let recipients = vec!["rcpt@example.com".to_string()];
+        let payload = build_send_payload(raw, Some("sender@aster.test"), &recipients, "sender@aster.test", None, b"pass").unwrap();
+        let body = payload["body"].as_str().unwrap();
+        assert!(!body.is_empty());
+    }
+
+    #[test]
+    fn build_send_payload_invalid_message_errors() {
+        let raw: &[u8] = b"";
+        let recipients = vec!["rcpt@example.com".to_string()];
+        let result = build_send_payload(raw, None, &recipients, "sender@aster.test", None, b"pass");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn build_send_payload_attaches_alias_hash_for_non_primary_identity() {
+        use crate::auth::session::{SendIdentity, SendIdentityKind};
+        let raw = b"From: alias@example.com\r\nTo: rcpt@example.com\r\nSubject: hi\r\n\r\nbody\r\n";
+        let recipients = vec!["rcpt@example.com".to_string()];
+        let identity = SendIdentity {
+            address: "alias@example.com".to_string(),
+            auth_hash_b64: Some("AAAA".to_string()),
+            display_name: Some("Sales".to_string()),
+            kind: SendIdentityKind::Alias,
+            enabled: true,
+            sender_id: "alias-1".to_string(),
+        };
+        let payload = build_send_payload(
+            raw,
+            Some("alias@example.com"),
+            &recipients,
+            "primary@aster.test",
+            Some(&identity),
+            b"pass",
+        )
+        .unwrap();
+        assert_eq!(payload["sender_email"], "alias@example.com");
+        assert_eq!(payload["sender_alias_hash"], "AAAA");
+        assert_eq!(payload["sender_display_name"], "Sales");
+    }
+
+    fn header_fixture() -> crate::sign_in_notice::test_support::Fixture {
+        use crate::auth::session::{SendIdentity, SendIdentityKind};
+        let fixture = crate::sign_in_notice::test_support::fixture();
+        let identity = |address: &str, kind, enabled| SendIdentity {
+            address: address.to_string(),
+            auth_hash_b64: Some("AAAA".to_string()),
+            display_name: None,
+            kind,
+            enabled,
+            sender_id: address.to_string(),
+        };
+        fixture.session.try_write().unwrap().send_identities = vec![
+            identity("tester@aster.test", SendIdentityKind::Primary, true),
+            identity("alias@aster.test", SendIdentityKind::Alias, true),
+            identity("other@aster.test", SendIdentityKind::Alias, true),
+            identity("off@aster.test", SendIdentityKind::Alias, false),
+            identity("me@mydomain.example", SendIdentityKind::CustomDomain, true),
+        ];
+        fixture
+    }
+
+    async fn pick(fixture: &crate::sign_in_notice::test_support::Fixture, header: &str, envelope: Option<&str>) -> Option<String> {
+        let raw = format!("From: Someone <{}>\r\nTo: rcpt@example.com\r\nSubject: hi\r\n\r\nbody\r\n", header);
+        prefer_header_identity(raw.as_bytes(), envelope.map(str::to_string), &fixture.session, &fixture.client).await
+    }
+
+    #[test]
+    fn header_from_address_needs_exactly_one_address() {
+        assert_eq!(header_from_address(b"From: A <a@x.test>\r\n\r\nb").as_deref(), Some("a@x.test"));
+        assert_eq!(header_from_address(b"From: a@x.test, b@x.test\r\n\r\nb"), None);
+        assert_eq!(header_from_address(b"Subject: none\r\n\r\nb"), None);
+    }
+
+    #[tokio::test]
+    async fn header_alias_wins_over_a_primary_envelope() {
+        let f = header_fixture();
+        assert_eq!(pick(&f, "alias@aster.test", Some("tester@aster.test")).await.as_deref(), Some("alias@aster.test"));
+        assert_eq!(pick(&f, "ALIAS@aster.test", Some("Tester@Aster.test")).await.as_deref(), Some("ALIAS@aster.test"));
+        assert_eq!(pick(&f, "me@mydomain.example", None).await.as_deref(), Some("me@mydomain.example"));
+        assert_eq!(pick(&f, "alias@aster.test", Some("")).await.as_deref(), Some("alias@aster.test"));
+    }
+
+    #[tokio::test]
+    async fn envelope_is_kept_when_the_header_cannot_send() {
+        let f = header_fixture();
+        assert_eq!(pick(&f, "alias@aster.test", Some("other@aster.test")).await.as_deref(), Some("other@aster.test"));
+        assert_eq!(pick(&f, "tester@aster.test", Some("tester@aster.test")).await.as_deref(), Some("tester@aster.test"));
+        assert_eq!(pick(&f, "off@aster.test", Some("tester@aster.test")).await.as_deref(), Some("tester@aster.test"));
+        assert_eq!(pick(&f, "stranger@example.com", Some("tester@aster.test")).await.as_deref(), Some("tester@aster.test"));
+        assert_eq!(pick(&f, "stranger@example.com", None).await, None);
+    }
+
+    #[test]
+    fn bcc_only_send_from_a_custom_domain_is_not_split_as_external() {
+        use crate::auth::session::{SendIdentity, SendIdentityKind};
+        let raw = b"From: me@mydomain.example\r\nSubject: hi\r\n\r\nbody\r\n";
+        let recipients = vec!["friend@astermail.org".to_string()];
+        let identity = SendIdentity {
+            address: "me@mydomain.example".to_string(),
+            auth_hash_b64: Some("AAAA".to_string()),
+            display_name: None,
+            kind: SendIdentityKind::CustomDomain,
+            enabled: true,
+            sender_id: "domain-1".to_string(),
+        };
+        let payload = build_send_payload(
+            raw,
+            Some("me@mydomain.example"),
+            &recipients,
+            "primary@astermail.org",
+            Some(&identity),
+            b"pass",
+        )
+        .unwrap();
+        assert_eq!(payload["to"], serde_json::json!([]));
+        assert_eq!(payload["bcc"], serde_json::json!(["friend@astermail.org"]));
+        let split = crate::crypto::internal_send::split_recipients(&payload);
+        assert!(!split.has_external);
+        assert_eq!(split.internal, vec!["friend@astermail.org".to_string()]);
+
+        let mixed = vec!["friend@astermail.org".to_string(), "pal@example.com".to_string()];
+        let payload = build_send_payload(
+            raw,
+            Some("me@mydomain.example"),
+            &mixed,
+            "primary@astermail.org",
+            Some(&identity),
+            b"pass",
+        )
+        .unwrap();
+        assert_eq!(payload["to"], serde_json::json!(["me@mydomain.example"]));
+        assert!(crate::crypto::internal_send::split_recipients(&payload).has_external);
+    }
+
+    #[test]
+    fn a_custom_domain_sender_who_addresses_themselves_keeps_a_readable_copy() {
+        use crate::auth::session::{SendIdentity, SendIdentityKind};
+        let raw = b"From: me@mydomain.example\r\nTo: me@mydomain.example\r\nSubject: hi\r\n\r\nbody\r\n";
+        let recipients = vec!["me@mydomain.example".to_string(), "friend@astermail.org".to_string()];
+        let identity = SendIdentity {
+            address: "me@mydomain.example".to_string(),
+            auth_hash_b64: Some("AAAA".to_string()),
+            display_name: None,
+            kind: SendIdentityKind::CustomDomain,
+            enabled: true,
+            sender_id: "domain-1".to_string(),
+        };
+        let payload = build_send_payload(
+            raw,
+            Some("me@mydomain.example"),
+            &recipients,
+            "primary@astermail.org",
+            Some(&identity),
+            b"pass",
+        )
+        .unwrap();
+        assert_eq!(payload["to"], serde_json::json!(["me@mydomain.example"]));
+        assert!(crate::crypto::internal_send::split_recipients(&payload).has_external);
+    }
+
+    #[test]
+    fn build_send_payload_sends_the_from_header_display_name() {
+        let raw = b"From: Ada Lovelace <primary@aster.test>\r\nTo: rcpt@example.com\r\nSubject: hi\r\n\r\nbody\r\n";
+        let recipients = vec!["rcpt@example.com".to_string()];
+        let payload = build_send_payload(
+            raw,
+            Some("primary@aster.test"),
+            &recipients,
+            "primary@aster.test",
+            None,
+            b"pass",
+        )
+        .unwrap();
+        assert_eq!(payload["sender_display_name"], "Ada Lovelace");
+    }
+
+    #[test]
+    fn build_send_payload_primary_identity_omits_alias_hash() {
+        use crate::auth::session::{SendIdentity, SendIdentityKind};
+        let raw = b"From: primary@aster.test\r\nTo: rcpt@example.com\r\nSubject: hi\r\n\r\nbody\r\n";
+        let recipients = vec!["rcpt@example.com".to_string()];
+        let identity = SendIdentity {
+            address: "primary@aster.test".to_string(),
+            auth_hash_b64: None,
+            display_name: Some("Me".to_string()),
+            kind: SendIdentityKind::Primary,
+            enabled: true,
+            sender_id: "primary".to_string(),
+        };
+        let payload = build_send_payload(
+            raw,
+            Some("primary@aster.test"),
+            &recipients,
+            "primary@aster.test",
+            Some(&identity),
+            b"pass",
+        )
+        .unwrap();
+        assert!(payload.get("sender_alias_hash").is_none());
+        assert!(payload.get("sender_display_name").is_none());
+    }
+
+    #[tokio::test]
+    async fn closing_connections_drops_an_open_session() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpStream;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::open_with_key(dir.path(), &[7u8; 32]).unwrap());
+        let passwords = Arc::new(AppPasswords::new(db.clone()));
+        let session = Arc::new(RwLock::new(Session {
+            data_kek: None,
+            user_id: uuid::Uuid::new_v4(),
+            username: "tester".to_string(),
+            email: "tester@aster.test".to_string(),
+            access_token: zeroize::Zeroizing::new("stub".to_string()),
+            refresh_token: None,
+            vault_passphrase: Vec::new(),
+            identity_key: None,
+            ratchet_identity_public: None,
+            ratchet_keys: Vec::new(),
+            inbound_keys: Vec::new(),
+            send_identities: Vec::new(),
+            default_sender_id: None,
+            account_keys: Vec::new(),
+            previous_keys: Default::default(),
+            ratchet_recovery: Default::default(),
+        }));
+        let client = Arc::new(ApiClient::new_with_base_url("http://127.0.0.1:1"));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (trigger, shutdown) = crate::shutdown::channel();
+        let listener_task = tokio::spawn(shutdown.scope(async move {
+            let _ = serve(listener, session, client, passwords, db, None).await;
+        }));
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        assert!(line.starts_with("220"), "greeting was {:?}", line);
+
+        reader.get_mut().write_all(b"EHLO client.test\r\n").await.unwrap();
+        loop {
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            assert!(line.starts_with("250"), "EHLO reply was {:?}", line);
+            if line.starts_with("250 ") {
+                break;
+            }
+        }
+
+        let mut rest = Vec::new();
+        let still_open = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            reader.read_to_end(&mut rest),
+        )
+        .await;
+        assert!(still_open.is_err(), "the session closed before the bridge stopped");
+
+        trigger.close_connections();
+        listener_task.abort();
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reader.read_to_end(&mut rest),
+        )
+        .await
+        .expect("an open SMTP session stayed open after connections were closed")
+        .ok();
+
+        reader.get_mut().write_all(b"NOOP\r\n").await.ok();
+        line.clear();
+        let after = reader.read_line(&mut line).await.unwrap_or(0);
+        assert_eq!(after, 0, "the closed session still answered {:?}", line);
+        drop(dir);
+    }
+}

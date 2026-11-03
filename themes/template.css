@@ -1,0 +1,260 @@
+/* Aster Qt theme template.
+ * Copy to <data>/themes/<id>.css, edit any token, select in Settings > Appearance.
+ * This is a token sheet, not a selector stylesheet. Every token below is honored.
+ */
+
+:root {
+  /* Identity */
+  --theme-id: my-theme;
+  --theme-name: My Theme;
+  --theme-light: false;
+
+  /* Window background */
+  --bg: #121417;
+  /* Sidebar background */
+  --sidebar: #1a1d22;
+  /* Panels and dialogs */
+  --surface: #1b1e23;
+  /* Card surface */
+  --card: #23262c;
+  /* Raised controls and selected rows */
+  --surface-strong: #2e323a;
+  /* Menus and popovers */
+  --menu: #23262c;
+  /* Text field background */
+  --input: #1b1e2322;
+  /* Hover background */
+  --hover: #2e323a2e;
+  /* Selected row background */
+  --selected: #2e323a3d;
+  /* Default border */
+  --border: #1b1e2317;
+  /* Hover and focus border */
+  --border-strong: #2e323a29;
+  /* Primary text */
+  --text: #ece7de;
+  /* Secondary text */
+  --text-2: #ebe7dedb;
+  /* Muted text and icons */
+  --muted: #ece7dea8;
+  /* Accent color */
+  --accent: #d98e5c;
+  /* Solid button background */
+  --accent-button: #d98e5c;
+  /* Accent-colored text */
+  --accent-text: #e7a97f;
+  /* Text on accent backgrounds */
+  --accent-ink: #171717;
+  /* Errors and destructive actions */
+  --danger: #d97a72;
+  /* Warnings */
+  --warning: #d9b36a;
+  /* Success state */
+  --success: #7fae83;
+  /* Text selection */
+  --selection: #d98e5c59;
+  /* Focus ring */
+  --focus: #d98e5c;
+  /* Modal scrim */
+  --overlay: #0000008c;
+  /* Shadow color */
+  --shadow: #00000040;
+  /* Unread indicator */
+  --unread-dot: #d98e5c;
+  /* Verified sender */
+  --trust-verified: #7fae83;
+  /* Unverified or changed sender */
+  --trust-warning: #d9b36a;
+  /* Dangerous or failed trust */
+  --trust-danger: #d97a72;
+  /* PGP key is present and trusted */
+  --pgp-ok: #7fae83;
+  /* PGP key is missing, expiring, or unverified */
+  --pgp-warn: #d9b36a;
+  /* Conversation thread line */
+  --thread-line: #2e323a2e;
+  /* Divider between message rows */
+  --message-divider: #343a44;
+  /* Quoted reply text */
+  --quoted-text: #ece7dea8;
+  /* HTML mail body background */
+  --html-mail-bg: #ffffff;
+  /* Signature text */
+  --signature: #ece7dea8;
+  /* UI font family */
+  --font-family: Inter;
+  /* Brand font family */
+  --font-brand: TeX Gyre Adventor;
+  /* Monospace font family */
+  --font-mono: JetBrains Mono;
+  /* Message body font family */
+  --font-mail: Inter;
+  /* Micro text */
+  --font-size-micro: 9px;
+  /* Caption text */
+  --font-size-caption: 10px;
+  /* Small text */
+  --font-size-small: 12px;
+  /* Body text */
+  --font-size-body: 14px;
+  /* Subtitle text */
+  --font-size-subtitle: 15px;
+  /* Title text */
+  --font-size-title: 16px;
+  /* Page title */
+  --font-size-page: 18px;
+  /* Large display text */
+  --font-size-large: 22px;
+  /* Hero display text */
+  --font-size-display: 32px;
+  /* HTML mail body size */
+  --font-size-html-mail: 15px;
+  /* Regular weight */
+  --font-weight-regular: 400;
+  /* Medium weight */
+  --font-weight-medium: 500;
+  /* Semibold weight */
+  --font-weight-semibold: 600;
+  /* Unread row weight */
+  --font-weight-unread: 600;
+  /* Tight line height */
+  --line-height-tight: 1.2;
+  /* Normal line height */
+  --line-height-normal: 1.35;
+  /* Relaxed line height */
+  --line-height-relaxed: 1.55;
+  /* HTML mail line height */
+  --line-height-html-mail: 1.5;
+  /* No space */
+  --space-0: 0px;
+  /* Extra small gap */
+  --space-1: 4px;
+  /* Small gap */
+  --space-2: 8px;
+  /* Snug gap */
+  --space-snug: 10px;
+  /* Medium gap */
+  --space-3: 12px;
+  /* Default gap */
+  --space-4: 16px;
+  /* Large gap */
+  --space-5: 24px;
+  /* Section gap */
+  --space-6: 32px;
+  /* Page gap */
+  --space-7: 40px;
+  /* Hero gap */
+  --space-8: 48px;
+  /* Hairline gap */
+  --space-half: 2px;
+  /* Tight gap */
+  --space-tight: 5px;
+  /* Compact gap */
+  --space-compact: 6px;
+  /* Hairline radius */
+  --radius-line: 1px;
+  /* Hairline corner */
+  --radius-hairline: 2px;
+  /* Small corner */
+  --radius-small: 3px;
+  /* Micro corner */
+  --radius-micro: 4px;
+  /* Dot corner */
+  --radius-dot: 5px;
+  /* Loose corner */
+  --radius-loose: 7px;
+  /* Badge corner */
+  --radius-badge: 9px;
+  /* Wide corner */
+  --radius-wide: 11px;
+  /* Buttons and inputs */
+  --radius-control: 8px;
+  /* Cards */
+  --radius-card: 14px;
+  /* Panels and dialogs */
+  --radius-panel: 16px;
+  /* Menus and popovers */
+  --radius-menu: 10px;
+  /* Pills and toggles */
+  --radius-pill: 999px;
+  /* Keyboard keycaps */
+  --radius-keycap: 6px;
+  /* Default border width */
+  --border-width: 1;
+  /* Emphasized border width */
+  --border-width-strong: 1.5;
+  /* Focus border width */
+  --border-width-focus: 1.5;
+  /* Small icon */
+  --icon-small: 14px;
+  /* Default icon */
+  --icon-body: 16px;
+  /* Large icon */
+  --icon-large: 20px;
+  /* Page mark */
+  --icon-page: 32px;
+  /* Default control height */
+  --control-height: 36px;
+  /* Compact control height */
+  --control-height-small: 30px;
+  /* Top bar height */
+  --topbar-height: 56px;
+  /* Status bar height */
+  --statusbar-height: 30px;
+  /* Expanded sidebar width */
+  --sidebar-width: 256px;
+  /* Message list width */
+  --list-width: 380px;
+  /* Reader content width */
+  --reader-width: 720px;
+  /* Settings navigation width */
+  --settings-nav-width: 220px;
+  /* Default dialog width */
+  --dialog-width: 480px;
+  /* Wide dialog width */
+  --dialog-width-wide: 720px;
+  /* Composer window height */
+  --composer-height: 560px;
+  /* Message row height */
+  --message-row-height: 82px;
+  /* Message row padding */
+  --message-row-padding: 10px;
+  /* Thread indentation */
+  --thread-indent: 18px;
+  /* HTML mail max width */
+  --html-mail-max-width: 720px;
+  /* Trust banner height */
+  --trust-banner-height: 34px;
+  /* Unread bar width */
+  --unread-bar-width: 3px;
+  /* Attachment chip height */
+  --attachment-chip-height: 30px;
+  /* Fast transition (ms) */
+  --motion-fast: 110ms;
+  /* Medium transition (ms) */
+  --motion-medium: 180ms;
+  /* Slow transition (ms) */
+  --motion-slow: 280ms;
+  /* Toast lifetime (ms) */
+  --motion-toast: 2400ms;
+  /* Standard easing curve */
+  --easing-standard: OutCubic;
+  /* Emphasized easing curve */
+  --easing-emphasized: OutQuint;
+  /* Fully transparent */
+  --opacity-none: 0.0;
+  /* Faint decoration */
+  --opacity-faint: 0.35;
+  /* Medium decoration */
+  --opacity-medium: 0.6;
+  /* Emphasized decoration */
+  --opacity-emphasis: 0.65;
+  /* Disabled control */
+  --opacity-disabled: 0.45;
+  /* Shadow blur radius */
+  --shadow-blur: 24;
+  /* Shadow vertical offset */
+  --shadow-offset-y: 8;
+  /* Shadow opacity */
+  --shadow-opacity: 0.25;
+}

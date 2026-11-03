@@ -1,0 +1,2615 @@
+//
+// Aster Communications Inc.
+//
+// Copyright (c) 2026 Aster Communications Inc.
+//
+// This file is part of this project.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+//
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use crate::error::{BridgeError, Result};
+
+const USER_AGENT_OS: &str = if cfg!(target_os = "windows") {
+    "Windows"
+} else if cfg!(target_os = "macos") {
+    "macOS"
+} else if cfg!(target_os = "linux") {
+    "Linux"
+} else {
+    std::env::consts::OS
+};
+const USER_AGENT: &str = concat!("AsterBridge/", env!("CARGO_PKG_VERSION"));
+
+fn user_agent() -> String {
+    format!("{} ({})", USER_AGENT, USER_AGENT_OS)
+}
+const API_BASE_URL: &str = "https://app.astermail.org/api";
+const ERR_BODY_MAX: usize = 256;
+const SEND_MAIL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(900);
+pub const ATTACHMENT_TRANSFER_TIMEOUT: std::time::Duration = SEND_MAIL_TIMEOUT;
+
+#[allow(dead_code)]
+async fn err_body(resp: reqwest::Response) -> String {
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    let truncated: String = body.chars().take(ERR_BODY_MAX).collect();
+    format!("{}: {}", status, truncated)
+}
+
+fn urlencoding_path(segment: &str) -> String {
+    percent_encoding::utf8_percent_encode(segment, percent_encoding::NON_ALPHANUMERIC).to_string()
+}
+
+async fn map_response_error(resp: reqwest::Response) -> BridgeError {
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    map_error_body(status, &body)
+}
+
+fn is_plan_limit_error(status: reqwest::StatusCode, body: &str) -> bool {
+    status == reqwest::StatusCode::FORBIDDEN
+        && serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|parsed| {
+                parsed
+                    .get("code")
+                    .and_then(|v| v.as_str())
+                    .map(|code| code == "PLAN_LIMIT_EXCEEDED")
+            })
+            .unwrap_or(false)
+}
+
+fn map_error_body(status: reqwest::StatusCode, body: &str) -> BridgeError {
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        crate::auth::session::request_token_refresh();
+    }
+    if status == reqwest::StatusCode::FORBIDDEN {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(body) {
+            if parsed.get("error").and_then(|v| v.as_str()) == Some("plan_upgrade_required") {
+                let msg = parsed
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Aster Bridge requires a Star plan or higher.")
+                    .to_string();
+                return BridgeError::PlanUpgradeRequired(msg);
+            }
+        }
+    }
+    if status == reqwest::StatusCode::BAD_REQUEST {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(body) {
+            if parsed.get("code").and_then(|v| v.as_str()) == Some("ATTACHMENTS_TOO_LARGE") {
+                let msg = parsed
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("attachments exceed the size limit for your plan")
+                    .chars()
+                    .take(200)
+                    .collect::<String>();
+                return BridgeError::MessageTooLarge(msg);
+            }
+        }
+    }
+    let truncated: String = body.chars().take(ERR_BODY_MAX).collect();
+    BridgeError::Api(format!("{}: {}", status, truncated))
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ContactRecord {
+    pub id: String,
+    pub contact_token: String,
+    pub encrypted_data: String,
+    pub data_nonce: String,
+    #[serde(default)]
+    pub integrity_hash: Option<String>,
+    #[serde(default)]
+    pub data_version: Option<u32>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ContactListResponse {
+    pub items: Vec<ContactRecord>,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+    #[serde(default)]
+    pub has_more: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateContactRequest {
+    pub contact_token: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name_search_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email_search_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub company_search_token: Option<String>,
+    pub encrypted_data: String,
+    pub data_nonce: String,
+    pub integrity_hash: String,
+    pub data_version: u32,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateContactResponse {
+    pub id: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UpdateContactRequest {
+    pub encrypted_data: String,
+    pub data_nonce: String,
+    pub integrity_hash: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name_search_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email_search_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub company_search_token: Option<String>,
+}
+
+pub struct ApiClient {
+    client: Client,
+    base_url: String,
+}
+
+#[derive(Deserialize)]
+pub struct EscrowPlaintextResponse {
+    pub message_id: String,
+    pub encrypted_plaintext: String,
+    pub plaintext_nonce: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PqSecretResponse {
+    pub key_id: i32,
+    pub encrypted_secret: String,
+    pub secret_nonce: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BundlePqPrekey {
+    pub key_id: u32,
+    pub public_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PrekeyBundle {
+    pub kem_identity_key: String,
+    pub signed_prekey: String,
+    #[serde(default)]
+    pub signed_prekey_signature: Option<String>,
+    #[serde(default)]
+    pub pq_prekey: Option<BundlePqPrekey>,
+    #[serde(default)]
+    pub pq_kem_public_key: Option<String>,
+    #[serde(default)]
+    pub x3dh_max_version: Option<i16>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RecipientPublicKey {
+    pub public_key: String,
+    #[serde(default)]
+    pub internal: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecipientKeyLookup {
+    pub public_key: Option<String>,
+    pub internal: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReportEnvelopeCapability<'a> {
+    pub client_id: &'a str,
+    pub max_envelope_marker: i16,
+    pub platform: &'a str,
+    pub identity_fingerprint: Option<&'a str>,
+    pub x3dh_max_version: i16,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EnvelopeCapabilityResponse {
+    pub success: bool,
+    #[serde(default)]
+    pub min_supported_marker: Option<i16>,
+    #[serde(default)]
+    pub pq_hybrid_enabled: bool,
+    #[serde(default)]
+    pub identity_verified: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateMailItem<'a> {
+    pub item_type: &'a str,
+    pub encrypted_envelope: &'a str,
+    pub envelope_nonce: &'a str,
+    pub folder_token: &'a str,
+    pub content_hash: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateImportJobBody<'a> {
+    pub source: &'a str,
+    pub total_emails: i32,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateImportJobResponse {
+    pub id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BulkMetadataResponse {
+    #[serde(default)]
+    pub updated_count: i64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ImportJobSummary {
+    pub id: String,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub status: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ImportJobListResponse {
+    #[serde(default)]
+    pub jobs: Vec<ImportJobSummary>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UpdateImportJobBody<'a> {
+    pub status: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ImportedEmail<'a> {
+    pub message_id_hash: &'a str,
+    pub encrypted_envelope: &'a str,
+    pub envelope_nonce: &'a str,
+    pub content_hash: &'a str,
+    pub item_type: &'a str,
+    pub received_at: &'a str,
+    pub has_attachments: bool,
+    pub attachment_count: i16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_token: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub folder_token: Option<&'a str>,
+    pub is_read: bool,
+    pub is_starred: bool,
+    pub is_archived: bool,
+    pub is_spam: bool,
+    pub is_trashed: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StoreImportedEmailsBody<'a> {
+    pub emails: Vec<ImportedEmail<'a>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct StoreImportedEmailsResponse {
+    #[serde(default)]
+    pub stored_count: i32,
+    #[serde(default)]
+    pub duplicate_count: i32,
+    #[serde(default)]
+    pub skipped_quota_count: i32,
+    #[serde(default)]
+    pub quota_exceeded: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct SyncResponse {
+    pub items: Vec<MailItem>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateAttachmentBody<'a> {
+    pub encrypted_data: &'a str,
+    pub data_nonce: &'a str,
+    pub encrypted_meta: &'a str,
+    pub meta_nonce: &'a str,
+    pub seq_num: i16,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateDraftBody<'a> {
+    pub draft_type: &'a str,
+    pub encrypted_content: &'a str,
+    pub content_nonce: &'a str,
+    pub content_hash: &'a str,
+    pub size_bytes: i64,
+    pub has_attachments: bool,
+    pub attachment_count: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_to_id: Option<&'a str>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct DraftListItem {
+    pub id: String,
+    pub draft_type: String,
+    #[serde(default)]
+    pub reply_to_id: Option<String>,
+    pub encrypted_content: String,
+    pub content_nonce: String,
+    pub version: i64,
+    #[serde(default)]
+    pub has_attachments: bool,
+    #[serde(default)]
+    pub attachment_count: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DraftListResponse {
+    pub items: Vec<DraftListItem>,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+    #[serde(default)]
+    pub has_more: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateDraftResponse {
+    pub id: String,
+    #[serde(default)]
+    pub version: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DeviceCodeRequest {
+    pub ed25519_pk: String,
+    pub mlkem_pk: String,
+    pub x25519_pk: String,
+    pub machine_name: String,
+    pub device_type: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DeviceCodeResponse {
+    pub code: String,
+    pub expires_in: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DeviceChallengeRequest {
+    pub device_id: Uuid,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct DeviceChallengeResponse {
+    pub challenge_id: Uuid,
+    pub nonce: String,
+    pub expires_in: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DeviceLoginRequest {
+    pub challenge_id: Uuid,
+    pub signature: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct DeviceLoginResponse {
+    pub user_id: Uuid,
+    pub username: String,
+    pub email: String,
+    pub access_token: Option<String>,
+    pub refresh_token: Option<String>,
+    pub encrypted_vault: String,
+    pub vault_nonce: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RefreshSessionRequest {
+    pub refresh_token: String,
+    pub expected_user_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RefreshSessionResponse {
+    pub access_token: Option<String>,
+    pub refresh_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DeviceCodeStatusResponse {
+    pub status: String,
+    pub device_id: Option<Uuid>,
+    pub sealed_envelope: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct UserProfileResponse {
+    pub user_id: uuid::Uuid,
+    pub username: String,
+    pub email: String,
+    pub display_name: Option<String>,
+    pub profile_color: Option<String>,
+    pub profile_picture: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct PlanInfoResponse {
+    pub plan_code: String,
+    pub has_bridge_access: bool,
+}
+
+#[derive(Deserialize)]
+pub struct AccountKeyTokenResponse {
+    pub token: String,
+}
+
+#[derive(Deserialize)]
+pub struct AccountKeyTokenHistoryEntry {
+    pub token: String,
+}
+
+#[derive(Deserialize)]
+pub struct AccountKeyTokenHistoryResponse {
+    #[serde(default)]
+    pub entries: Vec<AccountKeyTokenHistoryEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PreferencesResponse {
+    pub encrypted_preferences: Option<String>,
+    pub preferences_nonce: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct MailListResponse {
+    pub items: Vec<MailItem>,
+    pub total: i64,
+    pub has_more: bool,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[allow(dead_code)]
+pub struct MailItem {
+    pub id: String,
+    pub item_type: String,
+    pub encrypted_envelope: String,
+    pub envelope_nonce: String,
+    pub ephemeral_key: Option<String>,
+    pub ephemeral_pq_key: Option<String>,
+    pub sender_sealed: Option<String>,
+    pub folder_token: String,
+    pub is_external: bool,
+    pub thread_token: Option<String>,
+    pub thread_message_count: Option<i16>,
+    pub created_at: String,
+    pub encrypted_metadata: Option<String>,
+    pub metadata_nonce: Option<String>,
+    pub metadata_version: Option<i16>,
+    pub scheduled_at: Option<String>,
+    pub send_status: Option<String>,
+    pub message_ts: Option<String>,
+    pub snoozed_until: Option<String>,
+    pub expires_at: Option<String>,
+    pub expiry_type: Option<String>,
+    pub is_spam: Option<bool>,
+    pub is_read: Option<bool>,
+    pub is_starred: Option<bool>,
+    #[serde(default)]
+    pub has_attachments: Option<bool>,
+    #[serde(default)]
+    pub attachment_count: Option<i16>,
+    #[serde(default)]
+    pub labels: Option<Vec<MailItemLabel>>,
+    #[serde(default)]
+    pub tag_tokens: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct MailItemLabel {
+    pub token: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct FolderDefinition {
+    pub id: String,
+    pub label_token: String,
+    pub encrypted_name: String,
+    pub name_nonce: String,
+    #[serde(default)]
+    pub is_system: bool,
+    #[serde(default)]
+    pub is_password_protected: bool,
+    #[serde(default)]
+    pub sort_order: i16,
+    #[serde(default)]
+    pub parent_token: Option<String>,
+    #[serde(default)]
+    pub folder_type: Option<String>,
+    #[serde(default)]
+    pub created_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FolderListResponse {
+    pub labels: Vec<FolderDefinition>,
+    #[serde(default)]
+    pub has_more: bool,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct TagDefinition {
+    pub id: String,
+    pub tag_token: String,
+    pub encrypted_name: String,
+    pub name_nonce: String,
+    #[serde(default)]
+    pub parent_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TagListResponse {
+    pub tags: Vec<TagDefinition>,
+    #[serde(default)]
+    pub has_more: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateTagResponse {
+    pub id: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateTagBody<'a> {
+    pub tag_token: &'a str,
+    pub encrypted_name: &'a str,
+    pub name_nonce: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_token: Option<&'a str>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UpdateTagBody<'a> {
+    pub encrypted_name: &'a str,
+    pub name_nonce: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateFolderResponse {
+    pub id: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateFolderBody<'a> {
+    pub label_token: &'a str,
+    pub encrypted_name: &'a str,
+    pub name_nonce: &'a str,
+    pub folder_type: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_token: Option<&'a str>,
+}
+
+#[derive(Debug, Serialize, Default)]
+pub struct UpdateFolderBody<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encrypted_name: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name_nonce: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_token: Option<&'a str>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[allow(dead_code)]
+pub struct AttachmentResponse {
+    pub id: String,
+    pub mail_item_id: String,
+    pub encrypted_data: String,
+    pub data_nonce: String,
+    pub encrypted_meta: String,
+    #[serde(default)]
+    pub meta_nonce: String,
+    #[serde(default)]
+    pub size_bytes: i64,
+    pub seq_num: i16,
+    #[serde(default)]
+    pub created_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct AttachmentListResponse {
+    pub attachments: Vec<AttachmentResponse>,
+    #[serde(default)]
+    pub total: i64,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[allow(dead_code)]
+pub struct AliasResponse {
+    pub id: String,
+    pub encrypted_local_part: String,
+    pub local_part_nonce: String,
+    #[serde(default)]
+    pub encrypted_display_name: Option<String>,
+    #[serde(default)]
+    pub display_name_nonce: Option<String>,
+    pub alias_address_hash: String,
+    pub domain: String,
+    pub is_enabled: bool,
+    pub is_random: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct AliasListResponse {
+    pub aliases: Vec<AliasResponse>,
+    #[serde(default)]
+    pub total: i64,
+    #[serde(default)]
+    pub has_more: bool,
+    #[serde(default)]
+    pub max_aliases: i64,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[allow(dead_code)]
+pub struct CustomDomainResponse {
+    pub id: String,
+    pub domain_name: String,
+    pub status: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct DomainListResponse {
+    pub domains: Vec<CustomDomainResponse>,
+    #[serde(default)]
+    pub total: i64,
+    #[serde(default)]
+    pub max_domains: i64,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[allow(dead_code)]
+pub struct DomainAddressResponse {
+    pub id: String,
+    pub domain_id: String,
+    pub encrypted_local_part: String,
+    pub local_part_nonce: String,
+    pub local_part_hash: String,
+    #[serde(default)]
+    pub encrypted_display_name: Option<String>,
+    #[serde(default)]
+    pub display_name_nonce: Option<String>,
+    pub is_enabled: bool,
+    #[serde(default)]
+    pub is_primary: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct DomainAddressListResponse {
+    pub addresses: Vec<DomainAddressResponse>,
+    #[serde(default)]
+    pub total: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct DefaultSenderResponse {
+    #[serde(default)]
+    pub sender_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MailListQuery {
+    pub item_type: Option<String>,
+    pub is_trashed: Option<bool>,
+    pub is_archived: Option<bool>,
+    pub is_spam: Option<bool>,
+    pub limit: Option<i64>,
+    pub cursor: Option<String>,
+}
+
+#[allow(dead_code)]
+impl Default for ApiClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ApiClient {
+    pub fn new() -> Self {
+        let mut default_headers = reqwest::header::HeaderMap::new();
+        default_headers.insert("x-aster-client", reqwest::header::HeaderValue::from_static("aster-bridge"));
+        let client = crate::tls_pinning::pinned_client_builder(
+            default_headers,
+            &user_agent(),
+            std::time::Duration::from_secs(30),
+        )
+        .expect("failed to build pinned HTTP client");
+
+        Self {
+            client,
+            base_url: API_BASE_URL.to_string(),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn new_with_base_url(base_url: &str) -> Self {
+        let mut default_headers = reqwest::header::HeaderMap::new();
+        default_headers.insert("x-aster-client", reqwest::header::HeaderValue::from_static("aster-bridge"));
+        let client = Client::builder()
+            .default_headers(default_headers)
+            .user_agent(user_agent())
+            .timeout(std::time::Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("failed to build HTTP client");
+        Self {
+            client,
+            base_url: base_url.to_string(),
+        }
+    }
+
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    pub async fn generate_device_code(&self, req: &DeviceCodeRequest) -> Result<DeviceCodeResponse> {
+        let resp = self.client
+            .post(format!("{}/core/v1/auth/device/code", self.base_url))
+            .json(req)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn poll_device_code_status(&self, code: &str) -> Result<DeviceCodeStatusResponse> {
+        let resp = self.client
+            .get(format!("{}/core/v1/auth/device/code/status", self.base_url))
+            .query(&[("code", code)])
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn device_challenge(&self, device_id: Uuid) -> Result<DeviceChallengeResponse> {
+        let resp = self.client
+            .post(format!("{}/core/v1/auth/device/challenge", self.base_url))
+            .json(&DeviceChallengeRequest { device_id })
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn device_login(&self, req: &DeviceLoginRequest) -> Result<DeviceLoginResponse> {
+        let resp = self.client
+            .post(format!("{}/core/v1/auth/device/login", self.base_url))
+            .json(req)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn refresh_session(&self, req: &RefreshSessionRequest) -> Result<RefreshSessionResponse> {
+        let resp = self.client
+            .post(format!("{}/core/v1/auth/refresh", self.base_url))
+            .json(req)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn get_user_profile(&self, access_token: &str) -> Result<UserProfileResponse> {
+        let resp = self.client
+            .get(format!("{}/core/v1/auth/me", self.base_url))
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn get_plan_info(&self, access_token: &str) -> Result<PlanInfoResponse> {
+        let resp = self.client
+            .get(format!("{}/core/v1/billing/plan", self.base_url))
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn get_preferences(&self, access_token: &str) -> Result<PreferencesResponse> {
+        let resp = self.client
+            .get(format!("{}/settings/v1/preferences", self.base_url))
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn get_account_key_token(
+        &self,
+        access_token: &str,
+    ) -> Result<Option<AccountKeyTokenResponse>> {
+        let resp = self
+            .client
+            .get(format!("{}/crypto/v1/keys/account-key", self.base_url))
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map(Some).map_err(BridgeError::from)
+    }
+
+    pub async fn get_account_key_token_history(
+        &self,
+        access_token: &str,
+    ) -> Result<Vec<AccountKeyTokenHistoryEntry>> {
+        let resp = self
+            .client
+            .get(format!(
+                "{}/crypto/v1/keys/account-key/history",
+                self.base_url
+            ))
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(Vec::new());
+        }
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        let body: AccountKeyTokenHistoryResponse = resp.json().await.map_err(BridgeError::from)?;
+        Ok(body.entries)
+    }
+
+    pub async fn get_account_key_format_writes(&self, access_token: &str) -> bool {
+        let resp = match self
+            .client
+            .get(format!(
+                "{}/crypto/v1/keys/account-key/capabilities",
+                self.base_url
+            ))
+            .bearer_auth(access_token)
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => resp,
+            _ => return false,
+        };
+
+        match resp.bytes().await {
+            Ok(body) => crate::crypto::sent_copy::parse_format_writes(&body),
+            Err(_) => false,
+        }
+    }
+
+    pub async fn get_default_sender(&self, access_token: &str) -> Result<Option<String>> {
+        let resp = self.client
+            .get(format!("{}/settings/v1/preferences/default-sender", self.base_url))
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        let body: DefaultSenderResponse = resp.json().await.map_err(BridgeError::from)?;
+        Ok(body.sender_id)
+    }
+
+    pub async fn set_default_sender(&self, access_token: &str, sender_id: Option<&str>) -> Result<()> {
+        let resp = self.client
+            .put(format!("{}/settings/v1/preferences/default-sender", self.base_url))
+            .bearer_auth(access_token)
+            .json(&serde_json::json!({ "sender_id": sender_id }))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        Ok(())
+    }
+
+    pub async fn get_prekey_bundle(
+        &self,
+        access_token: &str,
+        username: &str,
+        email: &str,
+    ) -> Result<PrekeyBundle> {
+        let resp = self.client
+            .get(format!("{}/crypto/v1/ratchet/prekey-bundle/{}", self.base_url, username))
+            .query(&[("email", email)])
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn find_prekey_bundle(
+        &self,
+        access_token: &str,
+        username: &str,
+        email: &str,
+    ) -> Result<Option<PrekeyBundle>> {
+        let resp = self.client
+            .get(format!("{}/crypto/v1/ratchet/prekey-bundle/{}", self.base_url, username))
+            .query(&[("email", email)])
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map(Some).map_err(BridgeError::from)
+    }
+
+    pub async fn get_recipient_public_key(
+        &self,
+        access_token: &str,
+        username: &str,
+        email: &str,
+    ) -> Result<Option<String>> {
+        Ok(self
+            .lookup_recipient_key(access_token, username, email)
+            .await?
+            .and_then(|lookup| lookup.public_key))
+    }
+
+    pub async fn lookup_recipient_key(
+        &self,
+        access_token: &str,
+        username: &str,
+        email: &str,
+    ) -> Result<Option<RecipientKeyLookup>> {
+        let resp = self.client
+            .get(format!("{}/crypto/v1/keys/public/{}", self.base_url, username))
+            .query(&[("email", email)])
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        let body: RecipientPublicKey = resp.json().await.map_err(BridgeError::from)?;
+        let key = body.public_key.trim().to_string();
+        Ok(Some(RecipientKeyLookup {
+            public_key: if key.is_empty() { None } else { Some(key) },
+            internal: body.internal,
+        }))
+    }
+
+    pub async fn report_envelope_capability(
+        &self,
+        access_token: &str,
+        body: &ReportEnvelopeCapability<'_>,
+    ) -> Result<EnvelopeCapabilityResponse> {
+        let resp = self.client
+            .post(format!("{}/crypto/v1/ratchet/envelope-capability", self.base_url))
+            .bearer_auth(access_token)
+            .json(body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn delete_mail_item_permanent(&self, access_token: &str, item_id: &str) -> Result<()> {
+        let resp = self.client
+            .delete(format!("{}/mail/v1/messages/{}", self.base_url, item_id))
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+        Ok(())
+    }
+
+    pub async fn create_mail_item(
+        &self,
+        access_token: &str,
+        req: &CreateMailItem<'_>,
+    ) -> Result<serde_json::Value> {
+        let resp = self.client
+            .post(format!("{}/mail/v1/messages", self.base_url))
+            .bearer_auth(access_token)
+            .json(req)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn create_import_job(
+        &self,
+        access_token: &str,
+        body: &CreateImportJobBody<'_>,
+    ) -> Result<CreateImportJobResponse> {
+        let resp = self
+            .client
+            .post(format!("{}/mail/v1/email_import/jobs", self.base_url))
+            .bearer_auth(access_token)
+            .json(body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn list_import_jobs(&self, access_token: &str) -> Result<ImportJobListResponse> {
+        let resp = self
+            .client
+            .get(format!("{}/mail/v1/email_import/jobs", self.base_url))
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn update_import_job(
+        &self,
+        access_token: &str,
+        job_id: &str,
+        body: &UpdateImportJobBody<'_>,
+    ) -> Result<()> {
+        let resp = self
+            .client
+            .put(format!(
+                "{}/mail/v1/email_import/jobs/{}",
+                self.base_url, job_id
+            ))
+            .bearer_auth(access_token)
+            .json(body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        Ok(())
+    }
+
+    pub async fn store_imported_emails(
+        &self,
+        access_token: &str,
+        job_id: &str,
+        body: &StoreImportedEmailsBody<'_>,
+    ) -> Result<StoreImportedEmailsResponse> {
+        let resp = self
+            .client
+            .post(format!(
+                "{}/mail/v1/email_import/jobs/{}/emails",
+                self.base_url, job_id
+            ))
+            .bearer_auth(access_token)
+            .json(body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn sync_recent_items(
+        &self,
+        access_token: &str,
+        limit: i64,
+        since: Option<&str>,
+    ) -> Result<SyncResponse> {
+        let mut query = vec![("limit".to_string(), limit.to_string())];
+        if let Some(since) = since {
+            query.push(("since".to_string(), since.to_string()));
+        }
+        let resp = self
+            .client
+            .get(format!("{}/bridge/v1/messages/sync", self.base_url))
+            .bearer_auth(access_token)
+            .query(&query)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn create_attachment(
+        &self,
+        access_token: &str,
+        mail_id: &str,
+        body: &CreateAttachmentBody<'_>,
+    ) -> Result<()> {
+        let resp = self
+            .client
+            .post(format!(
+                "{}/mail/v1/attachments/by-mail/{}",
+                self.base_url, mail_id
+            ))
+            .bearer_auth(access_token)
+            .json(body)
+            .timeout(ATTACHMENT_TRANSFER_TIMEOUT)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        Ok(())
+    }
+
+    pub async fn list_attachments_for_mail(
+        &self,
+        access_token: &str,
+        mail_id: &str,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<AttachmentListResponse> {
+        let mut req = self
+            .client
+            .get(format!(
+                "{}/mail/v1/attachments/by-mail/{}",
+                self.base_url, mail_id
+            ))
+            .bearer_auth(access_token);
+        if let Some(timeout) = timeout {
+            req = req.timeout(timeout);
+        }
+        let resp = req.send().await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn list_drafts(
+        &self,
+        access_token: &str,
+        limit: i64,
+        cursor: Option<&str>,
+    ) -> Result<DraftListResponse> {
+        let mut params: Vec<(&str, String)> = vec![("limit", limit.to_string())];
+        if let Some(c) = cursor {
+            params.push(("cursor", c.to_string()));
+        }
+        let resp = self.client
+            .get(format!("{}/mail/v1/drafts", self.base_url))
+            .bearer_auth(access_token)
+            .query(&params)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn create_draft(
+        &self,
+        access_token: &str,
+        body: &CreateDraftBody<'_>,
+    ) -> Result<CreateDraftResponse> {
+        let resp = self.client
+            .post(format!("{}/mail/v1/drafts", self.base_url))
+            .bearer_auth(access_token)
+            .json(body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn delete_draft(&self, access_token: &str, draft_id: &str) -> Result<()> {
+        let resp = self.client
+            .delete(format!("{}/mail/v1/drafts/{}", self.base_url, draft_id))
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        Ok(())
+    }
+
+    pub async fn get_pq_secret(&self, access_token: &str, key_id: u32) -> Result<PqSecretResponse> {
+        let resp = self.client
+            .get(format!("{}/crypto/v1/ratchet/pq-secret/{}", self.base_url, key_id))
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn get_escrow_plaintext(
+        &self,
+        access_token: &str,
+        dedupe_key: &str,
+    ) -> Result<Option<EscrowPlaintextResponse>> {
+        let resp = self.client
+            .get(format!(
+                "{}/crypto/v1/ratchet/plaintext/{}",
+                self.base_url,
+                urlencoding_path(dedupe_key)
+            ))
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map(Some).map_err(BridgeError::from)
+    }
+
+    pub async fn list_mail(
+        &self,
+        access_token: &str,
+        query: &MailListQuery,
+    ) -> Result<MailListResponse> {
+        self.list_mail_with(access_token, query, true).await
+    }
+
+    pub async fn list_mail_with(
+        &self,
+        access_token: &str,
+        query: &MailListQuery,
+        include_envelope: bool,
+    ) -> Result<MailListResponse> {
+        let mut params: Vec<(&str, String)> = Vec::new();
+        if !include_envelope {
+            params.push(("include_envelope", "false".to_string()));
+        }
+
+        if let Some(ref item_type) = query.item_type {
+            params.push(("item_type", item_type.clone()));
+        }
+        if let Some(is_trashed) = query.is_trashed {
+            params.push(("is_trashed", is_trashed.to_string()));
+        }
+        if let Some(is_archived) = query.is_archived {
+            params.push(("is_archived", is_archived.to_string()));
+        }
+        if let Some(is_spam) = query.is_spam {
+            params.push(("is_spam", is_spam.to_string()));
+        }
+        if let Some(limit) = query.limit {
+            params.push(("limit", limit.to_string()));
+        }
+        if let Some(ref cursor) = query.cursor {
+            params.push(("cursor", cursor.clone()));
+        }
+        params.push(("group_by_thread", "false".to_string()));
+
+        let resp = self.client
+            .get(format!("{}/bridge/v1/messages", self.base_url))
+            .bearer_auth(access_token)
+            .query(&params)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn fetch_mail_item(&self, access_token: &str, item_id: &str) -> Result<MailItem> {
+        let resp = self.client
+            .get(format!("{}/bridge/v1/messages/{}", self.base_url, item_id))
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn update_metadata(
+        &self,
+        access_token: &str,
+        item_id: &str,
+        encrypted_metadata: &str,
+        metadata_nonce: &str,
+    ) -> Result<()> {
+        let resp = self.client
+            .patch(format!("{}/bridge/v1/messages/{}/metadata", self.base_url, item_id))
+            .bearer_auth(access_token)
+            .json(&serde_json::json!({
+                "encrypted_metadata": encrypted_metadata,
+                "metadata_nonce": metadata_nonce
+            }))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        Ok(())
+    }
+
+    pub async fn set_read_status(
+        &self,
+        access_token: &str,
+        item_id: &str,
+        is_read: bool,
+    ) -> Result<()> {
+        let resp = self.client
+            .patch(format!("{}/bridge/v1/messages/{}/metadata", self.base_url, item_id))
+            .bearer_auth(access_token)
+            .json(&serde_json::json!({ "is_read": is_read }))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        Ok(())
+    }
+
+    pub const MAX_BULK_METADATA_ITEMS: usize = 100;
+
+    pub async fn bulk_set_mailbox_flags(
+        &self,
+        access_token: &str,
+        item_ids: &[String],
+        flags: &serde_json::Value,
+    ) -> Result<u64> {
+        let items: Vec<serde_json::Value> = item_ids
+            .iter()
+            .map(|id| {
+                let mut item = flags.clone();
+                if let Some(obj) = item.as_object_mut() {
+                    obj.insert("id".to_string(), serde_json::json!(id));
+                }
+                item
+            })
+            .collect();
+
+        let resp = self
+            .client
+            .patch(format!("{}/bridge/v1/messages/bulk/metadata", self.base_url))
+            .bearer_auth(access_token)
+            .json(&serde_json::json!({"items": items}))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        let parsed: BulkMetadataResponse = resp.json().await?;
+        Ok(parsed.updated_count.max(0) as u64)
+    }
+
+    pub async fn set_mailbox_flags(
+        &self,
+        access_token: &str,
+        item_id: &str,
+        flags: serde_json::Value,
+    ) -> Result<()> {
+        let resp = self.client
+            .patch(format!("{}/bridge/v1/messages/{}/metadata", self.base_url, item_id))
+            .bearer_auth(access_token)
+            .json(&flags)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        Ok(())
+    }
+
+    pub const MAX_BULK_FOLDER_ITEMS: usize = 100;
+    pub const FOLDER_PAGE_LIMIT: i64 = 500;
+
+    pub async fn list_folders(&self, access_token: &str) -> Result<Vec<FolderDefinition>> {
+        let mut out = Vec::new();
+        let mut offset: i64 = 0;
+        loop {
+            let resp = self
+                .client
+                .get(format!("{}/mail/v1/labels", self.base_url))
+                .bearer_auth(access_token)
+                .query(&[
+                    ("include_system", "false".to_string()),
+                    ("limit", Self::FOLDER_PAGE_LIMIT.to_string()),
+                    ("offset", offset.to_string()),
+                ])
+                .send()
+                .await?;
+            if !resp.status().is_success() {
+                return Err(map_response_error(resp).await);
+            }
+            let page: FolderListResponse = resp.json().await?;
+            let fetched = page.labels.len() as i64;
+            out.extend(page.labels);
+            if !page.has_more || fetched == 0 || offset >= 20_000 {
+                return Ok(out);
+            }
+            offset += fetched;
+        }
+    }
+
+    pub async fn create_folder(&self, access_token: &str, body: &CreateFolderBody<'_>) -> Result<String> {
+        let resp = self
+            .client
+            .post(format!("{}/mail/v1/labels", self.base_url))
+            .bearer_auth(access_token)
+            .json(body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+        let parsed: CreateFolderResponse = resp.json().await?;
+        Ok(parsed.id)
+    }
+
+    pub async fn update_folder(
+        &self,
+        access_token: &str,
+        folder_id: &str,
+        body: &UpdateFolderBody<'_>,
+    ) -> Result<()> {
+        let resp = self
+            .client
+            .put(format!("{}/mail/v1/labels/{}", self.base_url, urlencoding_path(folder_id)))
+            .bearer_auth(access_token)
+            .json(body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+        Ok(())
+    }
+
+    pub async fn delete_folder(&self, access_token: &str, folder_id: &str) -> Result<()> {
+        let resp = self
+            .client
+            .delete(format!("{}/mail/v1/labels/{}", self.base_url, urlencoding_path(folder_id)))
+            .bearer_auth(access_token)
+            .json(&serde_json::json!({"purge_contents": false}))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+        Ok(())
+    }
+
+    pub async fn move_to_folder(&self, access_token: &str, item_ids: &[String], label_token: &str) -> Result<()> {
+        self.bulk_folder_request(access_token, "bulk/labels", item_ids, label_token).await
+    }
+
+    pub async fn remove_from_folder(&self, access_token: &str, item_ids: &[String], label_token: &str) -> Result<()> {
+        self.bulk_folder_request(access_token, "bulk/labels/remove", item_ids, label_token).await
+    }
+
+    pub async fn list_tags(&self, access_token: &str) -> Result<Vec<TagDefinition>> {
+        let mut out = Vec::new();
+        let mut offset: i64 = 0;
+        loop {
+            let resp = self
+                .client
+                .get(format!("{}/mail/v1/tags", self.base_url))
+                .bearer_auth(access_token)
+                .query(&[
+                    ("limit", Self::FOLDER_PAGE_LIMIT.to_string()),
+                    ("offset", offset.to_string()),
+                ])
+                .send()
+                .await?;
+            if !resp.status().is_success() {
+                return Err(map_response_error(resp).await);
+            }
+            let page: TagListResponse = resp.json().await?;
+            let fetched = page.tags.len() as i64;
+            out.extend(page.tags);
+            if !page.has_more || fetched == 0 || offset >= 20_000 {
+                return Ok(out);
+            }
+            offset += fetched;
+        }
+    }
+
+    pub async fn create_tag(&self, access_token: &str, body: &CreateTagBody<'_>) -> Result<String> {
+        let resp = self
+            .client
+            .post(format!("{}/mail/v1/tags", self.base_url))
+            .bearer_auth(access_token)
+            .json(body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            if is_plan_limit_error(status, &text) {
+                return Err(BridgeError::PlanLimit("label limit reached".to_string()));
+            }
+            return Err(map_error_body(status, &text));
+        }
+        let parsed: CreateTagResponse = resp.json().await?;
+        Ok(parsed.id)
+    }
+
+    pub async fn update_tag(&self, access_token: &str, tag_id: &str, body: &UpdateTagBody<'_>) -> Result<()> {
+        let resp = self
+            .client
+            .put(format!("{}/mail/v1/tags/{}", self.base_url, urlencoding_path(tag_id)))
+            .bearer_auth(access_token)
+            .json(body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+        Ok(())
+    }
+
+    pub async fn delete_tag(&self, access_token: &str, tag_id: &str) -> Result<()> {
+        let resp = self
+            .client
+            .delete(format!("{}/mail/v1/tags/{}", self.base_url, urlencoding_path(tag_id)))
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+        Ok(())
+    }
+
+    pub async fn add_tag(&self, access_token: &str, item_ids: &[String], tag_token: &str) -> Result<()> {
+        self.bulk_tag_request(access_token, "bulk/tags", item_ids, tag_token).await
+    }
+
+    pub async fn remove_tag(&self, access_token: &str, item_ids: &[String], tag_token: &str) -> Result<()> {
+        self.bulk_tag_request(access_token, "bulk/tags/remove", item_ids, tag_token).await
+    }
+
+    async fn bulk_tag_request(
+        &self,
+        access_token: &str,
+        route: &str,
+        item_ids: &[String],
+        tag_token: &str,
+    ) -> Result<()> {
+        for chunk in item_ids.chunks(Self::MAX_BULK_FOLDER_ITEMS) {
+            let resp = self
+                .client
+                .post(format!("{}/bridge/v1/messages/{}", self.base_url, route))
+                .bearer_auth(access_token)
+                .json(&serde_json::json!({"ids": chunk, "tag_token": tag_token}))
+                .send()
+                .await?;
+            if !resp.status().is_success() {
+                return Err(map_response_error(resp).await);
+            }
+        }
+        Ok(())
+    }
+
+    async fn bulk_folder_request(
+        &self,
+        access_token: &str,
+        route: &str,
+        item_ids: &[String],
+        label_token: &str,
+    ) -> Result<()> {
+        for chunk in item_ids.chunks(Self::MAX_BULK_FOLDER_ITEMS) {
+            let resp = self
+                .client
+                .post(format!("{}/bridge/v1/messages/{}", self.base_url, route))
+                .bearer_auth(access_token)
+                .json(&serde_json::json!({"ids": chunk, "label_token": label_token}))
+                .send()
+                .await?;
+            if !resp.status().is_success() {
+                return Err(map_response_error(resp).await);
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn list_folder_mail(
+        &self,
+        access_token: &str,
+        label_token: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<MailListResponse> {
+        self.list_folder_mail_with(access_token, label_token, limit, offset, true)
+            .await
+    }
+
+    pub async fn list_folder_mail_with(
+        &self,
+        access_token: &str,
+        label_token: &str,
+        limit: i64,
+        offset: i64,
+        include_envelope: bool,
+    ) -> Result<MailListResponse> {
+        let mut params = vec![
+            ("label_token", label_token.to_string()),
+            ("limit", limit.to_string()),
+            ("offset", offset.to_string()),
+        ];
+        if !include_envelope {
+            params.push(("include_envelope", "false".to_string()));
+        }
+        let resp = self
+            .client
+            .get(format!("{}/bridge/v1/messages", self.base_url))
+            .bearer_auth(access_token)
+            .query(&params)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn send_mail(
+        &self,
+        access_token: &str,
+        body: &serde_json::Value,
+    ) -> Result<()> {
+        let mut stripped = None;
+        if body.get(crate::crypto::internal_send::SELF_TO_PLACEHOLDER).is_some() {
+            let mut copy = body.clone();
+            crate::crypto::internal_send::take_self_to_placeholder(&mut copy);
+            stripped = Some(copy);
+        }
+        let body = stripped.as_ref().unwrap_or(body);
+        let resp = self.client
+            .post(format!("{}/bridge/v1/send", self.base_url))
+            .bearer_auth(access_token)
+            .json(body)
+            .timeout(SEND_MAIL_TIMEOUT)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        Ok(())
+    }
+
+    pub async fn link_thread(
+        &self,
+        access_token: &str,
+        item_id: &str,
+        thread_token: &str,
+    ) -> Result<()> {
+        let resp = self.client
+            .put(format!("{}/bridge/v1/messages/{}/thread", self.base_url, item_id))
+            .bearer_auth(access_token)
+            .json(&serde_json::json!({ "thread_token": thread_token }))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        Ok(())
+    }
+
+    pub async fn get_mail_stats(&self, access_token: &str) -> Result<serde_json::Value> {
+        let resp = self.client
+            .get(format!("{}/bridge/v1/messages/stats", self.base_url))
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn list_mail_rules(&self, access_token: &str) -> Result<serde_json::Value> {
+        let resp = self
+            .client
+            .get(format!("{}/mail/v1/mail-rules?ops=2", self.base_url))
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn create_mail_rule(
+        &self,
+        access_token: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let resp = self
+            .client
+            .post(format!("{}/mail/v1/mail-rules", self.base_url))
+            .bearer_auth(access_token)
+            .json(body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn update_mail_rule(
+        &self,
+        access_token: &str,
+        rule_id: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let resp = self
+            .client
+            .patch(format!(
+                "{}/mail/v1/mail-rules/{}?ops=2",
+                self.base_url,
+                urlencoding_path(rule_id)
+            ))
+            .bearer_auth(access_token)
+            .json(body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn delete_mail_rule(&self, access_token: &str, rule_id: &str) -> Result<()> {
+        let resp = self
+            .client
+            .delete(format!(
+                "{}/mail/v1/mail-rules/{}",
+                self.base_url,
+                urlencoding_path(rule_id)
+            ))
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+        Ok(())
+    }
+
+    pub async fn reorder_mail_rules(
+        &self,
+        access_token: &str,
+        ordered_ids: &[String],
+    ) -> Result<()> {
+        let resp = self
+            .client
+            .post(format!("{}/mail/v1/mail-rules/reorder", self.base_url))
+            .bearer_auth(access_token)
+            .json(&serde_json::json!({ "order": ordered_ids }))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+        Ok(())
+    }
+
+    pub async fn run_mail_rule_on_existing(
+        &self,
+        access_token: &str,
+        rule_id: &str,
+        include_trashed: bool,
+    ) -> Result<serde_json::Value> {
+        let query = if include_trashed {
+            "?include_trashed=true"
+        } else {
+            ""
+        };
+        let resp = self
+            .client
+            .post(format!(
+                "{}/mail/v1/mail-rules/{}/run-on-existing{}",
+                self.base_url,
+                urlencoding_path(rule_id),
+                query
+            ))
+            .bearer_auth(access_token)
+            .json(&serde_json::json!({}))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn apply_mail_rule_to_items(
+        &self,
+        access_token: &str,
+        rule_id: &str,
+        ids: &[String],
+    ) -> Result<serde_json::Value> {
+        let resp = self
+            .client
+            .post(format!(
+                "{}/mail/v1/mail-rules/{}/apply-to-items",
+                self.base_url,
+                urlencoding_path(rule_id)
+            ))
+            .bearer_auth(access_token)
+            .json(&serde_json::json!({ "ids": ids }))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn list_mail_rule_runs(&self, access_token: &str) -> Result<serde_json::Value> {
+        let resp = self
+            .client
+            .get(format!("{}/mail/v1/mail-rules/runs", self.base_url))
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn list_aliases_page(
+        &self,
+        access_token: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<AliasListResponse> {
+        let resp = self.client
+            .get(format!("{}/addresses/v1/aliases", self.base_url))
+            .bearer_auth(access_token)
+            .query(&[("limit", limit.to_string()), ("offset", offset.to_string())])
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    // Mirrors list_all_aliases (aliases.ts): paginate until has_more is false.
+    pub async fn list_all_aliases(&self, access_token: &str) -> Result<Vec<AliasResponse>> {
+        const PAGE_SIZE: u32 = 100;
+        const MAX_PAGES: u32 = 100;
+        let mut aliases: Vec<AliasResponse> = Vec::new();
+        let mut offset = 0u32;
+
+        for _ in 0..MAX_PAGES {
+            let page = self.list_aliases_page(access_token, PAGE_SIZE, offset).await?;
+            let count = page.aliases.len();
+            aliases.extend(page.aliases);
+            if !page.has_more || count == 0 {
+                break;
+            }
+            offset += PAGE_SIZE;
+        }
+
+        Ok(aliases)
+    }
+
+    pub async fn list_domains(&self, access_token: &str) -> Result<DomainListResponse> {
+        let resp = self.client
+            .get(format!("{}/addresses/v1/domains", self.base_url))
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn list_domain_addresses(
+        &self,
+        access_token: &str,
+        domain_id: &str,
+    ) -> Result<DomainAddressListResponse> {
+        let resp = self.client
+            .get(format!("{}/addresses/v1/domains/{}/addresses", self.base_url, domain_id))
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn list_contacts(
+        &self,
+        access_token: &str,
+        limit: u32,
+        cursor: Option<&str>,
+    ) -> Result<ContactListResponse> {
+        let mut request = self
+            .client
+            .get(format!("{}/contacts/v1", self.base_url))
+            .bearer_auth(access_token)
+            .query(&[("limit", limit.to_string())]);
+
+        if let Some(cursor) = cursor {
+            request = request.query(&[("cursor", cursor)]);
+        }
+
+        let resp = request.send().await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn get_contact(
+        &self,
+        access_token: &str,
+        contact_id: &str,
+    ) -> Result<Option<ContactRecord>> {
+        let resp = self
+            .client
+            .get(format!(
+                "{}/contacts/v1/{}",
+                self.base_url,
+                urlencoding_path(contact_id)
+            ))
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map(Some).map_err(BridgeError::from)
+    }
+
+    pub async fn create_contact(
+        &self,
+        access_token: &str,
+        body: &CreateContactRequest,
+    ) -> Result<CreateContactResponse> {
+        let resp = self
+            .client
+            .post(format!("{}/contacts/v1", self.base_url))
+            .bearer_auth(access_token)
+            .json(body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn update_contact(
+        &self,
+        access_token: &str,
+        contact_id: &str,
+        body: &UpdateContactRequest,
+    ) -> Result<()> {
+        let resp = self
+            .client
+            .put(format!(
+                "{}/contacts/v1/{}",
+                self.base_url,
+                urlencoding_path(contact_id)
+            ))
+            .bearer_auth(access_token)
+            .json(body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        Ok(())
+    }
+
+    pub async fn delete_contact(&self, access_token: &str, contact_id: &str) -> Result<()> {
+        let resp = self
+            .client
+            .delete(format!(
+                "{}/contacts/v1/{}",
+                self.base_url,
+                urlencoding_path(contact_id)
+            ))
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::extract::Path as AxumPath;
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use axum::{routing::get, routing::patch, routing::post, Json, Router};
+    use std::sync::Arc;
+    use tokio::sync::Mutex as TokioMutex;
+
+    async fn spawn(app: Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://127.0.0.1:{}", port)
+    }
+
+    fn sample_item_json(id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "item_type": "received",
+            "encrypted_envelope": "ZW52",
+            "envelope_nonce": "",
+            "folder_token": "tok",
+            "is_external": false,
+            "created_at": "2026-06-14T00:00:00Z"
+        })
+    }
+
+    #[tokio::test]
+    async fn list_mail_parses_200_json_list() {
+        let body = serde_json::json!({
+            "items": [sample_item_json("msg-a"), sample_item_json("msg-b")],
+            "total": 2,
+            "has_more": false,
+            "next_cursor": serde_json::Value::Null
+        });
+        let app = Router::new().route(
+            "/bridge/v1/messages",
+            get(move || {
+                let body = body.clone();
+                async move { Json(body) }
+            }),
+        );
+        let base = spawn(app).await;
+        let client = ApiClient::new_with_base_url(&base);
+        let q = MailListQuery {
+            item_type: Some("received".to_string()),
+            is_trashed: None,
+            is_archived: None,
+            is_spam: None,
+            limit: Some(100),
+            cursor: None,
+        };
+        let resp = client.list_mail("tok", &q).await.unwrap();
+        assert_eq!(resp.total, 2);
+        assert!(!resp.has_more);
+        assert_eq!(resp.items.len(), 2);
+        assert_eq!(resp.items[0].id, "msg-a");
+        assert_eq!(resp.items[1].id, "msg-b");
+    }
+
+    #[tokio::test]
+    async fn list_mail_forwards_query_params() {
+        let seen: Arc<TokioMutex<Vec<(String, String)>>> = Arc::new(TokioMutex::new(Vec::new()));
+        let cap = seen.clone();
+        let app = Router::new().route(
+            "/bridge/v1/messages",
+            get(move |axum::extract::RawQuery(raw): axum::extract::RawQuery| {
+                let cap = cap.clone();
+                async move {
+                    let raw = raw.unwrap_or_default();
+                    let mut pairs = Vec::new();
+                    for kv in raw.split('&') {
+                        if let Some((k, v)) = kv.split_once('=') {
+                            pairs.push((k.to_string(), v.to_string()));
+                        }
+                    }
+                    *cap.lock().await = pairs;
+                    Json(serde_json::json!({
+                        "items": [],
+                        "total": 0,
+                        "has_more": false,
+                        "next_cursor": null
+                    }))
+                }
+            }),
+        );
+        let base = spawn(app).await;
+        let client = ApiClient::new_with_base_url(&base);
+        let q = MailListQuery {
+            item_type: None,
+            is_trashed: Some(true),
+            is_archived: None,
+            is_spam: None,
+            limit: Some(50),
+            cursor: Some("cur1".to_string()),
+        };
+        let _ = client.list_mail("tok", &q).await.unwrap();
+        let pairs = seen.lock().await.clone();
+        assert!(pairs.iter().any(|(k, v)| k == "is_trashed" && v == "true"));
+        assert!(pairs.iter().any(|(k, v)| k == "limit" && v == "50"));
+        assert!(pairs.iter().any(|(k, v)| k == "cursor" && v == "cur1"));
+        assert!(pairs.iter().any(|(k, v)| k == "group_by_thread" && v == "false"));
+        assert!(!pairs.iter().any(|(k, _)| k == "item_type"));
+    }
+
+    #[tokio::test]
+    async fn list_mail_sends_bearer_token() {
+        let seen: Arc<TokioMutex<Option<String>>> = Arc::new(TokioMutex::new(None));
+        let cap = seen.clone();
+        let app = Router::new().route(
+            "/bridge/v1/messages",
+            get(move |headers: axum::http::HeaderMap| {
+                let cap = cap.clone();
+                async move {
+                    let auth = headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .map(|s| s.to_string());
+                    *cap.lock().await = auth;
+                    Json(serde_json::json!({
+                        "items": [],
+                        "total": 0,
+                        "has_more": false,
+                        "next_cursor": null
+                    }))
+                }
+            }),
+        );
+        let base = spawn(app).await;
+        let client = ApiClient::new_with_base_url(&base);
+        let q = MailListQuery {
+            item_type: None,
+            is_trashed: None,
+            is_archived: None,
+            is_spam: None,
+            limit: None,
+            cursor: None,
+        };
+        let _ = client.list_mail("secret-token", &q).await.unwrap();
+        let auth = seen.lock().await.clone();
+        assert_eq!(auth.as_deref(), Some("Bearer secret-token"));
+    }
+
+    #[tokio::test]
+    async fn fetch_mail_item_parses_single_item() {
+        let app = Router::new().route(
+            "/bridge/v1/messages/:id",
+            get(|AxumPath(id): AxumPath<String>| async move { Json(sample_item_json(&id)) }),
+        );
+        let base = spawn(app).await;
+        let client = ApiClient::new_with_base_url(&base);
+        let item = client.fetch_mail_item("tok", "msg-xyz").await.unwrap();
+        assert_eq!(item.id, "msg-xyz");
+        assert_eq!(item.item_type, "received");
+    }
+
+    #[tokio::test]
+    async fn unauthorized_maps_to_api_error() {
+        let app = Router::new().route(
+            "/bridge/v1/messages/:id",
+            get(|| async { (StatusCode::UNAUTHORIZED, "no token").into_response() }),
+        );
+        let base = spawn(app).await;
+        let client = ApiClient::new_with_base_url(&base);
+        let err = client.fetch_mail_item("tok", "msg-1").await.unwrap_err();
+        match err {
+            BridgeError::Api(msg) => assert!(msg.contains("401")),
+            other => panic!("expected Api error, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn forbidden_plain_maps_to_api_error() {
+        let app = Router::new().route(
+            "/bridge/v1/messages/:id",
+            get(|| async { (StatusCode::FORBIDDEN, "denied").into_response() }),
+        );
+        let base = spawn(app).await;
+        let client = ApiClient::new_with_base_url(&base);
+        let err = client.fetch_mail_item("tok", "msg-1").await.unwrap_err();
+        match err {
+            BridgeError::Api(msg) => assert!(msg.contains("403")),
+            other => panic!("expected Api error, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn forbidden_plan_upgrade_maps_to_plan_upgrade_required() {
+        let app = Router::new().route(
+            "/core/v1/billing/plan",
+            get(|| async {
+                (
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({
+                        "error": "plan_upgrade_required",
+                        "message": "Star plan needed"
+                    })),
+                )
+                    .into_response()
+            }),
+        );
+        let base = spawn(app).await;
+        let client = ApiClient::new_with_base_url(&base);
+        let err = client.get_plan_info("tok").await.unwrap_err();
+        match err {
+            BridgeError::PlanUpgradeRequired(msg) => assert_eq!(msg, "Star plan needed"),
+            other => panic!("expected PlanUpgradeRequired, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn server_error_maps_to_api_error() {
+        let app = Router::new().route(
+            "/bridge/v1/messages/:id",
+            get(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response() }),
+        );
+        let base = spawn(app).await;
+        let client = ApiClient::new_with_base_url(&base);
+        let err = client.fetch_mail_item("tok", "msg-1").await.unwrap_err();
+        match err {
+            BridgeError::Api(msg) => assert!(msg.contains("500")),
+            other => panic!("expected Api error, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn update_metadata_patch_body_has_expected_fields() {
+        let seen: Arc<TokioMutex<Option<serde_json::Value>>> = Arc::new(TokioMutex::new(None));
+        let cap = seen.clone();
+        let app = Router::new().route(
+            "/bridge/v1/messages/:id/metadata",
+            patch(move |Json(body): Json<serde_json::Value>| {
+                let cap = cap.clone();
+                async move {
+                    *cap.lock().await = Some(body);
+                    Json(serde_json::json!({"success": true}))
+                }
+            }),
+        );
+        let base = spawn(app).await;
+        let client = ApiClient::new_with_base_url(&base);
+        client
+            .update_metadata("tok", "msg-1", "ENC", "NON")
+            .await
+            .unwrap();
+        let body = seen.lock().await.clone().unwrap();
+        assert_eq!(body["encrypted_metadata"], "ENC");
+        assert_eq!(body["metadata_nonce"], "NON");
+    }
+
+    #[tokio::test]
+    async fn set_read_status_patch_body_has_is_read() {
+        let seen: Arc<TokioMutex<Option<serde_json::Value>>> = Arc::new(TokioMutex::new(None));
+        let cap = seen.clone();
+        let app = Router::new().route(
+            "/bridge/v1/messages/:id/metadata",
+            patch(move |Json(body): Json<serde_json::Value>| {
+                let cap = cap.clone();
+                async move {
+                    *cap.lock().await = Some(body);
+                    Json(serde_json::json!({"success": true}))
+                }
+            }),
+        );
+        let base = spawn(app).await;
+        let client = ApiClient::new_with_base_url(&base);
+        client.set_read_status("tok", "msg-1", true).await.unwrap();
+        let body = seen.lock().await.clone().unwrap();
+        assert_eq!(body["is_read"], true);
+    }
+
+    #[tokio::test]
+    async fn set_mailbox_flags_forwards_raw_flags() {
+        let seen: Arc<TokioMutex<Option<serde_json::Value>>> = Arc::new(TokioMutex::new(None));
+        let cap = seen.clone();
+        let app = Router::new().route(
+            "/bridge/v1/messages/:id/metadata",
+            patch(move |Json(body): Json<serde_json::Value>| {
+                let cap = cap.clone();
+                async move {
+                    *cap.lock().await = Some(body);
+                    Json(serde_json::json!({"success": true}))
+                }
+            }),
+        );
+        let base = spawn(app).await;
+        let client = ApiClient::new_with_base_url(&base);
+        let flags = serde_json::json!({"is_archived": true, "is_trashed": false});
+        client.set_mailbox_flags("tok", "msg-1", flags).await.unwrap();
+        let body = seen.lock().await.clone().unwrap();
+        assert_eq!(body["is_archived"], true);
+        assert_eq!(body["is_trashed"], false);
+    }
+
+    #[tokio::test]
+    async fn an_unauthorized_response_requests_a_token_refresh() {
+        let app = Router::new().route(
+            "/bridge/v1/send",
+            post(|| async { (StatusCode::UNAUTHORIZED, "expired").into_response() }),
+        );
+        let base = spawn(app).await;
+        let client = ApiClient::new_with_base_url(&base);
+        use futures_util::FutureExt;
+        let _ = crate::auth::session::token_refresh_requested().now_or_never();
+        let err = client
+            .send_mail("tok", &serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BridgeError::Api(ref m) if m.starts_with("401")));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            crate::auth::session::token_refresh_requested(),
+        )
+        .await
+        .expect("a 401 must ask the refresh task to run");
+    }
+
+    #[tokio::test]
+    async fn attachment_listing_uses_the_timeout_it_is_given() {
+        let app = Router::new().route(
+            "/mail/v1/attachments/by-mail/:id",
+            get(|| async {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                Json(serde_json::json!({"attachments": [], "total": 0}))
+            }),
+        );
+        let base = spawn(app).await;
+        let client = ApiClient::new_with_base_url(&base);
+        let err = client
+            .list_attachments_for_mail("tok", "msg-1", Some(std::time::Duration::from_millis(50)))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BridgeError::Network(ref e) if e.is_timeout()));
+        let ok = client
+            .list_attachments_for_mail("tok", "msg-1", Some(ATTACHMENT_TRANSFER_TIMEOUT))
+            .await
+            .unwrap();
+        assert!(ok.attachments.is_empty());
+    }
+
+    #[tokio::test]
+    async fn send_mail_posts_body_and_returns_ok() {
+        let seen: Arc<TokioMutex<Vec<serde_json::Value>>> = Arc::new(TokioMutex::new(Vec::new()));
+        let cap = seen.clone();
+        let app = Router::new().route(
+            "/bridge/v1/send",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let cap = cap.clone();
+                async move {
+                    cap.lock().await.push(body);
+                    Json(serde_json::json!({"success": true}))
+                }
+            }),
+        );
+        let base = spawn(app).await;
+        let client = ApiClient::new_with_base_url(&base);
+        let payload = serde_json::json!({"subject": "hi", "body": "there"});
+        client.send_mail("tok", &payload).await.unwrap();
+        let captured = seen.lock().await.clone();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0]["subject"], "hi");
+        assert_eq!(captured[0]["body"], "there");
+    }
+
+    #[tokio::test]
+    async fn send_mail_non_2xx_maps_to_api_error() {
+        let app = Router::new().route(
+            "/bridge/v1/send",
+            post(|| async { (StatusCode::BAD_REQUEST, "bad").into_response() }),
+        );
+        let base = spawn(app).await;
+        let client = ApiClient::new_with_base_url(&base);
+        let err = client
+            .send_mail("tok", &serde_json::json!({}))
+            .await
+            .unwrap_err();
+        match err {
+            BridgeError::Api(msg) => assert!(msg.contains("400")),
+            other => panic!("expected Api error, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_plan_info_parses_bridge_access() {
+        let app = Router::new().route(
+            "/core/v1/billing/plan",
+            get(|| async {
+                Json(serde_json::json!({"plan_code": "star", "has_bridge_access": true}))
+            }),
+        );
+        let base = spawn(app).await;
+        let client = ApiClient::new_with_base_url(&base);
+        let info = client.get_plan_info("tok").await.unwrap();
+        assert_eq!(info.plan_code, "star");
+        assert!(info.has_bridge_access);
+    }
+
+    #[test]
+    fn mail_item_deserializes_with_optional_fields_absent() {
+        let item: MailItem = serde_json::from_value(sample_item_json("only-required")).unwrap();
+        assert_eq!(item.id, "only-required");
+        assert!(item.ephemeral_key.is_none());
+        assert!(item.thread_token.is_none());
+        assert!(item.is_spam.is_none());
+    }
+}

@@ -1,0 +1,24 @@
+[package]
+name = "aster-qt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Aster Qt native email client"
+default-run = "aster-qt"
+
+[dependencies]
+cxx = "1.0"
+cxx-qt = "0.10"
+cxx-qt-lib = { version = "0.10", features = ["qt_full"] }
+aster-theme = { path = "../aster-theme" }
+aster-client-core = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+
+[build-dependencies]
+cxx-qt-build = "0.10"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true

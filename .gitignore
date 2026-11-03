@@ -1,0 +1,8 @@
+/target
+**/target/
+/vendor/**/target/
+*.swp
+.DS_Store
+
+# Qt QML language server
+crates/aster-qt/.qmlls.ini

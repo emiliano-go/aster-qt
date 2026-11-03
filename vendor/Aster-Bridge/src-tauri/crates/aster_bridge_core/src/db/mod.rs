@@ -1,0 +1,6168 @@
+//
+// Aster Communications Inc.
+//
+// Copyright (c) 2026 Aster Communications Inc.
+//
+// This file is part of this project.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+//
+use rand_core::{OsRng, RngCore};
+use rusqlite::{Connection, OptionalExtension};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use zeroize::Zeroize;
+
+mod history;
+
+const KEYRING_DB_USER: &str = "db-encryption-key-v1";
+
+fn to_hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push(char::from_digit((b >> 4) as u32, 16).unwrap());
+        s.push(char::from_digit((b & 0x0f) as u32, 16).unwrap());
+    }
+    s
+}
+
+fn from_hex(s: &str) -> Result<[u8; 32], String> {
+    let bytes = s.as_bytes();
+    if bytes.len() != 64 {
+        return Err("db key must be 64 hex chars".to_string());
+    }
+    let mut out = [0u8; 32];
+    for (i, chunk) in bytes.as_chunks::<2>().0.iter().enumerate() {
+        let hi = (chunk[0] as char)
+            .to_digit(16)
+            .ok_or_else(|| "invalid hex".to_string())?;
+        let lo = (chunk[1] as char)
+            .to_digit(16)
+            .ok_or_else(|| "invalid hex".to_string())?;
+        out[i] = ((hi << 4) | lo) as u8;
+    }
+    Ok(out)
+}
+
+pub fn forget_db_key() -> Result<(), String> {
+    crate::secrets::delete(KEYRING_DB_USER)
+}
+
+fn get_or_create_db_key() -> Result<[u8; 32], String> {
+    match crate::secrets::get(KEYRING_DB_USER).map_err(|e| format!("db key: {}", e))? {
+        Some(mut hex) => {
+            let result = from_hex(hex.trim());
+            hex.zeroize();
+            result
+        }
+        None => {
+            let mut key = [0u8; 32];
+            OsRng.fill_bytes(&mut key);
+            let mut hex = to_hex(&key);
+            let stored = crate::secrets::set(KEYRING_DB_USER, &hex);
+            hex.zeroize();
+            stored.map_err(|e| format!("db key: {}", e))?;
+            Ok(key)
+        }
+    }
+}
+
+fn apply_key(conn: &Connection, key: &[u8; 32]) -> Result<(), String> {
+    let mut hex = to_hex(key);
+    let res = conn.execute_batch(&format!("PRAGMA key = \"x'{}'\";", hex));
+    hex.zeroize();
+    res.map_err(|e| e.to_string())
+}
+
+fn is_readable(conn: &Connection) -> bool {
+    conn.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))
+        .is_ok()
+}
+
+fn assert_cipher_active(conn: &Connection) -> Result<(), String> {
+    let version: Option<String> = conn
+        .query_row("PRAGMA cipher_version", [], |r| r.get(0))
+        .ok();
+    match version {
+        Some(v) if !v.trim().is_empty() => Ok(()),
+        _ => Err(
+            "SQLCipher is not active - refusing to operate on an unencrypted database".to_string(),
+        ),
+    }
+}
+
+const DB_FILE_SUFFIXES: [&str; 3] = ["", "-wal", "-shm"];
+
+fn sibling_path(db_path: &Path, suffix: &str) -> PathBuf {
+    let mut os = db_path.as_os_str().to_os_string();
+    os.push(suffix);
+    PathBuf::from(os)
+}
+
+fn plaintext_backup_path(db_path: &Path) -> PathBuf {
+    sibling_path(db_path, ".plain")
+}
+
+fn quote_identifier(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+fn table_row_counts(conn: &Connection) -> Result<Vec<(String, i64)>, String> {
+    let names: Vec<String> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND rootpage > 0 \
+                 AND name NOT LIKE 'sqlite!_%' ESCAPE '!' ORDER BY name",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        rows
+    };
+    let mut counts = Vec::with_capacity(names.len());
+    for name in names {
+        let count: i64 = conn
+            .query_row(
+                &format!("SELECT count(*) FROM {}", quote_identifier(&name)),
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        counts.push((name, count));
+    }
+    Ok(counts)
+}
+
+fn holds_same_rows(conn: &Connection, expected: &[(String, i64)]) -> bool {
+    expected.iter().all(|(name, count)| {
+        conn.query_row(
+            &format!("SELECT count(*) FROM {}", quote_identifier(name)),
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|found| found == *count)
+        .unwrap_or(false)
+    })
+}
+
+fn export_encrypted(conn: &Connection, enc_path: &Path, key: &[u8; 32]) -> Result<(), String> {
+    let mut hex = to_hex(key);
+    let export = conn.execute_batch(&format!(
+        "ATTACH DATABASE '{}' AS encrypted KEY \"x'{}'\";
+         SELECT sqlcipher_export('encrypted');
+         DETACH DATABASE encrypted;",
+        enc_path.to_string_lossy().replace('\'', "''"),
+        hex
+    ));
+    hex.zeroize();
+    export.map_err(|e| format!("sqlcipher_export: {}", e))
+}
+
+fn sync_file(path: &Path) {
+    let synced = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .and_then(|f| f.sync_all());
+    if let Err(e) = synced {
+        tracing::warn!("could not flush {} to disk: {}", path.display(), e);
+    }
+}
+
+type RenameFn<'a> = &'a dyn Fn(&Path, &Path) -> std::io::Result<()>;
+
+fn move_db_files(from: &Path, to: &Path, rename: RenameFn<'_>) -> std::io::Result<()> {
+    for suffix in DB_FILE_SUFFIXES {
+        let source = sibling_path(from, suffix);
+        if source.exists() {
+            rename(&source, &sibling_path(to, suffix))?;
+        }
+    }
+    Ok(())
+}
+
+fn shred_db_files(db_path: &Path) -> Result<(), String> {
+    let mut failed = Vec::new();
+    for suffix in DB_FILE_SUFFIXES {
+        let path = sibling_path(db_path, suffix);
+        if !path.is_file() {
+            continue;
+        }
+        best_effort_overwrite(&path);
+        if let Err(e) = std::fs::remove_file(&path) {
+            failed.push(format!("{} ({})", path.display(), e));
+        }
+    }
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("could not delete {}", failed.join(", ")))
+    }
+}
+
+fn migrate_plaintext_to_encrypted(db_path: &Path, key: &[u8; 32]) -> Result<(), String> {
+    migrate_plaintext_with_rename(db_path, key, &|from: &Path, to: &Path| {
+        std::fs::rename(from, to)
+    })
+}
+
+fn migrate_plaintext_with_rename(
+    db_path: &Path,
+    key: &[u8; 32],
+    rename: RenameFn<'_>,
+) -> Result<(), String> {
+    let plaintext = Connection::open(db_path).map_err(|e| e.to_string())?;
+    if !is_readable(&plaintext) {
+        return Err(
+            "bridge.db exists but is neither plaintext nor decryptable with the stored key"
+                .to_string(),
+        );
+    }
+
+    let _ = plaintext.pragma_update(None, "journal_mode", "DELETE");
+    let expected = table_row_counts(&plaintext)?;
+
+    let enc_path = db_path.with_extension("db.enc");
+    let _ = std::fs::remove_file(&enc_path);
+
+    let exported = export_encrypted(&plaintext, &enc_path, key);
+    drop(plaintext);
+    if let Err(e) = exported {
+        let _ = std::fs::remove_file(&enc_path);
+        return Err(e);
+    }
+    sync_file(&enc_path);
+
+    let verified = (|| -> Result<bool, String> {
+        let verify = Connection::open(&enc_path).map_err(|e| e.to_string())?;
+        apply_key(&verify, key)?;
+        Ok(assert_cipher_active(&verify).is_ok()
+            && is_readable(&verify)
+            && table_row_counts(&verify).map(|found| found == expected).unwrap_or(false))
+    })();
+    if !matches!(verified, Ok(true)) {
+        let _ = std::fs::remove_file(&enc_path);
+        return Err("encrypted migration copy failed verification".to_string());
+    }
+
+    let backup = plaintext_backup_path(db_path);
+    if backup.exists() {
+        let aside = sibling_path(db_path, &format!(".plain.{}", unix_millis()));
+        if let Err(e) = move_db_files(&backup, &aside, rename) {
+            let _ = std::fs::remove_file(&enc_path);
+            return Err(format!("move an older plaintext copy aside: {}", e));
+        }
+    }
+
+    if let Err(e) = move_db_files(db_path, &backup, rename) {
+        let _ = move_db_files(&backup, db_path, rename);
+        let _ = std::fs::remove_file(&enc_path);
+        return Err(format!("set the plaintext database aside: {}", e));
+    }
+
+    if let Err(e) = rename(&enc_path, db_path) {
+        let restored = move_db_files(&backup, db_path, rename);
+        let _ = std::fs::remove_file(&enc_path);
+        return Err(match restored {
+            Ok(()) => format!("swap encrypted db into place: {}", e),
+            Err(r) => format!(
+                "swap encrypted db into place: {} (plaintext kept at {}: {})",
+                e,
+                backup.display(),
+                r
+            ),
+        });
+    }
+    crate::atomic_file::sync_parent_dir(db_path);
+
+    if let Err(e) = shred_db_files(&backup) {
+        tracing::warn!("encrypted database is in place but the plaintext copy remains: {}", e);
+    }
+    Ok(())
+}
+
+fn restore_plaintext_backup(db_path: &Path) -> Result<(), String> {
+    let backup = plaintext_backup_path(db_path);
+    tracing::warn!(
+        "an earlier switch to the encrypted database did not finish; restoring {}",
+        backup.display()
+    );
+    for suffix in ["-wal", "-shm"] {
+        let stray = sibling_path(db_path, suffix);
+        if stray.exists() && !sibling_path(&backup, suffix).exists() {
+            let _ = std::fs::remove_file(&stray);
+        }
+    }
+    move_db_files(&backup, db_path, &|from: &Path, to: &Path| std::fs::rename(from, to))
+        .map_err(|e| format!("restore plaintext database from {}: {}", backup.display(), e))
+}
+
+fn discard_copied_plaintext_backup(conn: &Connection, db_path: &Path) {
+    let backup = plaintext_backup_path(db_path);
+    if !backup.is_file() {
+        return;
+    }
+    let expected = match Connection::open(&backup) {
+        Ok(plain) if is_readable(&plain) => table_row_counts(&plain),
+        _ => Err("not readable as plaintext".to_string()),
+    };
+    match expected {
+        Ok(expected) if holds_same_rows(conn, &expected) => {
+            if let Err(e) = shred_db_files(&backup) {
+                tracing::warn!("could not remove the plaintext copy: {}", e);
+            }
+        }
+        Ok(_) => tracing::warn!(
+            "keeping {} because the encrypted database does not hold the same rows",
+            backup.display()
+        ),
+        Err(e) => tracing::warn!("keeping {}: {}", backup.display(), e),
+    }
+}
+
+fn best_effort_overwrite(path: &Path) {
+    use std::io::Write;
+    let len = match std::fs::metadata(path) {
+        Ok(m) => m.len(),
+        Err(_) => return,
+    };
+    let mut f = match std::fs::OpenOptions::new().write(true).open(path) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    let zeros = [0u8; 64 * 1024];
+    let mut remaining = len;
+    while remaining > 0 {
+        let n = remaining.min(zeros.len() as u64) as usize;
+        if f.write_all(&zeros[..n]).is_err() {
+            break;
+        }
+        remaining -= n as u64;
+    }
+    let _ = f.flush();
+    let _ = f.sync_all();
+}
+
+fn is_old_copy(live: &str, name: &str) -> bool {
+    name.len() > live.len() + 1 && name.starts_with(live) && name.as_bytes()[live.len()] == b'.'
+}
+
+fn is_cache_file(live: &str, name: &str) -> bool {
+    name == live || is_old_copy(live, name) || ["-wal", "-shm", "-journal"].iter().any(|suffix| {
+        name.strip_prefix(live) == Some(suffix)
+    })
+}
+
+fn shred_files_where(db_path: &Path, keep: impl Fn(&str, &str) -> bool) -> Result<(), String> {
+    let (Some(dir), Some(live)) = (db_path.parent(), db_path.file_name().and_then(|n| n.to_str())) else {
+        return Ok(());
+    };
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("could not list {}: {}", dir.display(), e)),
+    };
+    let mut failed = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !keep(live, name) {
+            continue;
+        }
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        best_effort_overwrite(&path);
+        if let Err(e) = std::fs::remove_file(&path) {
+            failed.push(format!("{} ({})", name, e));
+        }
+    }
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("could not delete {}", failed.join(", ")))
+    }
+}
+
+pub fn remove_old_copies(data_dir: &Path) -> Result<(), String> {
+    shred_files_where(&data_dir.join("bridge.db"), is_old_copy)
+}
+
+pub fn destroy_cache_files(data_dir: &Path) -> Result<(), String> {
+    shred_files_where(&data_dir.join("bridge.db"), is_cache_file)
+}
+
+fn plaintext_is_readable(db_path: &Path) -> bool {
+    match Connection::open(db_path) {
+        Ok(c) => is_readable(&c),
+        Err(_) => false,
+    }
+}
+
+fn quarantine_unreadable_db(db_path: &Path) -> Result<(), String> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let dest = db_path.with_extension(format!("db.unreadable.{}", stamp));
+    if db_path.exists() {
+        tracing::warn!(
+            "database could not be decrypted with the stored key; quarantining to {}",
+            dest.display()
+        );
+        std::fs::rename(db_path, &dest)
+            .map_err(|e| format!("quarantine unreadable db: {}", e))?;
+    }
+    let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+    let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+    Ok(())
+}
+
+const OUTBOX_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS outbox (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    raw_mime BLOB NOT NULL,
+    envelope_from TEXT NOT NULL,
+    envelope_to TEXT NOT NULL,
+    queued_at INTEGER NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_attempt_at INTEGER,
+    last_error TEXT,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','sending','sent','failed'))
+);";
+
+const REQUIRED_COLUMNS: &[(&str, &[&str])] = &[
+    ("uid_map", &["aster_id", "folder", "imap_uid"]),
+    (
+        "message_cache",
+        &[
+            "aster_id",
+            "folder",
+            "subject",
+            "sender",
+            "recipients",
+            "date",
+            "flags",
+            "size",
+            "body_cached",
+            "body_text",
+            "raw_headers",
+            "created_at",
+            "thread_id",
+            "message_id",
+            "attachments_state",
+            "attachment_attempts",
+        ],
+    ),
+    (
+        "app_passwords",
+        &["id", "label", "hash", "created_at", "last_used_at", "last_client", "use_count"],
+    ),
+    ("sync_state", &["key", "value"]),
+    (
+        "jmap_mailbox",
+        &["id", "name", "parent_id", "role", "sort_order", "folder_label"],
+    ),
+    (
+        "custom_folder",
+        &["label_token", "server_id", "name", "parent_token", "sort_order", "created_at"],
+    ),
+    ("jmap_state", &["type", "counter"]),
+    ("jmap_change_log", &["seq", "type", "state", "object_id", "op", "ts"]),
+    ("jmap_blob", &["blob_id", "data", "content_type", "size", "created_ts"]),
+    ("envelope_nonces", &["aster_id", "nonce", "first_seen"]),
+    (
+        "message_attachment",
+        &["aster_id", "seq", "name", "content_type", "content_id", "is_inline", "size", "data"],
+    ),
+    (
+        "outbox",
+        &[
+            "id",
+            "raw_mime",
+            "envelope_from",
+            "envelope_to",
+            "queued_at",
+            "attempts",
+            "last_attempt_at",
+            "last_error",
+            "status",
+        ],
+    ),
+    ("pending_flag_push", &["aster_id", "bit", "value", "attempts", "queued_at"]),
+];
+
+fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>, String> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info(\"{}\")", table))
+        .map_err(|e| e.to_string())?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string());
+    columns
+}
+
+fn unix_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+fn repair_outbox_table(conn: &Connection) -> Result<(), String> {
+    let columns = table_columns(conn, "outbox")?;
+    let has = |name: &str| columns.iter().any(|c| c == name);
+
+    let core = ["id", "raw_mime", "envelope_from", "envelope_to", "queued_at"];
+    if !core.iter().all(|c| has(c)) {
+        let aside = format!("outbox_incompatible_{}", unix_millis());
+        tracing::warn!(
+            "outbox table has an unrecognized layout ({}); moving it to {} and recreating it",
+            columns.join(", "),
+            aside
+        );
+        conn.execute_batch(&format!("ALTER TABLE outbox RENAME TO \"{}\";", aside))
+            .map_err(|e| e.to_string())?;
+        conn.execute_batch(OUTBOX_TABLE_SQL).map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
+    let additions = [
+        ("attempts", "INTEGER NOT NULL DEFAULT 0"),
+        ("last_attempt_at", "INTEGER"),
+        ("last_error", "TEXT"),
+        (
+            "status",
+            "TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','sending','sent','failed'))",
+        ),
+    ];
+    for (name, decl) in additions {
+        if !has(name) {
+            tracing::warn!("outbox table is missing column {}; adding it", name);
+            conn.execute_batch(&format!("ALTER TABLE outbox ADD COLUMN {} {};", name, decl))
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+fn verify_required_columns(conn: &Connection) -> Result<(), String> {
+    for (table, required) in REQUIRED_COLUMNS {
+        let columns = table_columns(conn, table)?;
+        let missing: Vec<&str> = required
+            .iter()
+            .copied()
+            .filter(|name| !columns.iter().any(|c| c == name))
+            .collect();
+        if !missing.is_empty() {
+            return Err(format!(
+                "table {} is missing columns: {}",
+                table,
+                missing.join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn quarantine_incompatible_db(db_path: &Path, reason: &str) -> Result<(), String> {
+    let dest = db_path.with_extension(format!("db.incompatible.{}", unix_millis()));
+    tracing::warn!(
+        "database schema could not be prepared ({}); moving it to {} and starting with a fresh database",
+        reason,
+        dest.display()
+    );
+    eprintln!(
+        "bridge.db has an incompatible schema ({}); moved to {} and created a fresh database",
+        reason,
+        dest.display()
+    );
+    std::fs::rename(db_path, &dest).map_err(|e| {
+        format!(
+            "database schema is incompatible ({}) and it could not be moved aside: {}",
+            reason, e
+        )
+    })?;
+    for suffix in ["-wal", "-shm"] {
+        let mut from = db_path.as_os_str().to_os_string();
+        from.push(suffix);
+        let from = PathBuf::from(from);
+        if from.exists() {
+            let mut to = dest.as_os_str().to_os_string();
+            to.push(suffix);
+            let _ = std::fs::rename(&from, PathBuf::from(to));
+        }
+    }
+    Ok(())
+}
+
+fn open_keyed(db_path: &Path, key: &[u8; 32]) -> Result<Connection, String> {
+    if !db_path.exists() && plaintext_backup_path(db_path).is_file() {
+        restore_plaintext_backup(db_path)?;
+    }
+    if db_path.exists() {
+        let probe = Connection::open(db_path).map_err(|e| e.to_string())?;
+        apply_key(&probe, key)?;
+        let readable = is_readable(&probe);
+        drop(probe);
+        if !readable {
+            if plaintext_is_readable(db_path) {
+                migrate_plaintext_to_encrypted(db_path, key)?;
+            } else {
+                quarantine_unreadable_db(db_path)?;
+            }
+        }
+    }
+
+    let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
+    apply_key(&conn, key)?;
+    assert_cipher_active(&conn)?;
+    if !is_readable(&conn) {
+        return Err("failed to open encrypted database".to_string());
+    }
+    discard_copied_plaintext_backup(&conn, db_path);
+    Ok(conn)
+}
+
+fn strip_c0_controls(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control() || matches!(c, '\t' | '\n' | '\r'))
+        .collect()
+}
+
+fn restrict_db_file_permissions(db_path: &Path) {
+    let mut paths = vec![db_path.to_path_buf()];
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut os = db_path.as_os_str().to_os_string();
+        os.push(suffix);
+        paths.push(PathBuf::from(os));
+    }
+    for p in paths {
+        if !p.exists() {
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            let user = whoami::fallible::username()
+                .unwrap_or_else(|_| std::env::var("USERNAME").unwrap_or_default());
+            if !user.is_empty() {
+                let _ = crate::system_tools::icacls_command()
+                    .args([
+                        p.to_string_lossy().as_ref(),
+                        "/inheritance:r",
+                        "/grant:r",
+                        &format!("{}:(F)", user),
+                    ])
+                    .creation_flags(0x0800_0000)
+                    .output();
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = &p;
+        }
+    }
+}
+
+pub fn without_starving_the_runtime<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle)
+            if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread =>
+        {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
+}
+
+const WIRE_SIZE_REVISION: i64 = 1;
+const PENDING_CLEAR_MARKER: &str = "user_data_clear_pending";
+const CLEAR_ATTEMPTS: u32 = 5;
+const CLEAR_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+
+const USER_DATA_TABLES: &[&str] = &[
+    "message_cache",
+    "message_keywords",
+    "message_tag",
+    "custom_tag",
+    "custom_tag_alias",
+    "builtin_tag_slot",
+    "custom_folder",
+    "message_attachment",
+    "message_fts",
+    "uid_map",
+    "app_passwords",
+    "sync_state",
+    "jmap_mailbox",
+    "jmap_state",
+    "jmap_change_log",
+    "jmap_blob",
+    "envelope_nonces",
+    "recipient_key_pin",
+    "outbox",
+    "pending_flag_push",
+    "sqlite_sequence",
+];
+
+pub struct Database {
+    conn: Mutex<Connection>,
+    path: PathBuf,
+    pub(crate) app_password_cache: crate::auth::app_passwords::VerifyCache,
+    pub(crate) tag_lock: tokio::sync::Mutex<()>,
+    pub(crate) tag_writes: std::sync::atomic::AtomicU64,
+    append_pins: Mutex<HashMap<String, AppendPin>>,
+    aster_sender_scope: Mutex<Option<crate::crypto::internal_send::AsterSenderScope>>,
+}
+
+struct AppendPin {
+    folder: String,
+    at: std::time::Instant,
+}
+
+const APPEND_PIN_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+const APPEND_PIN_SWEEP_LEN: usize = 512;
+
+impl Database {
+    pub fn open(data_dir: &Path) -> Result<Self, String> {
+        let mut key = get_or_create_db_key()?;
+        let result = Self::open_with_key(data_dir, &key);
+        key.zeroize();
+        result
+    }
+
+    pub fn open_with_key(data_dir: &Path, key: &[u8; 32]) -> Result<Self, String> {
+        let db_path = data_dir.join("bridge.db");
+        let conn = open_keyed(&db_path, key)?;
+        let conn = match Self::prepare_schema(&conn) {
+            Ok(()) => conn,
+            Err(e) => {
+                drop(conn);
+                quarantine_incompatible_db(&db_path, &e)?;
+                let fresh = open_keyed(&db_path, key)?;
+                Self::prepare_schema(&fresh)?;
+                fresh
+            }
+        };
+
+        restrict_db_file_permissions(&db_path);
+
+        Ok(Self {
+            conn: Mutex::new(conn),
+            path: db_path,
+            app_password_cache: Default::default(),
+            tag_lock: tokio::sync::Mutex::new(()),
+            tag_writes: std::sync::atomic::AtomicU64::new(0),
+            append_pins: Mutex::new(HashMap::new()),
+            aster_sender_scope: Mutex::new(None),
+        })
+    }
+
+    fn prepare_schema(conn: &Connection) -> Result<(), String> {
+        let journal_mode: String = conn
+            .pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        if journal_mode.eq_ignore_ascii_case("wal") {
+            conn.pragma_update(None, "synchronous", "NORMAL")
+                .map_err(|e| e.to_string())?;
+        }
+        conn.pragma_update(None, "cache_size", -65536)
+            .map_err(|e| e.to_string())?;
+        conn.pragma_update(None, "foreign_keys", "ON")
+            .map_err(|e| e.to_string())?;
+        conn.pragma_update(None, "secure_delete", "ON")
+            .map_err(|e| e.to_string())?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|e| e.to_string())?;
+
+        conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS uid_map (
+                aster_id TEXT NOT NULL,
+                folder TEXT NOT NULL,
+                imap_uid INTEGER NOT NULL,
+                PRIMARY KEY (aster_id, folder)
+            );
+
+            CREATE TABLE IF NOT EXISTS message_keywords (
+                aster_id TEXT NOT NULL,
+                keyword TEXT NOT NULL COLLATE NOCASE,
+                PRIMARY KEY (aster_id, keyword)
+            );
+
+            CREATE TABLE IF NOT EXISTS message_cache (
+                aster_id TEXT PRIMARY KEY,
+                folder TEXT NOT NULL,
+                subject TEXT,
+                sender TEXT,
+                recipients TEXT,
+                date TEXT,
+                flags INTEGER NOT NULL DEFAULT 0,
+                size INTEGER NOT NULL DEFAULT 0,
+                body_cached INTEGER NOT NULL DEFAULT 0,
+                body_text TEXT,
+                raw_headers TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS app_passwords (
+                id TEXT PRIMARY KEY,
+                label TEXT NOT NULL,
+                hash TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS sync_state (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_message_cache_folder ON message_cache(folder);
+            CREATE INDEX IF NOT EXISTS idx_uid_map_folder_uid ON uid_map(folder, imap_uid);
+
+            CREATE TABLE IF NOT EXISTS jmap_mailbox (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                parent_id TEXT,
+                role TEXT,
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                folder_label TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS jmap_state (
+                type TEXT PRIMARY KEY,
+                counter INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS jmap_change_log (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                type TEXT NOT NULL,
+                state INTEGER NOT NULL,
+                object_id TEXT NOT NULL,
+                op TEXT NOT NULL CHECK(op IN ('created','updated','destroyed')),
+                ts INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_jmap_change_log_type_state ON jmap_change_log(type, state);
+
+            CREATE TABLE IF NOT EXISTS jmap_blob (
+                blob_id TEXT PRIMARY KEY,
+                data BLOB NOT NULL,
+                content_type TEXT,
+                size INTEGER NOT NULL,
+                created_ts INTEGER NOT NULL
+            );
+            ",
+        )
+        .map_err(|e| e.to_string())?;
+
+        let _ = conn.execute(
+            "ALTER TABLE message_cache ADD COLUMN thread_id TEXT",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE message_cache ADD COLUMN message_id TEXT",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE app_passwords ADD COLUMN last_used_at INTEGER",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE app_passwords ADD COLUMN last_client TEXT",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE app_passwords ADD COLUMN use_count INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_message_cache_thread_id ON message_cache(thread_id);
+             CREATE INDEX IF NOT EXISTS idx_message_cache_message_id ON message_cache(message_id);
+             CREATE INDEX IF NOT EXISTS idx_message_cache_folder_date ON message_cache(folder, date DESC);
+             CREATE INDEX IF NOT EXISTS idx_jmap_change_log_type_seq ON jmap_change_log(type, seq DESC);
+             CREATE INDEX IF NOT EXISTS idx_jmap_blob_created_ts ON jmap_blob(created_ts);
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_app_passwords_label ON app_passwords(label);",
+        ).map_err(|e| e.to_string())?;
+
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS custom_folder (
+                label_token TEXT PRIMARY KEY,
+                server_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                parent_token TEXT,
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT
+             );",
+        ).map_err(|e| e.to_string())?;
+
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS custom_tag (
+                tag_token TEXT PRIMARY KEY,
+                server_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                keyword TEXT COLLATE NOCASE
+             );
+             CREATE TABLE IF NOT EXISTS message_tag (
+                aster_id TEXT NOT NULL,
+                tag_token TEXT NOT NULL,
+                PRIMARY KEY (aster_id, tag_token)
+             );
+             CREATE INDEX IF NOT EXISTS idx_message_tag_token ON message_tag(tag_token);
+             CREATE TABLE IF NOT EXISTS custom_tag_alias (
+                keyword TEXT PRIMARY KEY COLLATE NOCASE,
+                tag_token TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_custom_tag_alias_token ON custom_tag_alias(tag_token);
+             CREATE TABLE IF NOT EXISTS builtin_tag_slot (
+                slot INTEGER PRIMARY KEY,
+                tag_token TEXT
+             );",
+        ).map_err(|e| e.to_string())?;
+        let _ = conn.execute(
+            "ALTER TABLE custom_tag ADD COLUMN position INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        rebuild_tag_aliases(conn).map_err(|e| e.to_string())?;
+
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS envelope_nonces (
+                aster_id TEXT PRIMARY KEY,
+                nonce TEXT NOT NULL,
+                first_seen INTEGER NOT NULL
+             );",
+        ).map_err(|e| e.to_string())?;
+
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS recipient_key_pin (
+                pin_id TEXT PRIMARY KEY,
+                identity_fingerprint TEXT NOT NULL,
+                owner_fingerprint TEXT NOT NULL,
+                pq_seen INTEGER NOT NULL DEFAULT 0,
+                flagged INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL
+             );",
+        ).map_err(|e| e.to_string())?;
+        let _ = conn.execute(
+            "ALTER TABLE recipient_key_pin ADD COLUMN pq_fingerprint TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE recipient_key_pin ADD COLUMN transcript_bound INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE recipient_key_pin ADD COLUMN binding_epoch INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE recipient_key_pin ADD COLUMN binding_fingerprint TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE recipient_key_pin ADD COLUMN hosted INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS message_attachment (
+                aster_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                content_type TEXT NOT NULL,
+                content_id TEXT,
+                is_inline INTEGER NOT NULL DEFAULT 0,
+                size INTEGER NOT NULL,
+                data BLOB NOT NULL,
+                PRIMARY KEY (aster_id, seq)
+             );",
+        ).map_err(|e| e.to_string())?;
+        let _ = conn.execute(
+            "ALTER TABLE message_cache ADD COLUMN attachments_state INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE message_cache ADD COLUMN attachment_attempts INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_message_cache_folder_meta ON message_cache(
+                folder, aster_id, subject, sender, recipients, date, size, flags, raw_headers, thread_id, attachments_state
+             );",
+        ).map_err(|e| e.to_string())?;
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_message_cache_attachments_state ON message_cache(attachments_state);
+             UPDATE message_cache SET attachments_state = 1
+              WHERE attachments_state = 0 AND raw_headers LIKE '%\"attachments\":[{%';",
+        ).map_err(|e| e.to_string())?;
+
+        conn.execute_batch(&format!(
+            "CREATE INDEX IF NOT EXISTS idx_message_cache_sealed ON message_cache(created_at)
+              WHERE {};
+             CREATE INDEX IF NOT EXISTS idx_message_cache_bundle ON message_cache(created_at)
+              WHERE {};",
+            body_is_predicate(crate::sync::poller::RATCHET_PLACEHOLDER),
+            body_starts_with_predicate(crate::crypto::ratchet_recovery::SUBJECT_BUNDLE_MARKER),
+        )).map_err(|e| e.to_string())?;
+
+        conn.execute_batch(OUTBOX_TABLE_SQL).map_err(|e| e.to_string())?;
+        repair_outbox_table(conn)?;
+        conn.execute_batch(history::HISTORY_SCHEMA_SQL).map_err(|e| e.to_string())?;
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_outbox_status_queued ON outbox(status, queued_at);",
+        ).map_err(|e| e.to_string())?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS pending_flag_push (
+                aster_id TEXT NOT NULL,
+                bit INTEGER NOT NULL,
+                value INTEGER NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                queued_at INTEGER NOT NULL,
+                PRIMARY KEY (aster_id, bit)
+             );",
+        ).map_err(|e| e.to_string())?;
+
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS message_fts USING fts5(
+                aster_id UNINDEXED,
+                subject,
+                sender,
+                recipients,
+                body_text,
+                tokenize = 'unicode61 remove_diacritics 2'
+            );",
+        ).map_err(|e| e.to_string())?;
+
+        let update_trigger: Option<String> = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'message_cache_au'",
+                [],
+                |r| r.get(0),
+            )
+            .ok();
+        if update_trigger.is_some_and(|sql| !sql.contains("UPDATE OF")) {
+            let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+            tx.execute_batch(
+                "DROP TRIGGER IF EXISTS message_cache_ai;
+                 DROP TRIGGER IF EXISTS message_cache_ad;
+                 DROP TRIGGER IF EXISTS message_cache_au;
+                 DELETE FROM message_fts;",
+            ).map_err(|e| format!("FTS migration failed: {}", e))?;
+            tx.commit().map_err(|e| e.to_string())?;
+        }
+
+        conn.execute_batch(
+            "CREATE TRIGGER IF NOT EXISTS message_cache_ai AFTER INSERT ON message_cache BEGIN
+                INSERT INTO message_fts(rowid, aster_id, subject, sender, recipients, body_text)
+                VALUES (NEW.rowid, NEW.aster_id, COALESCE(NEW.subject,''), COALESCE(NEW.sender,''),
+                        COALESCE(NEW.recipients,''), COALESCE(NEW.body_text,''));
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS message_cache_ad AFTER DELETE ON message_cache BEGIN
+                DELETE FROM message_fts WHERE rowid = OLD.rowid;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS message_cache_au
+            AFTER UPDATE OF subject, sender, recipients, body_text ON message_cache
+            WHEN OLD.subject IS NOT NEW.subject OR OLD.sender IS NOT NEW.sender
+              OR OLD.recipients IS NOT NEW.recipients OR OLD.body_text IS NOT NEW.body_text
+            BEGIN
+                DELETE FROM message_fts WHERE rowid = OLD.rowid;
+                INSERT INTO message_fts(rowid, aster_id, subject, sender, recipients, body_text)
+                VALUES (NEW.rowid, NEW.aster_id, COALESCE(NEW.subject,''), COALESCE(NEW.sender,''),
+                        COALESCE(NEW.recipients,''), COALESCE(NEW.body_text,''));
+            END;",
+        ).map_err(|e| e.to_string())?;
+
+        let fts_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM message_fts", [], |r| r.get(0))
+            .unwrap_or(0);
+        let cache_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM message_cache", [], |r| r.get(0))
+            .unwrap_or(0);
+        if fts_count == 0 && cache_count > 0 {
+            conn.execute_batch(
+                "INSERT INTO message_fts(rowid, aster_id, subject, sender, recipients, body_text)
+                 SELECT rowid, aster_id, COALESCE(subject,''), COALESCE(sender,''),
+                        COALESCE(recipients,''), COALESCE(body_text,'')
+                 FROM message_cache;",
+            ).map_err(|e| format!("FTS backfill failed: {}", e))?;
+        }
+
+        let schema_revision: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap_or(0);
+        if schema_revision < WIRE_SIZE_REVISION {
+            conn.execute_batch(&format!(
+                "BEGIN IMMEDIATE;
+                 UPDATE message_cache
+                 SET size = length(CAST(body_text AS BLOB))
+                     + (length(body_text) - length(replace(body_text, char(10), '')))
+                     + (length(body_text) - length(replace(body_text, char(13), '')))
+                     - (length(body_text) - length(replace(body_text, char(13) || char(10), '')))
+                 WHERE body_text IS NOT NULL
+                   AND (instr(body_text, char(10)) > 0 OR instr(body_text, char(13)) > 0);
+                 PRAGMA user_version = {};
+                 COMMIT;",
+                WIRE_SIZE_REVISION
+            ))
+            .map_err(|e| format!("message size repair failed: {}", e))?;
+        }
+
+        verify_required_columns(conn)
+    }
+
+    pub fn fts_search(&self, query: &str, limit: i64) -> Result<Vec<String>, String> {
+        let q = sanitize_fts_query(query);
+        if q.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT message_fts.aster_id FROM message_fts
+                 JOIN message_cache ON message_cache.aster_id = message_fts.aster_id
+                 WHERE message_fts MATCH ?1
+                 ORDER BY message_cache.date DESC
+                 LIMIT ?2",
+            )?;
+            let rows = stmt
+                .query_map(rusqlite::params![q, limit], |r| r.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+    }
+
+    pub fn fts_snippet(
+        &self,
+        aster_id: &str,
+        query: &str,
+    ) -> Result<Option<(Option<String>, Option<String>)>, String> {
+        let q = sanitize_fts_query(query);
+        if q.is_empty() {
+            return Ok(None);
+        }
+        self.with_conn(|conn| {
+            let row = conn
+                .query_row(
+                    "SELECT snippet(message_fts, 1, char(2), char(3), '…', 16) AS subj,
+                            snippet(message_fts, 4, char(2), char(3), '…', 32) AS body
+                     FROM message_fts
+                     WHERE message_fts MATCH ?1 AND aster_id = ?2
+                     LIMIT 1",
+                    rusqlite::params![q, aster_id],
+                    |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?)),
+                )
+                .ok();
+            Ok(row.map(|(subj, body)| (escape_fts_snippet(subj), escape_fts_snippet(body))))
+        })
+    }
+}
+
+const FTS_MARK_START: char = '\u{0002}';
+const FTS_MARK_END: char = '\u{0003}';
+
+pub struct WriteBatch<'c> {
+    conn: &'c Connection,
+}
+
+impl WriteBatch<'_> {
+    pub fn update_message_flags(&self, imap_uid: i64, folder: &str, new_flags: i64) -> Result<(), String> {
+        update_message_flags_on(self.conn, imap_uid, folder, new_flags).map_err(|e| e.to_string())
+    }
+
+    pub fn set_message_keywords(&self, aster_id: &str, keywords: &[String]) -> Result<(), String> {
+        self.conn
+            .execute_batch("SAVEPOINT set_keywords")
+            .map_err(|e| e.to_string())?;
+        match set_message_keywords_on(self.conn, aster_id, keywords) {
+            Ok(()) => self.conn.execute_batch("RELEASE set_keywords"),
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK TO set_keywords; RELEASE set_keywords");
+                Err(e)
+            }
+        }
+        .map_err(|e| e.to_string())
+    }
+
+    pub fn delete_message_by_uid(&self, uid: i64, folder: &str) -> Result<(), String> {
+        delete_message_by_uid_on(self.conn, uid, folder).map_err(|e| e.to_string())
+    }
+
+    pub fn delete_message_by_aster_id(&self, aster_id: &str) -> Result<(), String> {
+        delete_message_by_aster_id_on(self.conn, aster_id).map_err(|e| e.to_string())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_cached_message(
+        &self,
+        aster_id: &str,
+        folder: &str,
+        subject: Option<&str>,
+        sender: Option<&str>,
+        recipients: Option<&str>,
+        date: Option<&str>,
+        size: i64,
+        body_text: Option<&str>,
+        raw_headers: Option<&str>,
+    ) -> Result<bool, String> {
+        upsert_cached_message_on(
+            self.conn, aster_id, folder, subject, sender, recipients, date, size, body_text, raw_headers,
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    pub fn remove_uid_mapping(&self, uid: i64, folder: &str) -> Result<(), String> {
+        remove_uid_mapping_on(self.conn, uid, folder).map_err(|e| e.to_string())
+    }
+
+    pub fn assign_uid_if_missing(&self, folder: &str, aster_id: &str) -> Result<u32, String> {
+        assign_uid_if_missing_on(self.conn, folder, aster_id).map_err(|e| e.to_string())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn upsert_cached_message_on(
+    conn: &Connection,
+    aster_id: &str,
+    folder: &str,
+    subject: Option<&str>,
+    sender: Option<&str>,
+    recipients: Option<&str>,
+    date: Option<&str>,
+    size: i64,
+    body_text: Option<&str>,
+    raw_headers: Option<&str>,
+) -> rusqlite::Result<bool> {
+    let subject = subject.map(strip_c0_controls);
+    let sender = sender.map(strip_c0_controls);
+    let recipients = recipients.map(strip_c0_controls);
+    let body_text = body_text.map(strip_c0_controls);
+    let size = body_text
+        .as_ref()
+        .map_or(size, |b| crate::message_render::crlf_normalized_len(b) as i64);
+    conn.execute(
+        "INSERT OR IGNORE INTO message_cache (aster_id, folder, subject, sender, recipients, date, size, body_cached, body_text, raw_headers)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        rusqlite::params![
+            aster_id,
+            folder,
+            subject,
+            sender,
+            recipients,
+            date,
+            size,
+            body_text.is_some() as i32,
+            body_text,
+            raw_headers,
+        ],
+    )?;
+    let was_inserted = conn.changes() > 0;
+    if !was_inserted {
+        conn.execute(
+            "UPDATE message_cache SET folder=?2, subject=?3, sender=?4, recipients=?5, date=?6, size=?7, raw_headers=?8 WHERE aster_id=?1",
+            rusqlite::params![aster_id, folder, subject, sender, recipients, date, size, raw_headers],
+        )?;
+        if body_text.is_some() {
+            conn.execute(
+                "UPDATE message_cache SET body_cached=1, body_text=?2 WHERE aster_id=?1",
+                rusqlite::params![aster_id, body_text],
+            )?;
+        }
+    }
+    Ok(was_inserted)
+}
+
+fn update_message_flags_on(conn: &Connection, imap_uid: i64, folder: &str, new_flags: i64) -> rusqlite::Result<()> {
+    let aster_id: Option<String> = conn
+        .query_row(
+            "SELECT aster_id FROM uid_map WHERE imap_uid = ?1 AND folder = ?2",
+            rusqlite::params![imap_uid, folder],
+            |r| r.get(0),
+        )
+        .ok();
+    if let Some(id) = aster_id {
+        conn.execute(
+            "UPDATE message_cache SET flags = ?1 WHERE aster_id = ?2",
+            rusqlite::params![new_flags, id],
+        )?;
+    }
+    Ok(())
+}
+
+fn delete_message_by_uid_on(conn: &Connection, uid: i64, folder: &str) -> rusqlite::Result<()> {
+    let aster_id: Option<String> = conn
+        .query_row(
+            "SELECT aster_id FROM uid_map WHERE imap_uid = ?1 AND folder = ?2",
+            rusqlite::params![uid, folder],
+            |r| r.get(0),
+        )
+        .ok();
+    if let Some(id) = &aster_id {
+        conn.execute("DELETE FROM message_cache WHERE aster_id = ?1", [id])?;
+        conn.execute("DELETE FROM message_attachment WHERE aster_id = ?1", [id])?;
+        conn.execute(
+            "DELETE FROM uid_map WHERE aster_id = ?1 AND folder = ?2",
+            rusqlite::params![id, folder],
+        )?;
+    }
+    Ok(())
+}
+
+fn remove_uid_mapping_on(conn: &Connection, uid: i64, folder: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "DELETE FROM uid_map WHERE imap_uid = ?1 AND folder = ?2",
+        rusqlite::params![uid, folder],
+    )?;
+    Ok(())
+}
+
+fn delete_message_by_aster_id_on(conn: &Connection, aster_id: &str) -> rusqlite::Result<()> {
+    conn.execute("DELETE FROM message_cache WHERE aster_id = ?1", [aster_id])?;
+    conn.execute("DELETE FROM message_attachment WHERE aster_id = ?1", [aster_id])?;
+    conn.execute("DELETE FROM uid_map WHERE aster_id = ?1", [aster_id])?;
+    conn.execute("DELETE FROM listing_member WHERE aster_id = ?1", [aster_id])?;
+    conn.execute("DELETE FROM history_prune_queue WHERE aster_id = ?1", [aster_id])?;
+    conn.execute("DELETE FROM history_retry WHERE aster_id = ?1", [aster_id])?;
+    Ok(())
+}
+
+fn assign_uid_if_missing_on(conn: &Connection, folder: &str, aster_id: &str) -> rusqlite::Result<u32> {
+    if let Ok(uid) = conn.query_row(
+        "SELECT imap_uid FROM uid_map WHERE aster_id = ?1 AND folder = ?2",
+        rusqlite::params![aster_id, folder],
+        |r| r.get::<_, i64>(0),
+    ) {
+        return Ok(uid as u32);
+    }
+    let key = format!("uidnext:{}", folder);
+    let stored: i64 = conn
+        .query_row(
+            "SELECT value FROM sync_state WHERE key = ?1",
+            rusqlite::params![key],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0);
+    let existing_max: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(imap_uid), 0) FROM uid_map WHERE folder = ?1",
+            rusqlite::params![folder],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let next = stored.max(existing_max + 1).max(1);
+    conn.execute(
+        "INSERT INTO uid_map (aster_id, folder, imap_uid) VALUES (?1, ?2, ?3)",
+        rusqlite::params![aster_id, folder, next],
+    )?;
+    conn.execute(
+        "INSERT INTO sync_state (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        rusqlite::params![key, (next + 1).to_string()],
+    )?;
+    Ok(next as u32)
+}
+
+fn set_message_keywords_on(conn: &Connection, aster_id: &str, keywords: &[String]) -> rusqlite::Result<()> {
+    conn.execute("DELETE FROM message_keywords WHERE aster_id = ?1", [aster_id])?;
+    for keyword in keywords {
+        conn.execute(
+            "INSERT OR IGNORE INTO message_keywords (aster_id, keyword)
+             SELECT ?1, ?2 WHERE NOT EXISTS (
+                SELECT 1 FROM custom_tag WHERE keyword = ?2
+             ) AND NOT EXISTS (
+                SELECT 1 FROM custom_tag_alias WHERE keyword = ?2
+             )",
+            rusqlite::params![aster_id, keyword],
+        )?;
+    }
+    Ok(())
+}
+
+fn custom_tags_on(conn: &Connection) -> rusqlite::Result<Vec<CustomTag>> {
+    let mut stmt = conn.prepare(
+        "SELECT tag_token, server_id, name, keyword, position FROM custom_tag ORDER BY tag_token",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(CustomTag {
+                tag_token: r.get(0)?,
+                server_id: r.get(1)?,
+                name: r.get(2)?,
+                keyword: r.get(3)?,
+                position: r.get(4)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+fn tag_slot_overrides_on(conn: &Connection) -> rusqlite::Result<HashMap<usize, crate::tags::SlotOverride>> {
+    let mut stmt = conn.prepare("SELECT slot, tag_token FROM builtin_tag_slot")?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(slot, token)| {
+            let slot = usize::try_from(slot).ok()?;
+            let choice = match token {
+                Some(token) => crate::tags::SlotOverride::Label(token),
+                None => crate::tags::SlotOverride::Off,
+            };
+            Some((slot, choice))
+        })
+        .collect())
+}
+
+fn slot_assignments_on(conn: &Connection) -> rusqlite::Result<Vec<Option<String>>> {
+    let tags = custom_tags_on(conn)?;
+    Ok(crate::tags::slot_assignments(&tags, &tag_slot_overrides_on(conn)?))
+}
+
+fn rebuild_tag_aliases(conn: &Connection) -> rusqlite::Result<()> {
+    let tags = custom_tags_on(conn)?;
+    let overrides = tag_slot_overrides_on(conn)?;
+    conn.execute("DELETE FROM custom_tag_alias", [])?;
+    let rows = crate::tags::alias_rows(&tags)
+        .into_iter()
+        .chain(crate::tags::slot_alias_rows(&tags, &overrides));
+    for (keyword, tag_token) in rows {
+        conn.execute(
+            "INSERT OR IGNORE INTO custom_tag_alias (keyword, tag_token) VALUES (?1, ?2)",
+            rusqlite::params![keyword, tag_token],
+        )?;
+    }
+    conn.execute(
+        "DELETE FROM message_keywords WHERE EXISTS (
+            SELECT 1 FROM message_tag a
+            JOIN custom_tag t ON t.tag_token = a.tag_token
+            WHERE a.aster_id = message_keywords.aster_id AND t.keyword = message_keywords.keyword
+         ) OR EXISTS (
+            SELECT 1 FROM message_tag a
+            JOIN custom_tag_alias l ON l.tag_token = a.tag_token
+            WHERE a.aster_id = message_keywords.aster_id AND l.keyword = message_keywords.keyword
+         )",
+        [],
+    )?;
+    Ok(())
+}
+
+fn escape_fts_snippet(raw: Option<String>) -> Option<String> {
+    raw.map(|s| {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+            .replace(FTS_MARK_START, "<mark>")
+            .replace(FTS_MARK_END, "</mark>")
+    })
+}
+
+fn sanitize_fts_query(input: &str) -> String {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let tokens: Vec<String> = trimmed
+        .split_whitespace()
+        .filter_map(|tok| {
+            let cleaned: String = tok
+                .chars()
+                .filter(|c| c.is_alphanumeric() || *c == '\'' || *c == '-' || *c == '_' || *c == '@' || *c == '.')
+                .collect();
+            if cleaned.is_empty() {
+                None
+            } else {
+                Some(format!("\"{}\"", cleaned.replace('"', "\"\"")))
+            }
+        })
+        .collect();
+    tokens.join(" ")
+}
+
+impl Database {
+
+    pub fn with_conn<F, R>(&self, f: F) -> Result<R, String>
+    where
+        F: FnOnce(&Connection) -> Result<R, rusqlite::Error>,
+    {
+        without_starving_the_runtime(|| {
+            let conn = self.conn.lock().map_err(|e| e.to_string())?;
+            f(&conn).map_err(|e| e.to_string())
+        })
+    }
+
+    pub fn write_batch<R>(&self, f: impl Fn(&WriteBatch<'_>) -> R) -> R {
+        without_starving_the_runtime(|| {
+            let conn = match self.conn.lock() {
+                Ok(conn) => conn,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            match conn.unchecked_transaction() {
+                Ok(tx) => {
+                    let out = f(&WriteBatch { conn: &tx });
+                    match tx.commit() {
+                        Ok(()) => return out,
+                        Err(e) => {
+                            tracing::warn!("write batch commit failed, writing one at a time: {}", e);
+                            if !conn.is_autocommit() {
+                                let _ = conn.execute_batch("ROLLBACK");
+                            }
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!("write batch runs without a transaction: {}", e),
+            }
+            f(&WriteBatch { conn: &conn })
+        })
+    }
+
+    pub fn upsert_cached_message(
+        &self,
+        aster_id: &str,
+        folder: &str,
+        subject: Option<&str>,
+        sender: Option<&str>,
+        recipients: Option<&str>,
+        date: Option<&str>,
+        size: i64,
+        body_text: Option<&str>,
+        raw_headers: Option<&str>,
+    ) -> Result<bool, String> {
+        self.with_conn(|conn| {
+            upsert_cached_message_on(
+                conn, aster_id, folder, subject, sender, recipients, date, size, body_text, raw_headers,
+            )
+        })
+    }
+
+    pub fn set_cached_raw_headers(&self, aster_id: &str, raw_headers: &str) -> Result<(), String> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE message_cache SET raw_headers = ?2 WHERE aster_id = ?1",
+                rusqlite::params![aster_id, raw_headers],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn body_cached(&self, aster_id: &str) -> bool {
+        self.with_conn(|conn| {
+            let cached: Option<i64> = conn
+                .query_row(
+                    "SELECT body_cached FROM message_cache WHERE aster_id = ?1",
+                    rusqlite::params![aster_id],
+                    |row| row.get(0),
+                )
+                .ok();
+            Ok(cached == Some(1))
+        })
+        .unwrap_or(false)
+    }
+
+    pub fn update_cached_body(
+        &self,
+        aster_id: &str,
+        body_text: &str,
+        raw_headers: Option<&str>,
+    ) -> Result<(), String> {
+        let body = strip_c0_controls(body_text);
+        let size = crate::message_render::crlf_normalized_len(&body) as i64;
+        self.with_conn(|conn| {
+            match raw_headers {
+                Some(rh) => conn.execute(
+                    "UPDATE message_cache SET body_cached=1, body_text=?2, size=?3, raw_headers=?4 WHERE aster_id=?1",
+                    rusqlite::params![aster_id, body, size, rh],
+                )?,
+                None => conn.execute(
+                    "UPDATE message_cache SET body_cached=1, body_text=?2, size=?3 WHERE aster_id=?1",
+                    rusqlite::params![aster_id, body, size],
+                )?,
+            };
+            Ok(())
+        })
+    }
+
+    pub fn update_cached_subject(&self, aster_id: &str, subject: &str) -> Result<(), String> {
+        let single_line: String = subject
+            .chars()
+            .map(|c| if matches!(c, '\r' | '\n' | '\t') { ' ' } else { c })
+            .collect();
+        let subject = strip_c0_controls(single_line.trim());
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE message_cache SET subject=?2 WHERE aster_id=?1",
+                rusqlite::params![aster_id, subject],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn list_ids_with_body(&self, body_text: &str, limit: usize) -> Result<Vec<String>, String> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT aster_id FROM message_cache WHERE {} ORDER BY created_at DESC LIMIT ?1",
+                body_is_predicate(body_text),
+            ))?;
+            let rows = stmt.query_map([limit], |row| row.get::<_, String>(0))?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+    }
+
+    pub fn list_bodies_starting_with(
+        &self,
+        marker: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>, String> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT aster_id, body_text FROM message_cache WHERE {} ORDER BY created_at DESC LIMIT ?1",
+                body_starts_with_predicate(marker),
+            ))?;
+            let rows = stmt.query_map([limit], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+    }
+
+    pub fn list_cached_messages(&self, folder: &str) -> Result<Vec<CachedMessage>, String> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT m.aster_id, m.folder, m.subject, m.sender, m.recipients, m.date, m.size, m.flags, m.body_text, m.raw_headers, COALESCE(u.imap_uid, 0), m.thread_id, m.attachments_state
+                 FROM message_cache m
+                 LEFT JOIN uid_map u ON u.aster_id = m.aster_id AND u.folder = m.folder
+                 WHERE m.folder = ?1
+                 ORDER BY u.imap_uid ASC",
+            )?;
+            let rows = stmt.query_map([folder], |row| {
+                Ok(CachedMessage {
+                    aster_id: row.get(0)?,
+                    folder: row.get(1)?,
+                    subject: row.get(2)?,
+                    sender: row.get(3)?,
+                    recipients: row.get(4)?,
+                    date: row.get(5)?,
+                    size: row.get(6)?,
+                    flags: row.get(7)?,
+                    body_text: row.get(8)?,
+                    raw_headers: row.get(9)?,
+                    imap_uid: row.get::<_, i64>(10)? as u32,
+                    thread_id: row.get(11)?,
+                    attachments_state: row.get(12)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+    }
+
+    pub fn list_cached_message_meta_for_uids(
+        &self,
+        folder: &str,
+        uids: &[u32],
+    ) -> Result<Vec<CachedMessage>, String> {
+        let mut uids = uids.to_vec();
+        uids.sort_unstable();
+        uids.dedup();
+        self.with_conn(|conn| {
+            let mut out = Vec::new();
+            for chunk in uids.chunks(SQL_IN_CHUNK) {
+                let sql = format!(
+                    "SELECT m.aster_id, m.folder, m.subject, m.sender, m.recipients, m.date, m.size, m.flags, NULL, m.raw_headers, u.imap_uid, m.thread_id, m.attachments_state
+                     FROM uid_map u
+                     JOIN message_cache m ON m.aster_id = u.aster_id AND m.folder = u.folder
+                     WHERE u.folder = ? AND u.imap_uid IN ({})
+                     ORDER BY u.imap_uid ASC",
+                    sql_placeholders(chunk.len()),
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let params = std::iter::once(rusqlite::types::Value::from(folder.to_string()))
+                    .chain(chunk.iter().map(|uid| rusqlite::types::Value::from(*uid as i64)));
+                let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| {
+                    Ok(CachedMessage {
+                        aster_id: row.get(0)?,
+                        folder: row.get(1)?,
+                        subject: row.get(2)?,
+                        sender: row.get(3)?,
+                        recipients: row.get(4)?,
+                        date: row.get(5)?,
+                        size: row.get(6)?,
+                        flags: row.get(7)?,
+                        body_text: row.get(8)?,
+                        raw_headers: row.get(9)?,
+                        imap_uid: row.get::<_, i64>(10)? as u32,
+                        thread_id: row.get(11)?,
+                        attachments_state: row.get(12)?,
+                    })
+                })?;
+                for r in rows {
+                    out.push(r?);
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    pub fn list_cached_message_meta(&self, folder: &str) -> Result<Vec<CachedMessage>, String> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT m.aster_id, m.folder, m.subject, m.sender, m.recipients, m.date, m.size, m.flags, NULL, m.raw_headers, COALESCE(u.imap_uid, 0), m.thread_id, m.attachments_state
+                 FROM message_cache m
+                 LEFT JOIN uid_map u ON u.aster_id = m.aster_id AND u.folder = m.folder
+                 WHERE m.folder = ?1
+                 ORDER BY u.imap_uid ASC",
+            )?;
+            let rows = stmt.query_map([folder], |row| {
+                Ok(CachedMessage {
+                    aster_id: row.get(0)?,
+                    folder: row.get(1)?,
+                    subject: row.get(2)?,
+                    sender: row.get(3)?,
+                    recipients: row.get(4)?,
+                    date: row.get(5)?,
+                    size: row.get(6)?,
+                    flags: row.get(7)?,
+                    body_text: row.get(8)?,
+                    raw_headers: row.get(9)?,
+                    imap_uid: row.get::<_, i64>(10)? as u32,
+                    thread_id: row.get(11)?,
+                    attachments_state: row.get(12)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+    }
+
+    pub fn count_cached_messages(&self, folder: &str) -> Result<u32, String> {
+        self.with_conn(|conn| {
+            let n: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM message_cache WHERE folder = ?1",
+                [folder],
+                |r| r.get(0),
+            )?;
+            Ok(n as u32)
+        })
+    }
+
+    pub fn count_unread_messages(&self, folder: &str) -> Result<u32, String> {
+        self.with_conn(|conn| {
+            let n: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM message_cache WHERE folder = ?1 AND (flags & 1) = 0",
+                [folder],
+                |r| r.get(0),
+            )?;
+            Ok(n as u32)
+        })
+    }
+
+    pub fn delete_message_by_uid(&self, uid: i64, folder: &str) -> Result<(), String> {
+        self.with_conn(|conn| delete_message_by_uid_on(conn, uid, folder))
+    }
+
+    pub fn set_folder_if_changed(&self, aster_id: &str, folder: &str) -> Result<(), String> {
+        self.with_conn(|conn| {
+            let changed = conn.execute(
+                "UPDATE message_cache SET folder = ?2 WHERE aster_id = ?1 AND folder != ?2",
+                rusqlite::params![aster_id, folder],
+            )?;
+            if changed > 0 {
+                conn.execute(
+                    "DELETE FROM uid_map WHERE aster_id = ?1 AND folder != ?2",
+                    rusqlite::params![aster_id, folder],
+                )?;
+            }
+            Ok(())
+        })
+    }
+
+    pub(crate) fn set_aster_sender_scope(&self, scope: crate::crypto::internal_send::AsterSenderScope) {
+        *self.aster_sender_scope.lock().unwrap_or_else(|e| e.into_inner()) = Some(scope);
+    }
+
+    pub(crate) fn aster_sender_scope(&self) -> Option<crate::crypto::internal_send::AsterSenderScope> {
+        self.aster_sender_scope
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn pin_appended(&self, aster_id: &str, folder: &str) {
+        let mut pins = self.append_pins.lock().unwrap_or_else(|e| e.into_inner());
+        let now = std::time::Instant::now();
+        if pins.len() >= APPEND_PIN_SWEEP_LEN {
+            pins.retain(|_, pin| now.duration_since(pin.at) < APPEND_PIN_TTL);
+        }
+        pins.insert(
+            aster_id.to_string(),
+            AppendPin {
+                folder: folder.to_string(),
+                at: now,
+            },
+        );
+    }
+
+    pub(crate) fn unless_listing_predates_append<T>(
+        &self,
+        aster_id: &str,
+        folder: &str,
+        listed_at: std::time::Instant,
+        write: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let pins = self.append_pins.lock().unwrap_or_else(|e| e.into_inner());
+        if pins
+            .get(aster_id)
+            .is_some_and(|pin| pin.folder != folder && pin.at >= listed_at)
+        {
+            return None;
+        }
+        Some(write())
+    }
+
+    pub(crate) fn unless_appended_since<T>(
+        &self,
+        aster_id: &str,
+        since: std::time::Instant,
+        write: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let pins = self.append_pins.lock().unwrap_or_else(|e| e.into_inner());
+        if pins.get(aster_id).is_some_and(|pin| pin.at >= since) {
+            return None;
+        }
+        Some(write())
+    }
+
+    pub fn remove_uid_mapping(&self, uid: i64, folder: &str) -> Result<(), String> {
+        self.with_conn(|conn| remove_uid_mapping_on(conn, uid, folder))
+    }
+
+    pub fn delete_message_by_aster_id(&self, aster_id: &str) -> Result<(), String> {
+        self.with_conn(|conn| delete_message_by_aster_id_on(conn, aster_id))
+    }
+
+    pub fn get_message_flags_by_id(&self, aster_id: &str) -> Result<i64, String> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT flags FROM message_cache WHERE aster_id = ?1",
+                rusqlite::params![aster_id],
+                |r| r.get::<_, i64>(0),
+            )
+        })
+    }
+
+    pub fn cached_sync_states(
+        &self,
+        aster_ids: &[&str],
+    ) -> Result<HashMap<String, CachedSyncState>, String> {
+        let mut out: HashMap<String, CachedSyncState> = HashMap::new();
+        if aster_ids.is_empty() {
+            return Ok(out);
+        }
+        self.with_conn(|conn| {
+            for chunk in aster_ids.chunks(500) {
+                let placeholders = vec!["?"; chunk.len()].join(",");
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT aster_id, body_cached, folder, flags, raw_headers
+                     FROM message_cache WHERE aster_id IN ({})",
+                    placeholders
+                ))?;
+                let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        CachedSyncState {
+                            body_cached: r.get::<_, i64>(1)? == 1,
+                            folder: r.get(2)?,
+                            flags: r.get(3)?,
+                            raw_headers: r.get(4)?,
+                            uid_folders: Vec::new(),
+                        },
+                    ))
+                })?;
+                for row in rows {
+                    let (id, state) = row?;
+                    out.insert(id, state);
+                }
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT aster_id, folder FROM uid_map WHERE aster_id IN ({})",
+                    placeholders
+                ))?;
+                let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })?;
+                for row in rows {
+                    let (id, folder) = row?;
+                    if let Some(state) = out.get_mut(&id) {
+                        state.uid_folders.push(folder);
+                    }
+                }
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    pub fn set_message_flags_if_unchanged(
+        &self,
+        updates: &[(String, i64, i64)],
+    ) -> Result<Vec<String>, String> {
+        if updates.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let mut stale = Vec::new();
+            {
+                let mut stmt = tx.prepare(
+                    "UPDATE message_cache SET flags = ?1 WHERE aster_id = ?2 AND flags = ?3",
+                )?;
+                for (aster_id, expected, flags) in updates {
+                    if stmt.execute(rusqlite::params![flags, aster_id, expected])? == 0 {
+                        stale.push(aster_id.clone());
+                    }
+                }
+            }
+            tx.commit()?;
+            Ok(stale)
+        })
+    }
+
+    pub fn set_message_flags_by_id(&self, aster_id: &str, new_flags: i64) -> Result<(), String> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE message_cache SET flags = ?1 WHERE aster_id = ?2",
+                rusqlite::params![new_flags, aster_id],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn record_pending_flag_pushes(&self, changes: &[(String, bool)], bit: i64) -> Result<(), String> {
+        if changes.is_empty() {
+            return Ok(());
+        }
+        let now = unix_millis() as i64;
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            {
+                let mut stmt = tx.prepare(
+                    "INSERT INTO pending_flag_push (aster_id, bit, value, attempts, queued_at)
+                     VALUES (?1, ?2, ?3, 0, ?4)
+                     ON CONFLICT(aster_id, bit) DO UPDATE SET
+                        value = excluded.value, attempts = 0, queued_at = excluded.queued_at",
+                )?;
+                for (aster_id, value) in changes {
+                    stmt.execute(rusqlite::params![aster_id, bit, *value as i64, now])?;
+                }
+            }
+            tx.commit()
+        })
+    }
+
+    pub fn clear_pending_flag_pushes(&self, aster_ids: &[String], bit: i64, value: bool) -> Result<(), String> {
+        if aster_ids.is_empty() {
+            return Ok(());
+        }
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            {
+                let mut stmt = tx.prepare(
+                    "DELETE FROM pending_flag_push WHERE aster_id = ?1 AND bit = ?2 AND value = ?3",
+                )?;
+                for aster_id in aster_ids {
+                    stmt.execute(rusqlite::params![aster_id, bit, value as i64])?;
+                }
+            }
+            tx.commit()
+        })
+    }
+
+    pub fn note_failed_flag_push(&self, aster_id: &str, bit: i64, value: bool) -> Result<(), String> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE pending_flag_push SET attempts = attempts + 1
+                 WHERE aster_id = ?1 AND bit = ?2 AND value = ?3",
+                rusqlite::params![aster_id, bit, value as i64],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn drop_exhausted_flag_pushes(&self, max_attempts: i64) -> Result<usize, String> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "DELETE FROM pending_flag_push WHERE attempts >= ?1",
+                rusqlite::params![max_attempts],
+            )
+        })
+    }
+
+    pub fn pending_flag_pushes(&self, min_age_ms: i64, limit: usize) -> Result<Vec<(String, i64, bool)>, String> {
+        let queued_before = unix_millis() as i64 - min_age_ms;
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT aster_id, bit, value FROM pending_flag_push
+                 WHERE queued_at <= ?1 ORDER BY queued_at LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![queued_before, limit as i64], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)? != 0))
+            })?;
+            rows.collect()
+        })
+    }
+
+    pub fn pending_flag_values(&self, aster_ids: &[&str]) -> Result<HashMap<String, Vec<(i64, bool)>>, String> {
+        let mut out: HashMap<String, Vec<(i64, bool)>> = HashMap::new();
+        if aster_ids.is_empty() {
+            return Ok(out);
+        }
+        self.with_conn(|conn| {
+            for chunk in aster_ids.chunks(500) {
+                let placeholders = vec!["?"; chunk.len()].join(",");
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT aster_id, bit, value FROM pending_flag_push WHERE aster_id IN ({})",
+                    placeholders
+                ))?;
+                let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)? != 0))
+                })?;
+                for row in rows {
+                    let (id, bit, value) = row?;
+                    out.entry(id).or_default().push((bit, value));
+                }
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// IMAP keywords (user-defined flags such as Thunderbird's `$label1`
+    /// tags) of one message. They live only in the bridge: the Aster API has
+    /// no place for them. Keyed by message, so they survive moves and cache
+    /// repairs.
+    pub fn message_keywords(&self, aster_id: &str) -> Result<Vec<String>, String> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT keyword FROM message_keywords WHERE aster_id = ?1
+                 UNION
+                 SELECT t.keyword FROM message_tag a
+                 JOIN custom_tag t ON t.tag_token = a.tag_token
+                 WHERE a.aster_id = ?1 AND t.keyword IS NOT NULL
+                 ORDER BY 1",
+            )?;
+            let rows = stmt
+                .query_map([aster_id], |r| r.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+    }
+
+    pub fn keywords_for_messages(&self, aster_ids: &[String]) -> Result<HashMap<String, Vec<String>>, String> {
+        self.with_conn(|conn| {
+            let mut out: HashMap<String, Vec<String>> = HashMap::new();
+            for chunk in unique_ids(aster_ids).chunks(SQL_IN_CHUNK) {
+                let placeholders = sql_placeholders(chunk.len());
+                let sql = format!(
+                    "SELECT aster_id, keyword FROM message_keywords WHERE aster_id IN ({0})
+                     UNION
+                     SELECT a.aster_id, t.keyword FROM message_tag a
+                     JOIN custom_tag t ON t.tag_token = a.tag_token
+                     WHERE a.aster_id IN ({0}) AND t.keyword IS NOT NULL
+                     UNION
+                     SELECT a.aster_id, l.keyword FROM message_tag a
+                     JOIN custom_tag_alias l ON l.tag_token = a.tag_token
+                     WHERE a.aster_id IN ({0})
+                     ORDER BY 2",
+                    placeholders,
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt.query_map(
+                    rusqlite::params_from_iter(chunk.iter().chain(chunk.iter()).chain(chunk.iter())),
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+                )?;
+                for row in rows {
+                    let (id, keyword) = row?;
+                    out.entry(id).or_default().push(keyword);
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    /// Keywords of every message in a folder that has any, by message id.
+    pub fn folder_keywords(&self, folder: &str) -> Result<HashMap<String, Vec<String>>, String> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT k.aster_id, k.keyword FROM message_keywords k
+                 JOIN message_cache m ON m.aster_id = k.aster_id
+                 WHERE m.folder = ?1
+                 UNION
+                 SELECT a.aster_id, t.keyword FROM message_tag a
+                 JOIN custom_tag t ON t.tag_token = a.tag_token
+                 JOIN message_cache m ON m.aster_id = a.aster_id
+                 WHERE m.folder = ?1 AND t.keyword IS NOT NULL
+                 UNION
+                 SELECT a.aster_id, l.keyword FROM message_tag a
+                 JOIN custom_tag_alias l ON l.tag_token = a.tag_token
+                 JOIN message_cache m ON m.aster_id = a.aster_id
+                 WHERE m.folder = ?1
+                 ORDER BY 2",
+            )?;
+            let mut out: HashMap<String, Vec<String>> = HashMap::new();
+            let rows = stmt.query_map([folder], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (id, keyword) = row?;
+                out.entry(id).or_default().push(keyword);
+            }
+            Ok(out)
+        })
+    }
+
+    pub fn set_message_keywords(&self, aster_id: &str, keywords: &[String]) -> Result<(), String> {
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            set_message_keywords_on(&tx, aster_id, keywords)?;
+            tx.commit()
+        })
+    }
+
+    pub fn local_keyword_messages(&self) -> Result<Vec<(String, Vec<String>)>, String> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT k.keyword, k.aster_id FROM message_keywords k
+                 JOIN message_cache m ON m.aster_id = k.aster_id
+                 ORDER BY k.keyword, k.aster_id",
+            )?;
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            let mut out: Vec<(String, Vec<String>)> = Vec::new();
+            for row in rows {
+                let (keyword, id) = row?;
+                match out.last_mut() {
+                    Some((known, ids)) if known.eq_ignore_ascii_case(&keyword) => ids.push(id),
+                    _ => out.push((keyword, vec![id])),
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    pub fn list_custom_tags(&self) -> Result<Vec<CustomTag>, String> {
+        self.with_conn(custom_tags_on)
+    }
+
+    pub fn replace_custom_tags(&self, tags: &[CustomTag]) -> Result<bool, String> {
+        let mut incoming: Vec<CustomTag> = tags.to_vec();
+        incoming.sort_by(|a, b| a.tag_token.cmp(&b.tag_token));
+        incoming.dedup_by(|a, b| a.tag_token == b.tag_token);
+        if self.list_custom_tags()? == incoming {
+            return Ok(false);
+        }
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute("DELETE FROM custom_tag", [])?;
+            for tag in &incoming {
+                tx.execute(
+                    "INSERT INTO custom_tag (tag_token, server_id, name, keyword, position) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![tag.tag_token, tag.server_id, tag.name, tag.keyword, tag.position],
+                )?;
+            }
+            tx.execute(
+                "DELETE FROM message_tag WHERE tag_token NOT IN (SELECT tag_token FROM custom_tag)",
+                [],
+            )?;
+            rebuild_tag_aliases(&tx)?;
+            tx.commit()?;
+            Ok(true)
+        })
+    }
+
+    pub fn upsert_custom_tag(&self, tag: &CustomTag) -> Result<(), String> {
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
+                "INSERT INTO custom_tag (tag_token, server_id, name, keyword, position)
+                 VALUES (?1, ?2, ?3, CASE WHEN EXISTS (
+                    SELECT 1 FROM custom_tag WHERE keyword = ?4 AND tag_token != ?1
+                 ) THEN NULL ELSE ?4 END, ?5)
+                 ON CONFLICT(tag_token) DO UPDATE SET
+                    server_id = excluded.server_id,
+                    name = excluded.name,
+                    keyword = excluded.keyword,
+                    position = excluded.position",
+                rusqlite::params![tag.tag_token, tag.server_id, tag.name, tag.keyword, tag.position],
+            )?;
+            rebuild_tag_aliases(&tx)?;
+            tx.commit()
+        })
+    }
+
+    pub fn delete_custom_tag(&self, tag_token: &str) -> Result<Vec<String>, String> {
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let ids = {
+                let mut stmt = tx.prepare("SELECT aster_id FROM message_tag WHERE tag_token = ?1")?;
+                let rows = stmt
+                    .query_map([tag_token], |r| r.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                rows
+            };
+            tx.execute("DELETE FROM message_tag WHERE tag_token = ?1", [tag_token])?;
+            tx.execute("DELETE FROM custom_tag WHERE tag_token = ?1", [tag_token])?;
+            rebuild_tag_aliases(&tx)?;
+            tx.commit()?;
+            Ok(ids)
+        })
+    }
+
+    pub fn builtin_tag_slots(&self) -> Result<Vec<Option<String>>, String> {
+        self.with_conn(slot_assignments_on)
+    }
+
+    pub fn builtin_tag_slot_overrides(&self) -> Result<HashMap<usize, crate::tags::SlotOverride>, String> {
+        self.with_conn(tag_slot_overrides_on)
+    }
+
+    pub fn set_builtin_tag_slot(
+        &self,
+        slot: usize,
+        choice: Option<&crate::tags::SlotOverride>,
+    ) -> Result<Vec<String>, String> {
+        if !(1..=crate::tags::BUILTIN_TAG_SLOTS).contains(&slot) {
+            return Err("unknown tag slot".to_string());
+        }
+        let token = match choice {
+            Some(crate::tags::SlotOverride::Label(token)) => Some(token.clone()),
+            _ => None,
+        };
+        if let Some(token) = &token {
+            if !self.list_custom_tags()?.iter().any(|tag| tag.tag_token == *token) {
+                return Err("unknown label".to_string());
+            }
+        }
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let before = slot_assignments_on(&tx)?;
+            let slot_value = slot as i64;
+            if choice.is_none() {
+                tx.execute("DELETE FROM builtin_tag_slot WHERE slot = ?1", [slot_value])?;
+            } else {
+                if let Some(token) = &token {
+                    tx.execute(
+                        "DELETE FROM builtin_tag_slot WHERE tag_token = ?1 AND slot != ?2",
+                        rusqlite::params![token, slot_value],
+                    )?;
+                }
+                tx.execute(
+                    "INSERT INTO builtin_tag_slot (slot, tag_token) VALUES (?1, ?2)
+                     ON CONFLICT(slot) DO UPDATE SET tag_token = excluded.tag_token",
+                    rusqlite::params![slot_value, token],
+                )?;
+            }
+            rebuild_tag_aliases(&tx)?;
+            let after = slot_assignments_on(&tx)?;
+            let mut moved: Vec<&str> = Vec::new();
+            for (old, new) in before.iter().zip(after.iter()) {
+                if old != new {
+                    moved.extend(old.as_deref());
+                    moved.extend(new.as_deref());
+                }
+            }
+            let mut ids: Vec<String> = Vec::new();
+            {
+                let mut stmt = tx.prepare("SELECT aster_id FROM message_tag WHERE tag_token = ?1")?;
+                for token in moved {
+                    for id in stmt.query_map([token], |r| r.get::<_, String>(0))? {
+                        let id = id?;
+                        if !ids.contains(&id) {
+                            ids.push(id);
+                        }
+                    }
+                }
+            }
+            tx.commit()?;
+            Ok(ids)
+        })
+    }
+
+    pub fn messages_with_tag(&self, tag_token: &str) -> Result<Vec<String>, String> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare("SELECT aster_id FROM message_tag WHERE tag_token = ?1")?;
+            let rows = stmt
+                .query_map([tag_token], |r| r.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+    }
+
+    pub fn message_tags(&self, aster_ids: &[String]) -> Result<HashMap<String, Vec<String>>, String> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT tag_token FROM message_tag WHERE aster_id = ?1 ORDER BY tag_token",
+            )?;
+            let mut out: HashMap<String, Vec<String>> = HashMap::new();
+            for id in aster_ids {
+                let tokens = stmt
+                    .query_map([id], |r| r.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                if !tokens.is_empty() {
+                    out.insert(id.clone(), tokens);
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    pub fn set_message_tags(&self, aster_id: &str, tag_tokens: &[String]) -> Result<bool, String> {
+        let mut wanted: Vec<String> = tag_tokens.to_vec();
+        wanted.sort();
+        wanted.dedup();
+        let current = self
+            .message_tags(&[aster_id.to_string()])?
+            .remove(aster_id)
+            .unwrap_or_default();
+        if current == wanted {
+            return Ok(false);
+        }
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute("DELETE FROM message_tag WHERE aster_id = ?1", [aster_id])?;
+            for token in &wanted {
+                tx.execute(
+                    "INSERT OR IGNORE INTO message_tag (aster_id, tag_token) VALUES (?1, ?2)",
+                    rusqlite::params![aster_id, token],
+                )?;
+            }
+            tx.commit()?;
+            Ok(true)
+        })
+    }
+
+    pub fn add_message_tag(&self, aster_ids: &[String], tag_token: &str) -> Result<(), String> {
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            for id in aster_ids {
+                tx.execute(
+                    "INSERT OR IGNORE INTO message_tag (aster_id, tag_token) VALUES (?1, ?2)",
+                    rusqlite::params![id, tag_token],
+                )?;
+                tx.execute(
+                    "DELETE FROM message_keywords WHERE aster_id = ?1 AND (keyword IN (
+                        SELECT keyword FROM custom_tag WHERE tag_token = ?2 AND keyword IS NOT NULL
+                     ) OR keyword IN (
+                        SELECT keyword FROM custom_tag_alias WHERE tag_token = ?2
+                     ))",
+                    rusqlite::params![id, tag_token],
+                )?;
+            }
+            tx.commit()
+        })
+    }
+
+    pub fn remove_message_tag(&self, aster_ids: &[String], tag_token: &str) -> Result<(), String> {
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            for id in aster_ids {
+                tx.execute(
+                    "DELETE FROM message_tag WHERE aster_id = ?1 AND tag_token = ?2",
+                    rusqlite::params![id, tag_token],
+                )?;
+            }
+            tx.commit()
+        })
+    }
+
+    pub fn list_non_rfc3339_dates(&self) -> Result<Vec<(String, String)>, String> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT aster_id, date FROM message_cache
+                 WHERE date IS NOT NULL AND date NOT LIKE '____-__-__T%'",
+            )?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+    }
+
+    pub fn set_message_date(&self, aster_id: &str, date: &str) -> Result<(), String> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE message_cache SET date = ?2 WHERE aster_id = ?1",
+                rusqlite::params![aster_id, date],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn list_all_cached_id_folder_dates(
+        &self,
+    ) -> Result<Vec<(String, String, Option<String>)>, String> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare("SELECT aster_id, folder, date FROM message_cache")?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+    }
+
+    pub fn list_all_message_ids(&self) -> Result<Vec<String>, String> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare("SELECT aster_id FROM message_cache ORDER BY created_at DESC LIMIT 500")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+    }
+
+    pub fn update_message_flags(&self, imap_uid: i64, folder: &str, new_flags: i64) -> Result<(), String> {
+        self.with_conn(|conn| update_message_flags_on(conn, imap_uid, folder, new_flags))
+    }
+
+    pub fn assign_uid_if_missing(&self, folder: &str, aster_id: &str) -> Result<u32, String> {
+        self.with_conn(|conn| assign_uid_if_missing_on(conn, folder, aster_id))
+    }
+
+    pub fn uid_next(&self, folder: &str) -> Result<u32, String> {
+        let stored = self
+            .get_sync_state(&format!("uidnext:{}", folder))?
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0);
+        let max = self.max_uid(folder)?;
+        Ok(stored.max(max.saturating_add(1)).max(1))
+    }
+
+    pub fn max_uid(&self, folder: &str) -> Result<u32, String> {
+        self.with_conn(|conn| {
+            let n: i64 = conn.query_row(
+                "SELECT COALESCE(MAX(imap_uid), 0) FROM uid_map WHERE folder = ?1",
+                [folder],
+                |r| r.get(0),
+            )?;
+            Ok(n as u32)
+        })
+    }
+
+    pub fn get_sync_state(&self, key: &str) -> Result<Option<String>, String> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT value FROM sync_state WHERE key = ?1",
+                [key],
+                |r| r.get::<_, String>(0),
+            )
+            .map(Some)
+            .or_else(|e| {
+                if matches!(e, rusqlite::Error::QueryReturnedNoRows) {
+                    Ok(None)
+                } else {
+                    Err(e)
+                }
+            })
+        })
+    }
+
+    pub fn set_sync_state(&self, key: &str, value: &str) -> Result<(), String> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO sync_state (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                rusqlite::params![key, value],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn seed_jmap_mailboxes(&self) -> Result<(), String> {
+        const SEED: &[(&str, &str, &str, i64)] = &[
+            ("mbx_inbox", "Inbox", "inbox", 1),
+            ("mbx_archive", "Archive", "archive", 2),
+            ("mbx_drafts", "Drafts", "drafts", 3),
+            ("mbx_sent", "Sent", "sent", 4),
+            ("mbx_trash", "Trash", "trash", 5),
+            ("mbx_spam", "Junk", "spam", 6),
+        ];
+        self.with_conn(|conn| {
+            for (id, name, label, order) in SEED {
+                conn.execute(
+                    "INSERT OR IGNORE INTO jmap_mailbox (id, name, parent_id, role, sort_order, folder_label) VALUES (?1, ?2, NULL, ?3, ?4, ?5)",
+                    rusqlite::params![id, name, name.to_lowercase(), order, label],
+                )?;
+            }
+            Ok(())
+        })
+    }
+
+    pub fn jmap_state_get(&self, ty: &str) -> Result<i64, String> {
+        self.with_conn(|conn| {
+            let row: Option<i64> = conn
+                .query_row(
+                    "SELECT counter FROM jmap_state WHERE type = ?1",
+                    [ty],
+                    |r| r.get::<_, i64>(0),
+                )
+                .ok();
+            Ok(row.unwrap_or(0))
+        })
+    }
+
+    pub fn jmap_state_bump(&self, ty: &str) -> Result<i64, String> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO jmap_state (type, counter) VALUES (?1, 1)
+                 ON CONFLICT(type) DO UPDATE SET counter = counter + 1",
+                [ty],
+            )?;
+            let new: i64 = conn.query_row(
+                "SELECT counter FROM jmap_state WHERE type = ?1",
+                [ty],
+                |r| r.get(0),
+            )?;
+            Ok(new)
+        })
+    }
+
+    pub fn jmap_change_log_append(
+        &self,
+        ty: &str,
+        state: i64,
+        object_id: &str,
+        op: &str,
+    ) -> Result<(), String> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0) as i64;
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO jmap_change_log (type, state, object_id, op, ts) VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![ty, state, object_id, op, now],
+            )?;
+            let _ = conn.execute(
+                "DELETE FROM jmap_change_log WHERE type = ?1 AND seq NOT IN (
+                    SELECT seq FROM jmap_change_log WHERE type = ?1 ORDER BY seq DESC LIMIT 10000
+                 )",
+                [ty],
+            );
+            Ok(())
+        })
+    }
+
+    pub fn jmap_changes_since(
+        &self,
+        ty: &str,
+        since: i64,
+    ) -> Result<(Vec<(String, String)>, i64, bool, bool), String> {
+        self.with_conn(|conn| {
+            let oldest: Option<i64> = conn
+                .query_row(
+                    "SELECT MIN(state) FROM jmap_change_log WHERE type = ?1",
+                    [ty],
+                    |r| r.get(0),
+                )
+                .ok()
+                .flatten();
+            let too_old = match oldest {
+                Some(o) => since < o - 1,
+                None => false,
+            };
+            if too_old {
+                return Ok((Vec::new(), since, true, false));
+            }
+            let mut stmt = conn.prepare(
+                "SELECT object_id, op, state FROM jmap_change_log
+                 WHERE type = ?1 AND state > ?2
+                 ORDER BY seq ASC LIMIT 501",
+            )?;
+            let rows = stmt
+                .query_map(rusqlite::params![ty, since], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let has_more = rows.len() > 500;
+            let rows: Vec<_> = rows.into_iter().take(500).collect();
+            let new_state = rows.last().map(|(_, _, s)| *s).unwrap_or(since);
+            let entries = rows.into_iter().map(|(id, op, _)| (id, op)).collect();
+            Ok((entries, new_state, false, has_more))
+        })
+    }
+
+    pub fn jmap_blob_put(
+        &self,
+        blob_id: &str,
+        data: &[u8],
+        content_type: Option<&str>,
+    ) -> Result<(), String> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0) as i64;
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT OR IGNORE INTO jmap_blob (blob_id, data, content_type, size, created_ts) VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![blob_id, data, content_type, data.len() as i64, now],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn jmap_blob_gc(&self, older_than_secs: i64) -> Result<usize, String> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let cutoff = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+            .saturating_sub(older_than_secs);
+        self.with_conn(|conn| {
+            let n = conn.execute(
+                "DELETE FROM jmap_blob WHERE created_ts < ?1",
+                [cutoff],
+            )?;
+            Ok(n)
+        })
+    }
+
+    pub fn replay_check_and_record(
+        &self,
+        aster_id: &str,
+        envelope_nonce: &str,
+    ) -> Result<bool, String> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        self.with_conn(|conn| {
+            let existing: Option<String> = conn
+                .query_row(
+                    "SELECT nonce FROM envelope_nonces WHERE aster_id = ?1",
+                    [aster_id],
+                    |r| r.get::<_, String>(0),
+                )
+                .ok();
+            if let Some(prev) = existing {
+                if prev != envelope_nonce {
+                    conn.execute(
+                        "UPDATE envelope_nonces SET nonce = ?2, first_seen = ?3 WHERE aster_id = ?1",
+                        rusqlite::params![aster_id, envelope_nonce, now],
+                    )?;
+                }
+                return Ok(true);
+            }
+            conn.execute(
+                "INSERT INTO envelope_nonces (aster_id, nonce, first_seen) VALUES (?1, ?2, ?3)",
+                rusqlite::params![aster_id, envelope_nonce, now],
+            )?;
+            let _ = prune_envelope_nonces(conn, ENVELOPE_NONCES_KEPT, ENVELOPE_NONCES_SLACK);
+            Ok(true)
+        })
+    }
+
+    pub fn recipient_pin_get(
+        &self,
+        pin_id: &str,
+    ) -> Result<Option<crate::crypto::recipient_trust::RecipientPin>, String> {
+        use rusqlite::OptionalExtension;
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT identity_fingerprint, owner_fingerprint, pq_seen, flagged,
+                        pq_fingerprint, transcript_bound, binding_epoch, binding_fingerprint,
+                        hosted
+                 FROM recipient_key_pin WHERE pin_id = ?1",
+                [pin_id],
+                |r| {
+                    Ok(crate::crypto::recipient_trust::RecipientPin {
+                        identity_fingerprint: r.get(0)?,
+                        owner_fingerprint: r.get(1)?,
+                        pq_seen: r.get::<_, i64>(2)? != 0,
+                        flagged: r.get::<_, i64>(3)? != 0,
+                        pq_fingerprint: r.get(4)?,
+                        transcript_bound: r.get::<_, i64>(5)? != 0,
+                        binding_epoch: r.get(6)?,
+                        binding_fingerprint: r.get(7)?,
+                        hosted: r.get::<_, i64>(8)? != 0,
+                    })
+                },
+            )
+            .optional()
+        })
+    }
+
+    pub fn recipient_pin_put(
+        &self,
+        pin_id: &str,
+        pin: &crate::crypto::recipient_trust::RecipientPin,
+    ) -> Result<(), String> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO recipient_key_pin
+                    (pin_id, identity_fingerprint, owner_fingerprint, pq_seen, flagged, updated_at,
+                     pq_fingerprint, transcript_bound, binding_epoch, binding_fingerprint, hosted)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                 ON CONFLICT(pin_id) DO UPDATE SET
+                    identity_fingerprint = excluded.identity_fingerprint,
+                    owner_fingerprint = excluded.owner_fingerprint,
+                    pq_seen = excluded.pq_seen,
+                    flagged = excluded.flagged,
+                    updated_at = excluded.updated_at,
+                    pq_fingerprint = excluded.pq_fingerprint,
+                    transcript_bound = excluded.transcript_bound,
+                    binding_epoch = excluded.binding_epoch,
+                    binding_fingerprint = excluded.binding_fingerprint,
+                    hosted = excluded.hosted",
+                rusqlite::params![
+                    pin_id,
+                    pin.identity_fingerprint,
+                    pin.owner_fingerprint,
+                    pin.pq_seen as i64,
+                    pin.flagged as i64,
+                    now,
+                    pin.pq_fingerprint,
+                    pin.transcript_bound as i64,
+                    pin.binding_epoch,
+                    pin.binding_fingerprint,
+                    pin.hosted as i64
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn jmap_blob_get(&self, blob_id: &str) -> Result<Option<(Vec<u8>, Option<String>)>, String> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT data, content_type FROM jmap_blob WHERE blob_id = ?1",
+                [blob_id],
+                |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Option<String>>(1)?)),
+            )
+            .map(Some)
+            .or_else(|e| {
+                if matches!(e, rusqlite::Error::QueryReturnedNoRows) {
+                    Ok(None)
+                } else {
+                    Err(e)
+                }
+            })
+        })
+    }
+
+    pub fn list_jmap_mailboxes(&self) -> Result<Vec<JmapMailboxRow>, String> {
+        let mut rows = self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, name, parent_id, role, sort_order, folder_label FROM jmap_mailbox ORDER BY sort_order",
+            )?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok(JmapMailboxRow {
+                        id: r.get(0)?,
+                        name: r.get(1)?,
+                        parent_id: r.get(2)?,
+                        role: r.get(3)?,
+                        sort_order: r.get::<_, i64>(4)? as i32,
+                        folder_label: r.get(5)?,
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })?;
+        let custom = self.list_custom_folders()?;
+        rows.extend(crate::folders::jmap_rows(&crate::folders::build_tree(&custom)));
+        Ok(rows)
+    }
+
+    pub fn list_custom_folders(&self) -> Result<Vec<CustomFolder>, String> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT label_token, server_id, name, parent_token, sort_order, created_at
+                 FROM custom_folder ORDER BY label_token",
+            )?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok(CustomFolder {
+                        label_token: r.get(0)?,
+                        server_id: r.get(1)?,
+                        name: r.get(2)?,
+                        parent_token: r.get(3)?,
+                        sort_order: r.get(4)?,
+                        created_at: r.get(5)?,
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+    }
+
+    pub fn replace_custom_folders(&self, folders: &[CustomFolder]) -> Result<bool, String> {
+        let mut incoming: Vec<CustomFolder> = folders.to_vec();
+        incoming.sort_by(|a, b| a.label_token.cmp(&b.label_token));
+        incoming.dedup_by(|a, b| a.label_token == b.label_token);
+        if self.list_custom_folders()? == incoming {
+            return Ok(false);
+        }
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute("DELETE FROM custom_folder", [])?;
+            for f in &incoming {
+                tx.execute(
+                    "INSERT INTO custom_folder (label_token, server_id, name, parent_token, sort_order, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    rusqlite::params![f.label_token, f.server_id, f.name, f.parent_token, f.sort_order, f.created_at],
+                )?;
+            }
+            tx.commit()?;
+            Ok(true)
+        })
+    }
+
+    pub fn upsert_custom_folder(&self, folder: &CustomFolder) -> Result<(), String> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO custom_folder (label_token, server_id, name, parent_token, sort_order, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(label_token) DO UPDATE SET
+                    server_id = excluded.server_id,
+                    name = excluded.name,
+                    parent_token = excluded.parent_token,
+                    sort_order = excluded.sort_order,
+                    created_at = excluded.created_at",
+                rusqlite::params![
+                    folder.label_token,
+                    folder.server_id,
+                    folder.name,
+                    folder.parent_token,
+                    folder.sort_order,
+                    folder.created_at
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn delete_custom_folder(&self, label_token: &str) -> Result<(), String> {
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute("DELETE FROM custom_folder WHERE label_token = ?1", [label_token])?;
+            tx.execute(
+                "UPDATE custom_folder SET parent_token = NULL WHERE parent_token = ?1",
+                [label_token],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    pub fn relocate_folder_messages(&self, from: &str, to: &str) -> Result<Vec<String>, String> {
+        let ids = self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let ids = {
+                let mut stmt = tx.prepare("SELECT aster_id FROM message_cache WHERE folder = ?1")?;
+                let ids = stmt
+                    .query_map([from], |r| r.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                ids
+            };
+            tx.execute(
+                "UPDATE message_cache SET folder = ?2 WHERE folder = ?1",
+                rusqlite::params![from, to],
+            )?;
+            tx.execute("DELETE FROM uid_map WHERE folder = ?1", [from])?;
+            tx.commit()?;
+            Ok(ids)
+        })?;
+        for id in &ids {
+            self.assign_uid_if_missing(to, id)?;
+        }
+        Ok(ids)
+    }
+
+    pub fn recache_messages_without_message_id(&self) -> Result<usize, String> {
+        self.with_conn(|conn| {
+            let changed = conn.execute(
+                "UPDATE message_cache SET body_cached = 0
+                 WHERE body_cached = 1
+                   AND (message_id IS NULL OR message_id = '')
+                   AND (raw_headers IS NULL
+                        OR NOT json_valid(raw_headers)
+                        OR json_extract(raw_headers, '$.message_id') IS NULL)",
+                [],
+            )?;
+            Ok(changed)
+        })
+    }
+
+    pub fn update_message_thread_and_msgid(
+        &self,
+        aster_id: &str,
+        thread_id: Option<&str>,
+        message_id: Option<&str>,
+    ) -> Result<(), String> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE message_cache SET thread_id = COALESCE(?2, thread_id), message_id = COALESCE(?3, message_id) WHERE aster_id = ?1",
+                rusqlite::params![aster_id, thread_id, message_id],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn find_aster_id_by_message_id(&self, message_id: &str) -> Option<String> {
+        let bare = message_id.trim().trim_matches(&['<', '>'][..]).trim().to_string();
+        if bare.is_empty() {
+            return None;
+        }
+        let angled = format!("<{}>", bare);
+        self.with_conn(|conn| {
+            let by_column = conn
+                .query_row(
+                    "SELECT aster_id FROM message_cache WHERE message_id IN (?1, ?2) ORDER BY folder = 'drafts' LIMIT 1",
+                    rusqlite::params![bare, angled],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok();
+            if by_column.is_some() {
+                return Ok(by_column);
+            }
+            Ok(conn
+                .query_row(
+                    "SELECT aster_id FROM message_cache
+                     WHERE message_id IS NULL AND raw_headers IS NOT NULL
+                       AND CASE WHEN json_valid(raw_headers) THEN json_extract(raw_headers, '$.message_id') END IN (?1, ?2)
+                     ORDER BY folder = 'drafts' LIMIT 1",
+                    rusqlite::params![bare, angled],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok())
+        })
+        .ok()
+        .flatten()
+    }
+
+    pub fn find_uid_by_message_id_in_folder(&self, folder: &str, message_id: &str) -> Option<u32> {
+        self.find_in_folder_by_message_id(folder, message_id).map(|(_, uid)| uid)
+    }
+
+    pub fn find_in_folder_by_message_id(&self, folder: &str, message_id: &str) -> Option<(String, u32)> {
+        let bare = message_id.trim().trim_matches(&['<', '>'][..]).trim().to_string();
+        if bare.is_empty() {
+            return None;
+        }
+        let angled = format!("<{}>", bare);
+        self.with_conn(|conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT m.aster_id, u.imap_uid FROM message_cache m
+                     JOIN uid_map u ON u.aster_id = m.aster_id AND u.folder = m.folder
+                     WHERE m.folder = ?1
+                       AND COALESCE(
+                             m.message_id,
+                             CASE WHEN m.raw_headers IS NOT NULL AND json_valid(m.raw_headers)
+                                  THEN json_extract(m.raw_headers, '$.message_id') END
+                           ) IN (?2, ?3)
+                     ORDER BY u.imap_uid LIMIT 1",
+                    rusqlite::params![folder, bare, angled],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .ok())
+        })
+        .ok()
+        .flatten()
+        .and_then(|(aster_id, uid)| Some((aster_id, u32::try_from(uid).ok()?)))
+    }
+
+    pub fn repair_cache(&self) -> Result<(), String> {
+        self.with_conn(|conn| {
+            conn.execute_batch(
+                "DELETE FROM message_cache;
+                 DELETE FROM message_attachment;
+                 DELETE FROM message_fts;
+                 DELETE FROM jmap_state;
+                 DELETE FROM jmap_change_log;
+                 DELETE FROM jmap_blob;
+                 DELETE FROM uid_map;
+                 DELETE FROM envelope_nonces;
+                 DELETE FROM sync_state;",
+            )?;
+            conn.execute_batch(history::HISTORY_CLEAR_SQL)?;
+            Ok(())
+        })
+    }
+
+    pub fn clear_user_data(&self) -> Result<(), String> {
+        let result = self.with_conn(|conn| {
+            conn.execute_batch(
+                "DELETE FROM message_cache;
+                 DELETE FROM message_keywords;
+                 DELETE FROM message_tag;
+                 DELETE FROM custom_tag;
+                 DELETE FROM custom_tag_alias;
+                 DELETE FROM builtin_tag_slot;
+                 DELETE FROM message_attachment;
+                 DELETE FROM message_fts;
+                 DELETE FROM uid_map;
+                 DELETE FROM app_passwords;
+                 DELETE FROM sync_state;
+                 DELETE FROM jmap_state;
+                 DELETE FROM jmap_change_log;
+                 DELETE FROM jmap_blob;
+                 DELETE FROM envelope_nonces;
+                 DELETE FROM outbox;
+                 DELETE FROM pending_flag_push;",
+            )?;
+            conn.execute_batch(history::HISTORY_CLEAR_SQL)?;
+            Ok(())
+        });
+        self.app_password_cache.clear();
+        result
+    }
+
+    pub fn db_stats(&self) -> Result<(i64, i64, Option<String>), String> {
+        self.with_conn(|conn| {
+            let messages: i64 = conn
+                .query_row("SELECT COUNT(*) FROM message_cache", [], |r| r.get(0))
+                .unwrap_or(0);
+            let passwords: i64 = conn
+                .query_row("SELECT COUNT(*) FROM app_passwords", [], |r| r.get(0))
+                .unwrap_or(0);
+            let last_sync: Option<String> = conn
+                .query_row(
+                    "SELECT value FROM sync_state WHERE key = 'last_sync_ts'",
+                    [],
+                    |r| r.get::<_, String>(0),
+                )
+                .ok();
+            Ok((messages, passwords, last_sync))
+        })
+    }
+
+    pub fn get_cached_message(&self, aster_id: &str) -> Result<Option<CachedMessage>, String> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT m.aster_id, m.folder, m.subject, m.sender, m.recipients, m.date, m.size, m.flags, m.body_text, m.raw_headers, COALESCE(u.imap_uid, 0), m.thread_id, m.attachments_state
+                 FROM message_cache m LEFT JOIN uid_map u ON u.aster_id = m.aster_id AND u.folder = m.folder
+                 WHERE m.aster_id = ?1",
+                [aster_id],
+                |row| Ok(CachedMessage {
+                    aster_id: row.get(0)?,
+                    folder: row.get(1)?,
+                    subject: row.get(2)?,
+                    sender: row.get(3)?,
+                    recipients: row.get(4)?,
+                    date: row.get(5)?,
+                    size: row.get(6)?,
+                    flags: row.get(7)?,
+                    body_text: row.get(8)?,
+                    raw_headers: row.get(9)?,
+                    imap_uid: row.get::<_, i64>(10)? as u32,
+                    thread_id: row.get(11)?,
+                    attachments_state: row.get(12)?,
+                }),
+            )
+            .map(Some)
+            .or_else(|e| if matches!(e, rusqlite::Error::QueryReturnedNoRows) { Ok(None) } else { Err(e) })
+        })
+    }
+
+    pub fn get_cached_messages(
+        &self,
+        aster_ids: &[String],
+        with_body: bool,
+    ) -> Result<HashMap<String, CachedMessage>, String> {
+        let body_col = if with_body { "m.body_text" } else { "NULL" };
+        self.with_conn(|conn| {
+            let mut out = HashMap::new();
+            for chunk in unique_ids(aster_ids).chunks(SQL_IN_CHUNK) {
+                let sql = format!(
+                    "SELECT m.aster_id, m.folder, m.subject, m.sender, m.recipients, m.date, m.size, m.flags, {}, m.raw_headers, COALESCE(u.imap_uid, 0), m.thread_id, m.attachments_state
+                     FROM message_cache m LEFT JOIN uid_map u ON u.aster_id = m.aster_id AND u.folder = m.folder
+                     WHERE m.aster_id IN ({})",
+                    body_col,
+                    sql_placeholders(chunk.len()),
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt.query_map(rusqlite::params_from_iter(chunk), |row| {
+                    Ok(CachedMessage {
+                        aster_id: row.get(0)?,
+                        folder: row.get(1)?,
+                        subject: row.get(2)?,
+                        sender: row.get(3)?,
+                        recipients: row.get(4)?,
+                        date: row.get(5)?,
+                        size: row.get(6)?,
+                        flags: row.get(7)?,
+                        body_text: row.get(8)?,
+                        raw_headers: row.get(9)?,
+                        imap_uid: row.get::<_, i64>(10)? as u32,
+                        thread_id: row.get(11)?,
+                        attachments_state: row.get(12)?,
+                    })
+                })?;
+                for r in rows {
+                    let m = r?;
+                    out.insert(m.aster_id.clone(), m);
+                }
+            }
+            Ok(out)
+        })
+    }
+
+}
+
+const SQL_IN_CHUNK: usize = 500;
+
+const ENVELOPE_NONCES_KEPT: i64 = 50_000;
+const ENVELOPE_NONCES_SLACK: i64 = 1_024;
+const ENVELOPE_NONCES_SPAN_SQL: &str = "SELECT COALESCE(
+    (SELECT MAX(rowid) FROM envelope_nonces) - (SELECT MIN(rowid) FROM envelope_nonces),
+    0
+)";
+
+fn prune_envelope_nonces(conn: &Connection, kept: i64, slack: i64) -> rusqlite::Result<usize> {
+    let span: i64 = conn.query_row(ENVELOPE_NONCES_SPAN_SQL, [], |r| r.get(0))?;
+    if span < kept + slack {
+        return Ok(0);
+    }
+    conn.execute(
+        "DELETE FROM envelope_nonces WHERE rowid <= (
+            SELECT rowid FROM envelope_nonces ORDER BY rowid DESC LIMIT 1 OFFSET ?1
+         )",
+        [kept],
+    )
+}
+
+fn sql_text_literal(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+fn body_is_predicate(body_text: &str) -> String {
+    format!("body_cached = 1 AND body_text = {}", sql_text_literal(body_text))
+}
+
+fn body_starts_with_predicate(marker: &str) -> String {
+    format!(
+        "body_cached = 1 AND instr(substr(body_text, 1, 64), {}) > 0",
+        sql_text_literal(marker)
+    )
+}
+
+fn sql_placeholders(n: usize) -> String {
+    vec!["?"; n].join(",")
+}
+
+fn unique_ids(ids: &[String]) -> Vec<&str> {
+    let mut seen = std::collections::HashSet::new();
+    ids.iter().map(String::as_str).filter(|id| seen.insert(*id)).collect()
+}
+
+#[derive(Debug, Clone)]
+pub struct OutboxRow {
+    pub id: i64,
+    pub raw_mime: Vec<u8>,
+    pub envelope_from: String,
+    pub envelope_to: String,
+    pub queued_at: i64,
+    pub attempts: i64,
+    pub last_attempt_at: Option<i64>,
+    pub last_error: Option<String>,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OutboxStats {
+    pub pending: i64,
+    pub failed: i64,
+    pub sent_24h: i64,
+}
+
+impl Database {
+    pub fn outbox_insert(
+        &self,
+        raw_mime: &[u8],
+        envelope_from: &str,
+        envelope_to: &str,
+    ) -> Result<i64, String> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO outbox (raw_mime, envelope_from, envelope_to, queued_at, attempts, status)
+                 VALUES (?1, ?2, ?3, ?4, 0, 'pending')",
+                rusqlite::params![raw_mime, envelope_from, envelope_to, now],
+            )?;
+            Ok(conn.last_insert_rowid())
+        })
+    }
+
+    pub fn outbox_pending_count(&self) -> Result<usize, String> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM outbox WHERE status IN ('pending','failed','sending')",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|n| n.max(0) as usize)
+        })
+    }
+
+    pub fn outbox_list_pending(&self) -> Result<Vec<OutboxRow>, String> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, raw_mime, envelope_from, envelope_to, queued_at, attempts, last_attempt_at, last_error, status
+                 FROM outbox
+                 WHERE status IN ('pending','failed','sending')
+                 ORDER BY queued_at ASC",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok(OutboxRow {
+                    id: r.get(0)?,
+                    raw_mime: r.get(1)?,
+                    envelope_from: r.get(2)?,
+                    envelope_to: r.get(3)?,
+                    queued_at: r.get(4)?,
+                    attempts: r.get(5)?,
+                    last_attempt_at: r.get(6)?,
+                    last_error: r.get(7)?,
+                    status: r.get(8)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+    }
+
+    pub fn outbox_get(&self, id: i64) -> Result<Option<OutboxRow>, String> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT id, raw_mime, envelope_from, envelope_to, queued_at, attempts, last_attempt_at, last_error, status
+                 FROM outbox WHERE id = ?1",
+                [id],
+                |r| Ok(OutboxRow {
+                    id: r.get(0)?,
+                    raw_mime: r.get(1)?,
+                    envelope_from: r.get(2)?,
+                    envelope_to: r.get(3)?,
+                    queued_at: r.get(4)?,
+                    attempts: r.get(5)?,
+                    last_attempt_at: r.get(6)?,
+                    last_error: r.get(7)?,
+                    status: r.get(8)?,
+                }),
+            )
+            .map(Some)
+            .or_else(|e| if matches!(e, rusqlite::Error::QueryReturnedNoRows) { Ok(None) } else { Err(e) })
+        })
+    }
+
+    pub fn outbox_mark_sending(&self, id: i64) -> Result<usize, String> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        self.with_conn(|conn| {
+            let n = conn.execute(
+                "UPDATE outbox SET status = 'sending', last_attempt_at = ?2 WHERE id = ?1 AND status IN ('pending', 'failed')",
+                rusqlite::params![id, now],
+            )?;
+            Ok(n)
+        })
+    }
+
+    pub fn outbox_reset_stale_sending(&self, older_than_secs: i64) -> Result<usize, String> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let cutoff = now - older_than_secs;
+        self.with_conn(|conn| {
+            let n = conn.execute(
+                "UPDATE outbox SET status = 'pending' WHERE status = 'sending' AND COALESCE(last_attempt_at, queued_at) <= ?1",
+                [cutoff],
+            )?;
+            Ok(n)
+        })
+    }
+
+    pub fn outbox_mark_sent(&self, id: i64) -> Result<(), String> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE outbox SET status = 'sent', last_attempt_at = ?2, last_error = NULL WHERE id = ?1",
+                rusqlite::params![id, now],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn outbox_mark_failed(&self, id: i64, err: &str) -> Result<(), String> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let truncated: String = err.chars().take(512).collect();
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE outbox SET status = 'failed', last_attempt_at = ?2, last_error = ?3 WHERE id = ?1",
+                rusqlite::params![id, now, truncated],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn outbox_bump_attempt(&self, id: i64, err: &str) -> Result<(), String> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let truncated: String = err.chars().take(512).collect();
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE outbox SET attempts = attempts + 1, last_attempt_at = ?2, last_error = ?3, status = 'pending' WHERE id = ?1",
+                rusqlite::params![id, now, truncated],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn outbox_stats(&self) -> Result<OutboxStats, String> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let cutoff = now - 86400;
+        self.with_conn(|conn| {
+            let pending: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM outbox WHERE status IN ('pending','sending')",
+                [],
+                |r| r.get(0),
+            ).unwrap_or(0);
+            let failed: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM outbox WHERE status = 'failed'",
+                [],
+                |r| r.get(0),
+            ).unwrap_or(0);
+            let sent_24h: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM outbox WHERE status = 'sent' AND last_attempt_at >= ?1",
+                [cutoff],
+                |r| r.get(0),
+            ).unwrap_or(0);
+            Ok(OutboxStats { pending, failed, sent_24h })
+        })
+    }
+
+    pub fn jmap_record_sync_batch(&self, ty: &str, ids: &[&str]) -> Result<i64, String> {
+        self.jmap_record_batch(ty, ids, "created")
+    }
+
+    pub fn jmap_record_destroyed_batch(&self, ty: &str, ids: &[&str]) -> Result<i64, String> {
+        self.jmap_record_batch(ty, ids, "destroyed")
+    }
+
+    pub fn jmap_record_updated_batch(&self, ty: &str, ids: &[&str]) -> Result<i64, String> {
+        self.jmap_record_batch(ty, ids, "updated")
+    }
+
+    fn jmap_record_batch(&self, ty: &str, ids: &[&str], op: &str) -> Result<i64, String> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO jmap_state (type, counter) VALUES (?1, 1)
+                 ON CONFLICT(type) DO UPDATE SET counter = counter + 1",
+                [ty],
+            )?;
+            let new_state: i64 = conn.query_row(
+                "SELECT counter FROM jmap_state WHERE type = ?1",
+                [ty],
+                |r| r.get(0),
+            )?;
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0) as i64;
+            for id in ids {
+                let _ = conn.execute(
+                    "INSERT INTO jmap_change_log (type, state, object_id, op, ts) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![ty, new_state, id, op, now],
+                );
+            }
+            let _ = conn.execute(
+                "DELETE FROM jmap_change_log WHERE seq NOT IN (SELECT seq FROM jmap_change_log ORDER BY seq DESC LIMIT 10000)",
+                [],
+            );
+            Ok(new_state)
+        })
+    }
+
+    pub fn replace_message_attachments(
+        &self,
+        aster_id: &str,
+        attachments: &[CachedAttachment],
+    ) -> Result<(), String> {
+        self.with_conn(|conn| {
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            let result = (|| {
+                conn.execute(
+                    "DELETE FROM message_attachment WHERE aster_id = ?1",
+                    [aster_id],
+                )?;
+                for a in attachments {
+                    conn.execute(
+                        "INSERT INTO message_attachment (aster_id, seq, name, content_type, content_id, is_inline, size, data)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                        rusqlite::params![
+                            aster_id,
+                            a.seq,
+                            a.name,
+                            a.content_type,
+                            a.content_id,
+                            a.is_inline as i32,
+                            a.size,
+                            a.data,
+                        ],
+                    )?;
+                }
+                conn.execute(
+                    "UPDATE message_cache SET attachments_state = ?2, attachment_attempts = 0 WHERE aster_id = ?1",
+                    rusqlite::params![aster_id, ATTACHMENTS_STORED],
+                )?;
+                Ok::<(), rusqlite::Error>(())
+            })();
+            match result {
+                Ok(()) => {
+                    conn.execute_batch("COMMIT")?;
+                    Ok(())
+                }
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(e)
+                }
+            }
+        })
+    }
+
+    pub fn store_on_demand_attachments(
+        &self,
+        aster_id: &str,
+        parts: &[CachedAttachment],
+    ) -> Result<(), String> {
+        self.with_conn(|conn| {
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            let result = (|| {
+                conn.execute(
+                    "DELETE FROM message_attachment WHERE aster_id = ?1",
+                    [aster_id],
+                )?;
+                for a in parts {
+                    conn.execute(
+                        "INSERT INTO message_attachment (aster_id, seq, name, content_type, content_id, is_inline, size, data)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, X'')",
+                        rusqlite::params![
+                            aster_id,
+                            a.seq,
+                            a.name,
+                            a.content_type,
+                            a.content_id,
+                            a.is_inline as i32,
+                            a.size,
+                        ],
+                    )?;
+                }
+                conn.execute(
+                    "UPDATE message_cache SET attachments_state = ?2, attachment_attempts = 0 WHERE aster_id = ?1",
+                    rusqlite::params![aster_id, ATTACHMENTS_ON_DEMAND],
+                )?;
+                Ok::<(), rusqlite::Error>(())
+            })();
+            match result {
+                Ok(()) => {
+                    conn.execute_batch("COMMIT")?;
+                    Ok(())
+                }
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(e)
+                }
+            }
+        })
+    }
+
+    pub fn fill_on_demand_attachments(
+        &self,
+        aster_id: &str,
+        contents: &[(i64, Vec<u8>)],
+    ) -> Result<bool, String> {
+        self.with_conn(|conn| {
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            let result = (|| {
+                let state: Option<i64> = conn
+                    .query_row(
+                        "SELECT attachments_state FROM message_cache WHERE aster_id = ?1",
+                        [aster_id],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if state != Some(ATTACHMENTS_ON_DEMAND) {
+                    return Ok(false);
+                }
+                for (seq, data) in contents {
+                    conn.execute(
+                        "UPDATE message_attachment SET data = ?3 WHERE aster_id = ?1 AND seq = ?2",
+                        rusqlite::params![aster_id, seq, data],
+                    )?;
+                }
+                conn.execute(
+                    "UPDATE message_cache SET attachments_state = ?2, attachment_attempts = 0 WHERE aster_id = ?1",
+                    rusqlite::params![aster_id, ATTACHMENTS_STORED],
+                )?;
+                Ok::<bool, rusqlite::Error>(true)
+            })();
+            match result {
+                Ok(filled) => {
+                    conn.execute_batch(if filled { "COMMIT" } else { "ROLLBACK" })?;
+                    Ok(filled)
+                }
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(e)
+                }
+            }
+        })
+    }
+
+    pub fn drop_attachment_parts(&self, aster_id: &str, state: i64) -> Result<(), String> {
+        self.with_conn(|conn| {
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            let result = (|| {
+                conn.execute(
+                    "DELETE FROM message_attachment WHERE aster_id = ?1",
+                    [aster_id],
+                )?;
+                conn.execute(
+                    "UPDATE message_cache SET attachments_state = ?2 WHERE aster_id = ?1",
+                    rusqlite::params![aster_id, state],
+                )?;
+                Ok::<(), rusqlite::Error>(())
+            })();
+            match result {
+                Ok(()) => {
+                    conn.execute_batch("COMMIT")?;
+                    Ok(())
+                }
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(e)
+                }
+            }
+        })
+    }
+
+    pub fn set_attachments_state(&self, aster_id: &str, state: i64) -> Result<(), String> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE message_cache SET attachments_state = ?2 WHERE aster_id = ?1",
+                rusqlite::params![aster_id, state],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn attachments_state(&self, aster_id: &str) -> Result<i64, String> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT attachments_state FROM message_cache WHERE aster_id = ?1",
+                [aster_id],
+                |r| r.get::<_, i64>(0),
+            )
+        })
+    }
+
+    pub fn bump_attachment_attempts(&self, aster_id: &str) -> Result<i64, String> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE message_cache SET attachment_attempts = attachment_attempts + 1 WHERE aster_id = ?1",
+                [aster_id],
+            )?;
+            conn.query_row(
+                "SELECT attachment_attempts FROM message_cache WHERE aster_id = ?1",
+                [aster_id],
+                |r| r.get::<_, i64>(0),
+            )
+        })
+    }
+
+    pub fn get_message_attachments(&self, aster_id: &str) -> Result<Vec<CachedAttachment>, String> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT seq, name, content_type, content_id, is_inline, size, data
+                 FROM message_attachment WHERE aster_id = ?1 ORDER BY seq ASC",
+            )?;
+            let rows = stmt.query_map([aster_id], |row| {
+                Ok(CachedAttachment {
+                    seq: row.get(0)?,
+                    name: row.get(1)?,
+                    content_type: row.get(2)?,
+                    content_id: row.get(3)?,
+                    is_inline: row.get::<_, i64>(4)? != 0,
+                    size: row.get(5)?,
+                    data: row.get(6)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+    }
+
+    pub fn get_message_attachment_meta(&self, aster_id: &str) -> Result<Vec<CachedAttachment>, String> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT seq, name, content_type, content_id, is_inline, size
+                 FROM message_attachment WHERE aster_id = ?1 ORDER BY seq ASC",
+            )?;
+            let rows = stmt.query_map([aster_id], |row| {
+                Ok(CachedAttachment {
+                    seq: row.get(0)?,
+                    name: row.get(1)?,
+                    content_type: row.get(2)?,
+                    content_id: row.get(3)?,
+                    is_inline: row.get::<_, i64>(4)? != 0,
+                    size: row.get(5)?,
+                    data: Vec::new(),
+                })
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+    }
+
+    pub fn get_message_attachment_layout(&self, aster_id: &str) -> Result<Vec<CachedAttachment>, String> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT seq, name, content_type, content_id, is_inline,
+                        CASE WHEN length(data) > 0 THEN length(data) ELSE size END
+                 FROM message_attachment WHERE aster_id = ?1 ORDER BY seq ASC",
+            )?;
+            let rows = stmt.query_map([aster_id], |row| {
+                Ok(CachedAttachment {
+                    seq: row.get(0)?,
+                    name: row.get(1)?,
+                    content_type: row.get(2)?,
+                    content_id: row.get(3)?,
+                    is_inline: row.get::<_, i64>(4)? != 0,
+                    size: row.get(5)?,
+                    data: Vec::new(),
+                })
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+    }
+
+    pub fn get_attachment_meta_for_messages(
+        &self,
+        aster_ids: &[String],
+    ) -> Result<HashMap<String, Vec<CachedAttachment>>, String> {
+        self.with_conn(|conn| {
+            let mut out: HashMap<String, Vec<CachedAttachment>> = HashMap::new();
+            for chunk in unique_ids(aster_ids).chunks(SQL_IN_CHUNK) {
+                let sql = format!(
+                    "SELECT aster_id, seq, name, content_type, content_id, is_inline, size
+                     FROM message_attachment WHERE aster_id IN ({}) ORDER BY aster_id, seq ASC",
+                    sql_placeholders(chunk.len()),
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt.query_map(rusqlite::params_from_iter(chunk), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        CachedAttachment {
+                            seq: row.get(1)?,
+                            name: row.get(2)?,
+                            content_type: row.get(3)?,
+                            content_id: row.get(4)?,
+                            is_inline: row.get::<_, i64>(5)? != 0,
+                            size: row.get(6)?,
+                            data: Vec::new(),
+                        },
+                    ))
+                })?;
+                for r in rows {
+                    let (id, a) = r?;
+                    out.entry(id).or_default().push(a);
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    pub fn list_attachment_meta_for_folder(
+        &self,
+        folder: &str,
+    ) -> Result<HashMap<String, Vec<CachedAttachment>>, String> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT a.aster_id, a.seq, a.name, a.content_type, a.content_id, a.is_inline, a.size
+                 FROM message_attachment a
+                 JOIN message_cache m ON m.aster_id = a.aster_id
+                 WHERE m.folder = ?1 ORDER BY a.aster_id, a.seq ASC",
+            )?;
+            let rows = stmt.query_map([folder], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    CachedAttachment {
+                        seq: row.get(1)?,
+                        name: row.get(2)?,
+                        content_type: row.get(3)?,
+                        content_id: row.get(4)?,
+                        is_inline: row.get::<_, i64>(5)? != 0,
+                        size: row.get(6)?,
+                        data: Vec::new(),
+                    },
+                ))
+            })?;
+            let mut out: HashMap<String, Vec<CachedAttachment>> = HashMap::new();
+            for r in rows {
+                let (id, att) = r?;
+                out.entry(id).or_default().push(att);
+            }
+            Ok(out)
+        })
+    }
+
+    pub fn list_attachment_backlog(&self, limit: i64) -> Result<Vec<(String, String)>, String> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT aster_id, folder FROM message_cache
+                 WHERE attachments_state = ?1
+                 ORDER BY attachment_attempts ASC, date DESC, created_at DESC LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![ATTACHMENTS_PENDING, limit], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+    }
+
+    pub fn clear_pending(data_dir: &Path) -> bool {
+        data_dir.join(PENDING_CLEAR_MARKER).exists()
+    }
+
+    pub async fn clear_user_data_or_defer(&self, data_dir: &Path) -> Result<(), String> {
+        let marker = data_dir.join(PENDING_CLEAR_MARKER);
+        let marked = std::fs::write(&marker, b"").is_ok();
+        let mut last_error = String::new();
+        for attempt in 0..CLEAR_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(CLEAR_RETRY_DELAY).await;
+            }
+            match self.clear_all_user_data() {
+                Ok(()) => {
+                    if marked {
+                        std::fs::remove_file(&marker).map_err(|e| e.to_string())?;
+                    }
+                    return Ok(());
+                }
+                Err(e) => last_error = e,
+            }
+        }
+        Err(last_error)
+    }
+
+    pub fn finish_pending_clear(&self, data_dir: &Path) -> Result<bool, String> {
+        let marker = data_dir.join(PENDING_CLEAR_MARKER);
+        if !marker.exists() {
+            return Ok(false);
+        }
+        self.clear_all_user_data()?;
+        std::fs::remove_file(&marker).map_err(|e| e.to_string())?;
+        Ok(true)
+    }
+
+    pub fn clear_all_user_data(&self) -> Result<(), String> {
+        let result = self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            for table in USER_DATA_TABLES {
+                tx.execute_batch(&format!("DELETE FROM {};", table))?;
+            }
+            tx.execute_batch(history::HISTORY_CLEAR_SQL)?;
+            tx.execute_batch("INSERT INTO message_fts(message_fts) VALUES('optimize');")?;
+            tx.commit()
+        });
+        self.app_password_cache.clear();
+        self.append_pins
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        *self.aster_sender_scope.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        result?;
+        self.scrub_free_space()?;
+        match self.path.parent() {
+            Some(dir) => remove_old_copies(dir),
+            None => Ok(()),
+        }
+    }
+
+    fn scrub_free_space(&self) -> Result<(), String> {
+        let busy = self.with_conn(|conn| {
+            conn.pragma_update(None, "secure_delete", "ON")?;
+            conn.execute_batch("VACUUM;")?;
+            conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get::<_, i64>(0))
+        })?;
+        if busy != 0 {
+            return Err("the database is busy, so its log could not be emptied".to_string());
+        }
+        Ok(())
+    }
+
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustomTag {
+    pub tag_token: String,
+    pub server_id: String,
+    pub name: String,
+    pub keyword: Option<String>,
+    pub position: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustomFolder {
+    pub label_token: String,
+    pub server_id: String,
+    pub name: String,
+    pub parent_token: Option<String>,
+    pub sort_order: i64,
+    pub created_at: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct JmapMailboxRow {
+    pub id: String,
+    pub name: String,
+    pub parent_id: Option<String>,
+    pub role: Option<String>,
+    pub sort_order: i32,
+    pub folder_label: String,
+}
+
+pub const ATTACHMENTS_NONE: i64 = 0;
+pub const ATTACHMENTS_PENDING: i64 = 1;
+pub const ATTACHMENTS_STORED: i64 = 2;
+pub const ATTACHMENTS_FAILED: i64 = 3;
+pub const ATTACHMENTS_ON_DEMAND: i64 = 4;
+
+pub fn attachment_parts_known(state: i64) -> bool {
+    state == ATTACHMENTS_STORED || state == ATTACHMENTS_ON_DEMAND
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CachedAttachment {
+    pub seq: i64,
+    pub name: String,
+    pub content_type: String,
+    pub content_id: Option<String>,
+    pub is_inline: bool,
+    pub size: i64,
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CachedSyncState {
+    pub body_cached: bool,
+    pub folder: String,
+    pub flags: i64,
+    pub raw_headers: Option<String>,
+    pub uid_folders: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CachedMessage {
+    pub aster_id: String,
+    pub folder: String,
+    pub subject: Option<String>,
+    pub sender: Option<String>,
+    pub recipients: Option<String>,
+    pub date: Option<String>,
+    pub size: i64,
+    pub flags: i64,
+    pub body_text: Option<String>,
+    pub raw_headers: Option<String>,
+    pub imap_uid: u32,
+    pub thread_id: Option<String>,
+    pub attachments_state: i64,
+}
+
+#[cfg(test)]
+mod encryption_tests {
+    use super::*;
+
+    fn seed_foreign_schema(dir: &Path, key: &[u8; 32], sql: &str) {
+        let conn = Connection::open(dir.join("bridge.db")).unwrap();
+        apply_key(&conn, key).unwrap();
+        conn.execute_batch(sql).unwrap();
+    }
+
+    fn quarantined_files(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with("bridge.db.incompatible."))
+            .collect()
+    }
+
+    #[test]
+    fn outbox_without_status_is_repaired_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = [5u8; 32];
+        seed_foreign_schema(
+            dir.path(),
+            &key,
+            "CREATE TABLE outbox (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                raw_mime BLOB NOT NULL,
+                envelope_from TEXT NOT NULL,
+                envelope_to TEXT NOT NULL,
+                queued_at INTEGER NOT NULL
+             );
+             CREATE TABLE app_passwords (id TEXT PRIMARY KEY, label TEXT NOT NULL, hash TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')));
+             INSERT INTO app_passwords (id, label, hash) VALUES ('p1', 'laptop', 'h');",
+        );
+
+        let db = Database::open_with_key(dir.path(), &key).unwrap();
+        let id = db.outbox_insert(b"raw", "from@x", "to@y").unwrap();
+        assert_eq!(db.outbox_get(id).unwrap().unwrap().status, "pending");
+        assert_eq!(db.db_stats().unwrap().1, 1, "app passwords survive the repair");
+        assert!(quarantined_files(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn unrecognized_outbox_is_moved_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = [6u8; 32];
+        seed_foreign_schema(
+            dir.path(),
+            &key,
+            "CREATE TABLE outbox (id INTEGER PRIMARY KEY, body TEXT, recipient TEXT);
+             INSERT INTO outbox (body, recipient) VALUES ('hello', 'a@b');",
+        );
+
+        let db = Database::open_with_key(dir.path(), &key).unwrap();
+        let id = db.outbox_insert(b"raw", "from@x", "to@y").unwrap();
+        assert!(db.outbox_get(id).unwrap().is_some());
+        let aside: i64 = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name LIKE 'outbox_incompatible_%'",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(aside, 1);
+    }
+
+    #[test]
+    fn incompatible_schema_is_quarantined_and_rebuilt() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = [7u8; 32];
+        seed_foreign_schema(
+            dir.path(),
+            &key,
+            "CREATE TABLE message_cache (aster_id TEXT PRIMARY KEY, payload TEXT);",
+        );
+
+        let db = Database::open_with_key(dir.path(), &key).unwrap();
+        assert_eq!(quarantined_files(dir.path()).len(), 1);
+        db.upsert_cached_message("a1", "inbox", Some("s"), None, None, None, 1, None, None)
+            .unwrap();
+        assert!(db.get_cached_message("a1").unwrap().is_some());
+        drop(db);
+
+        let reopened = Database::open_with_key(dir.path(), &key).unwrap();
+        assert!(reopened.get_cached_message("a1").unwrap().is_some());
+        assert_eq!(quarantined_files(dir.path()).len(), 1, "a healthy database is not quarantined again");
+    }
+
+    #[test]
+    fn connection_pragmas_are_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[4u8; 32]).unwrap();
+        let conn = db.conn.lock().unwrap();
+        let get = |name: &str| -> String {
+            conn.query_row(&format!("PRAGMA {}", name), [], |r| {
+                r.get::<_, rusqlite::types::Value>(0)
+            })
+            .map(|v| match v {
+                rusqlite::types::Value::Integer(i) => i.to_string(),
+                rusqlite::types::Value::Text(t) => t,
+                other => format!("{:?}", other),
+            })
+            .unwrap()
+        };
+        assert_eq!(get("journal_mode"), "wal");
+        assert_eq!(get("synchronous"), "1");
+        assert_eq!(get("cache_size"), "-65536");
+        assert_eq!(get("secure_delete"), "1");
+        assert_eq!(get("foreign_keys"), "1");
+        assert!(!get("cipher_version").is_empty());
+    }
+
+    #[test]
+    fn fresh_db_is_encrypted() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = [3u8; 32];
+        let db = Database::open_with_key(dir.path(), &key).unwrap();
+        drop(db);
+
+        let bare = Connection::open(dir.path().join("bridge.db")).unwrap();
+        assert!(!is_readable(&bare), "plaintext open of encrypted db must fail");
+    }
+
+    #[test]
+    fn migrates_plaintext_db_preserving_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("bridge.db");
+
+        {
+            let plain = Connection::open(&db_path).unwrap();
+            plain
+                .execute_batch(
+                    "CREATE TABLE app_passwords (
+                        id TEXT PRIMARY KEY,
+                        label TEXT NOT NULL,
+                        hash TEXT NOT NULL,
+                        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                     );
+                     INSERT INTO app_passwords (id, label, hash)
+                     VALUES ('p1', 'thunderbird', 'argon2hash');",
+                )
+                .unwrap();
+        }
+
+        let key = [9u8; 32];
+        let db = Database::open_with_key(dir.path(), &key).unwrap();
+        let label: String = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT label FROM app_passwords WHERE id = 'p1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(label, "thunderbird");
+        drop(db);
+
+        let bare = Connection::open(&db_path).unwrap();
+        assert!(!is_readable(&bare), "migrated db must no longer be plaintext");
+
+        let keyed = Connection::open(&db_path).unwrap();
+        apply_key(&keyed, &key).unwrap();
+        assert!(is_readable(&keyed), "migrated db must open with the key");
+    }
+
+    #[test]
+    fn reopen_with_same_key_keeps_data_and_does_not_quarantine() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = [5u8; 32];
+
+        let db = Database::open_with_key(dir.path(), &key).unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO sync_state (key, value) VALUES ('marker', 'present')",
+                [],
+            )
+            .unwrap();
+        drop(db);
+
+        let db2 = Database::open_with_key(dir.path(), &key).unwrap();
+        let value: String = db2
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT value FROM sync_state WHERE key = 'marker'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(value, "present");
+        assert!(
+            !dir.path().join("bridge.db.unreadable").exists(),
+            "a correct-key reopen must not quarantine the db"
+        );
+    }
+
+    #[test]
+    fn wrong_key_quarantines_and_recovers_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let db = Database::open_with_key(dir.path(), &[1u8; 32]).unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO sync_state (key, value) VALUES ('marker', 'secret')",
+                [],
+            )
+            .unwrap();
+        drop(db);
+
+        let db2 = Database::open_with_key(dir.path(), &[2u8; 32]).unwrap();
+        let quarantined = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("bridge.db.unreadable")
+            });
+        assert!(
+            quarantined,
+            "undecryptable db must be quarantined, not bricked"
+        );
+        let count: i64 = db2
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM sync_state WHERE key = 'marker'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "fresh db must not expose old-key data");
+    }
+
+    #[test]
+    fn repairs_a_legacy_outbox_table_without_a_status_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = [11u8; 32];
+        {
+            let db = Database::open_with_key(dir.path(), &key).unwrap();
+            db.conn
+                .lock()
+                .unwrap()
+                .execute_batch(
+                    "DROP INDEX IF EXISTS idx_outbox_status_queued;
+                     DROP TABLE outbox;
+                     CREATE TABLE outbox (
+                         id INTEGER PRIMARY KEY AUTOINCREMENT,
+                         raw_mime BLOB NOT NULL,
+                         envelope_from TEXT NOT NULL,
+                         envelope_to TEXT NOT NULL,
+                         queued_at INTEGER NOT NULL
+                     );",
+                )
+                .unwrap();
+        }
+
+        let db = Database::open_with_key(dir.path(), &key).unwrap();
+        let conn = db.conn.lock().unwrap();
+        let status_columns: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('outbox') WHERE name = 'status'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status_columns, 1, "outbox must regain its status column");
+        let indexed: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_outbox_status_queued'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexed, 1, "the queued index must exist after repair");
+    }
+
+    #[test]
+    fn recaches_only_messages_without_a_message_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[12u8; 32]).unwrap();
+        let with_id = serde_json::json!({"is_html": false, "message_id": "<a@x.test>"}).to_string();
+        let without_id = serde_json::json!({"is_html": false}).to_string();
+        db.upsert_cached_message("keep", "inbox", Some("s"), Some("a@x.test"), Some("b@x.test"), Some("2026-09-01T00:00:00Z"), 1, Some("body"), Some(&with_id)).unwrap();
+        db.upsert_cached_message("redo", "inbox", Some("s"), Some("a@x.test"), Some("b@x.test"), Some("2026-09-01T00:00:00Z"), 1, Some("body"), Some(&without_id)).unwrap();
+
+        assert_eq!(db.recache_messages_without_message_id().unwrap(), 1);
+        assert!(db.body_cached("keep"));
+        assert!(!db.body_cached("redo"));
+        assert_eq!(db.recache_messages_without_message_id().unwrap(), 0);
+    }
+
+    #[test]
+    fn migrates_wal_mode_plaintext_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("bridge.db");
+
+        {
+            let plain = Connection::open(&db_path).unwrap();
+            plain.pragma_update(None, "journal_mode", "WAL").unwrap();
+            plain
+                .execute_batch(
+                    "CREATE TABLE sync_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                     INSERT INTO sync_state (key, value) VALUES ('cursor', '42');",
+                )
+                .unwrap();
+        }
+
+        let key = [8u8; 32];
+        let db = Database::open_with_key(dir.path(), &key).unwrap();
+        let value: String = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT value FROM sync_state WHERE key = 'cursor'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(value, "42", "WAL-mode plaintext data must survive migration");
+    }
+
+    fn seed_plaintext(path: &Path) {
+        let plain = Connection::open(path).unwrap();
+        plain
+            .execute_batch(
+                "CREATE TABLE sync_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO sync_state (key, value) VALUES ('cursor', '42'), ('folder', 'inbox');",
+            )
+            .unwrap();
+    }
+
+    fn plaintext_value(path: &Path, key: &str) -> Option<String> {
+        let plain = Connection::open(path).unwrap();
+        plain
+            .query_row("SELECT value FROM sync_state WHERE key = ?1", [key], |r| r.get(0))
+            .optional()
+            .unwrap()
+    }
+
+    fn stored_value(db: &Database, key: &str) -> Option<String> {
+        db.conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT value FROM sync_state WHERE key = ?1", [key], |r| r.get(0))
+            .optional()
+            .unwrap()
+    }
+
+    fn migration_leftovers(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with("bridge.db.plain") || n.starts_with("bridge.db.enc"))
+            .collect()
+    }
+
+    fn encrypted_copy_beside(db_path: &Path, key: &[u8; 32]) -> PathBuf {
+        let enc_path = sibling_path(db_path, ".copy");
+        let plain = Connection::open(db_path).unwrap();
+        export_encrypted(&plain, &enc_path, key).unwrap();
+        enc_path
+    }
+
+    #[test]
+    fn migration_keeps_every_row_and_leaves_no_plaintext_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("bridge.db");
+        seed_plaintext(&db_path);
+
+        let key = [11u8; 32];
+        let db = Database::open_with_key(dir.path(), &key).unwrap();
+        assert_eq!(stored_value(&db, "cursor").as_deref(), Some("42"));
+        assert_eq!(stored_value(&db, "folder").as_deref(), Some("inbox"));
+        drop(db);
+
+        assert!(migration_leftovers(dir.path()).is_empty());
+        let bare = Connection::open(&db_path).unwrap();
+        assert!(!is_readable(&bare));
+    }
+
+    #[test]
+    fn failed_swap_leaves_the_plaintext_database_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("bridge.db");
+        seed_plaintext(&db_path);
+
+        let key = [12u8; 32];
+        let enc_path = db_path.with_extension("db.enc");
+        let failing_rename = |from: &Path, to: &Path| {
+            if from == enc_path.as_path() {
+                Err(std::io::Error::other("injected rename failure"))
+            } else {
+                std::fs::rename(from, to)
+            }
+        };
+        assert!(migrate_plaintext_with_rename(&db_path, &key, &failing_rename).is_err());
+
+        assert_eq!(plaintext_value(&db_path, "cursor").as_deref(), Some("42"));
+        assert_eq!(plaintext_value(&db_path, "folder").as_deref(), Some("inbox"));
+        assert!(migration_leftovers(dir.path()).is_empty());
+
+        let db = Database::open_with_key(dir.path(), &key).unwrap();
+        assert_eq!(stored_value(&db, "cursor").as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn failed_export_leaves_the_plaintext_database_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("bridge.db");
+        seed_plaintext(&db_path);
+
+        let blocker = db_path.with_extension("db.enc");
+        std::fs::create_dir(&blocker).unwrap();
+        std::fs::write(blocker.join("child"), b"x").unwrap();
+
+        let key = [13u8; 32];
+        assert!(migrate_plaintext_to_encrypted(&db_path, &key).is_err());
+        assert_eq!(plaintext_value(&db_path, "cursor").as_deref(), Some("42"));
+        assert!(!plaintext_backup_path(&db_path).exists());
+    }
+
+    #[test]
+    fn interrupted_swap_is_restored_and_finished_on_next_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("bridge.db");
+        seed_plaintext(&plaintext_backup_path(&db_path));
+
+        let key = [14u8; 32];
+        let db = Database::open_with_key(dir.path(), &key).unwrap();
+        assert_eq!(stored_value(&db, "cursor").as_deref(), Some("42"));
+        assert_eq!(stored_value(&db, "folder").as_deref(), Some("inbox"));
+        drop(db);
+        assert!(migration_leftovers(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn leftover_plaintext_copy_is_removed_once_its_rows_are_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("bridge.db");
+        seed_plaintext(&db_path);
+
+        let key = [15u8; 32];
+        let enc_path = encrypted_copy_beside(&db_path, &key);
+        std::fs::rename(&db_path, plaintext_backup_path(&db_path)).unwrap();
+        std::fs::rename(&enc_path, &db_path).unwrap();
+
+        let db = Database::open_with_key(dir.path(), &key).unwrap();
+        assert_eq!(stored_value(&db, "cursor").as_deref(), Some("42"));
+        drop(db);
+        assert!(migration_leftovers(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn leftover_plaintext_copy_with_other_rows_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("bridge.db");
+        seed_plaintext(&db_path);
+
+        let key = [16u8; 32];
+        let enc_path = encrypted_copy_beside(&db_path, &key);
+        Connection::open(&db_path)
+            .unwrap()
+            .execute_batch("INSERT INTO sync_state (key, value) VALUES ('extra', '1');")
+            .unwrap();
+        let backup = plaintext_backup_path(&db_path);
+        std::fs::rename(&db_path, &backup).unwrap();
+        std::fs::rename(&enc_path, &db_path).unwrap();
+
+        let db = Database::open_with_key(dir.path(), &key).unwrap();
+        assert_eq!(stored_value(&db, "cursor").as_deref(), Some("42"));
+        drop(db);
+        assert_eq!(plaintext_value(&backup, "extra").as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn body_cached_reflects_cached_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[4u8; 32]).unwrap();
+
+        assert!(!db.body_cached("unknown-id"), "unknown id is not cached");
+
+        db.upsert_cached_message("m-nobody", "inbox", Some("s"), None, None, None, 0, None, None)
+            .unwrap();
+        assert!(
+            !db.body_cached("m-nobody"),
+            "row without a body must not count as cached"
+        );
+
+        db.upsert_cached_message(
+            "m-withbody",
+            "inbox",
+            Some("s"),
+            None,
+            None,
+            None,
+            4,
+            Some("body"),
+            None,
+        )
+        .unwrap();
+        assert!(
+            db.body_cached("m-withbody"),
+            "row with a body must count as cached (skips re-decrypt)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod db_tests {
+    use super::*;
+    use rusqlite::OptionalExtension;
+
+    fn open_db() -> (tempfile::TempDir, Database) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        (dir, db)
+    }
+
+    fn insert(db: &Database, aster_id: &str, folder: &str) {
+        db.upsert_cached_message(aster_id, folder, Some("subj"), Some("from@x"), Some("to@x"), Some("2026-01-01"), 10, Some("body"), Some("headers"))
+            .unwrap();
+    }
+
+    #[test]
+    fn pending_flag_push_keeps_the_latest_value_per_bit() {
+        let (_d, db) = open_db();
+        db.record_pending_flag_pushes(&[("m1".to_string(), true), ("m2".to_string(), true)], 1)
+            .unwrap();
+        db.record_pending_flag_pushes(&[("m1".to_string(), true)], 4).unwrap();
+        db.note_failed_flag_push("m1", 1, true).unwrap();
+        db.record_pending_flag_pushes(&[("m1".to_string(), false)], 1).unwrap();
+        let mut rows = db.pending_flag_pushes(0, 100).unwrap();
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                ("m1".to_string(), 1, false),
+                ("m1".to_string(), 4, true),
+                ("m2".to_string(), 1, true),
+            ]
+        );
+        assert!(db.pending_flag_pushes(60_000, 100).unwrap().is_empty());
+        let values = db.pending_flag_values(&["m1", "absent"]).unwrap();
+        let mut m1 = values["m1"].clone();
+        m1.sort();
+        assert_eq!(m1, vec![(1, false), (4, true)]);
+        assert!(!values.contains_key("absent"));
+    }
+
+    #[test]
+    fn pending_flag_push_clears_only_the_value_that_was_sent() {
+        let (_d, db) = open_db();
+        db.record_pending_flag_pushes(&[("m1".to_string(), false)], 1).unwrap();
+        db.clear_pending_flag_pushes(&["m1".to_string()], 1, true).unwrap();
+        assert_eq!(db.pending_flag_pushes(0, 100).unwrap().len(), 1);
+        db.clear_pending_flag_pushes(&["m1".to_string()], 4, false).unwrap();
+        assert_eq!(db.pending_flag_pushes(0, 100).unwrap().len(), 1);
+        db.clear_pending_flag_pushes(&["m1".to_string()], 1, false).unwrap();
+        assert!(db.pending_flag_pushes(0, 100).unwrap().is_empty());
+    }
+
+    #[test]
+    fn pending_flag_push_is_dropped_after_too_many_failures() {
+        let (_d, db) = open_db();
+        db.record_pending_flag_pushes(&[("m1".to_string(), true), ("m2".to_string(), true)], 1)
+            .unwrap();
+        for _ in 0..3 {
+            db.note_failed_flag_push("m1", 1, true).unwrap();
+        }
+        db.note_failed_flag_push("m2", 1, false).unwrap();
+        assert_eq!(db.drop_exhausted_flag_pushes(3).unwrap(), 1);
+        assert_eq!(db.pending_flag_pushes(0, 100).unwrap(), vec![("m2".to_string(), 1, true)]);
+    }
+
+    #[test]
+    fn upsert_inserts_then_updates() {
+        let (_d, db) = open_db();
+        let inserted = db
+            .upsert_cached_message("a1", "inbox", Some("s"), None, None, None, 5, None, None)
+            .unwrap();
+        assert!(inserted, "first upsert reports inserted");
+        let again = db
+            .upsert_cached_message("a1", "inbox", Some("s2"), None, None, None, 6, None, None)
+            .unwrap();
+        assert!(!again, "second upsert reports update not insert");
+        let msg = db.get_cached_message("a1").unwrap().unwrap();
+        assert_eq!(msg.subject.as_deref(), Some("s2"));
+        assert_eq!(msg.size, 6);
+    }
+
+    #[test]
+    fn upsert_size_matches_stored_body_after_control_stripping() {
+        let (_d, db) = open_db();
+        let raw = "hi\u{1}\u{7}\r\nthere\u{1b}";
+        db.upsert_cached_message("a1", "inbox", None, None, None, None, raw.len() as i64, Some(raw), None)
+            .unwrap();
+        let msg = db.get_cached_message("a1").unwrap().unwrap();
+        assert_eq!(msg.body_text.as_deref(), Some("hi\r\nthere"));
+        assert_eq!(msg.size, "hi\r\nthere".len() as i64);
+        let meta = db.list_cached_message_meta("inbox").unwrap();
+        let full = db.list_cached_messages("inbox").unwrap();
+        assert_eq!(
+            crate::message_render::rendered_size(&meta[0], &[]),
+            crate::message_render::render_text(&full[0], &[]).len()
+        );
+    }
+
+    #[test]
+    fn upsert_preserves_flags_on_update() {
+        let (_d, db) = open_db();
+        insert(&db, "a1", "inbox");
+        db.set_message_flags_by_id("a1", 3).unwrap();
+        db.upsert_cached_message("a1", "inbox", Some("new"), None, None, None, 99, None, None)
+            .unwrap();
+        assert_eq!(db.get_message_flags_by_id("a1").unwrap(), 3);
+    }
+
+    #[test]
+    fn upsert_sets_body_cached_only_with_body() {
+        let (_d, db) = open_db();
+        db.upsert_cached_message("a1", "inbox", None, None, None, None, 0, None, None)
+            .unwrap();
+        assert!(!db.body_cached("a1"));
+        db.upsert_cached_message("a1", "inbox", None, None, None, None, 0, Some("hello"), None)
+            .unwrap();
+        assert!(db.body_cached("a1"));
+        let msg = db.get_cached_message("a1").unwrap().unwrap();
+        assert_eq!(msg.body_text.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn upsert_strips_c0_controls() {
+        let (_d, db) = open_db();
+        db.upsert_cached_message("a1", "inbox", Some("a\u{0001}b\tc"), None, None, None, 0, Some("x\u{0007}y"), None)
+            .unwrap();
+        let msg = db.get_cached_message("a1").unwrap().unwrap();
+        assert_eq!(msg.subject.as_deref(), Some("ab\tc"));
+        assert_eq!(msg.body_text.as_deref(), Some("xy"));
+    }
+
+    #[test]
+    fn get_cached_message_missing_is_none() {
+        let (_d, db) = open_db();
+        assert!(db.get_cached_message("nope").unwrap().is_none());
+    }
+
+    #[test]
+    fn get_cached_message_includes_uid() {
+        let (_d, db) = open_db();
+        insert(&db, "a1", "inbox");
+        let uid = db.assign_uid_if_missing("inbox", "a1").unwrap();
+        let msg = db.get_cached_message("a1").unwrap().unwrap();
+        assert_eq!(msg.imap_uid, uid);
+    }
+
+    #[test]
+    fn list_cached_messages_orders_by_uid_and_filters_folder() {
+        let (_d, db) = open_db();
+        insert(&db, "a1", "inbox");
+        insert(&db, "a2", "inbox");
+        insert(&db, "b1", "archive");
+        let u1 = db.assign_uid_if_missing("inbox", "a1").unwrap();
+        let u2 = db.assign_uid_if_missing("inbox", "a2").unwrap();
+        assert!(u2 > u1);
+        let inbox = db.list_cached_messages("inbox").unwrap();
+        assert_eq!(inbox.len(), 2);
+        assert_eq!(inbox[0].aster_id, "a1");
+        assert_eq!(inbox[1].aster_id, "a2");
+        let archive = db.list_cached_messages("archive").unwrap();
+        assert_eq!(archive.len(), 1);
+        assert_eq!(archive[0].aster_id, "b1");
+    }
+
+    #[test]
+    fn envelope_nonce_pruning_keeps_the_newest_rows() {
+        let (_d, db) = open_db();
+        let insert = |n: i64| {
+            db.with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO envelope_nonces (aster_id, nonce, first_seen) VALUES (?1, 'n', 0)",
+                    [format!("id-{}", n)],
+                )
+            })
+            .unwrap();
+        };
+        let remaining = || -> Vec<String> {
+            db.with_conn(|conn| {
+                let mut stmt = conn.prepare("SELECT aster_id FROM envelope_nonces ORDER BY rowid")?;
+                let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+                rows.collect::<Result<Vec<_>, _>>()
+            })
+            .unwrap()
+        };
+        let prune = || db.with_conn(|conn| prune_envelope_nonces(conn, 10, 4)).unwrap();
+
+        for n in 1..=14 {
+            insert(n);
+        }
+        assert_eq!(prune(), 0, "under the slack nothing is scanned or deleted");
+        assert_eq!(remaining().len(), 14);
+
+        insert(15);
+        assert_eq!(prune(), 5);
+        let expected: Vec<String> = (6..=15).map(|n| format!("id-{}", n)).collect();
+        assert_eq!(remaining(), expected);
+
+        for n in 16..=40 {
+            insert(n);
+        }
+        db.with_conn(|conn| conn.execute("DELETE FROM envelope_nonces WHERE aster_id IN ('id-38', 'id-39')", []))
+            .unwrap();
+        prune();
+        let expected: Vec<String> = (29..=40)
+            .filter(|n| *n != 38 && *n != 39)
+            .map(|n| format!("id-{}", n))
+            .collect();
+        assert_eq!(remaining(), expected, "gaps never shrink the window below the newest rows");
+
+        let plan: Vec<String> = db
+            .with_conn(|conn| {
+                let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {}", ENVELOPE_NONCES_SPAN_SQL))?;
+                let rows = stmt.query_map([], |r| r.get::<_, String>(3))?;
+                rows.collect::<Result<Vec<_>, _>>()
+            })
+            .unwrap();
+        assert!(!plan.iter().any(|step| step.starts_with("SCAN envelope_nonces")), "{:?}", plan);
+    }
+
+    #[test]
+    fn sealed_and_bundle_scans_use_their_partial_indexes() {
+        let (_d, db) = open_db();
+        let placeholder = crate::sync::poller::RATCHET_PLACEHOLDER;
+        let marker = crate::crypto::ratchet_recovery::SUBJECT_BUNDLE_MARKER;
+        for (index, predicate) in [
+            ("idx_message_cache_sealed", body_is_predicate(placeholder)),
+            ("idx_message_cache_bundle", body_starts_with_predicate(marker)),
+        ] {
+            let plan: Vec<String> = db
+                .with_conn(|conn| {
+                    let mut stmt = conn.prepare(&format!(
+                        "EXPLAIN QUERY PLAN SELECT aster_id FROM message_cache WHERE {} ORDER BY created_at DESC LIMIT 10",
+                        predicate
+                    ))?;
+                    let rows = stmt.query_map([], |r| r.get::<_, String>(3))?;
+                    rows.collect::<Result<Vec<_>, _>>()
+                })
+                .unwrap();
+            assert!(plan.iter().any(|step| step.contains(index)), "{}: {:?}", index, plan);
+        }
+
+        insert(&db, "plain", "inbox");
+        insert(&db, "sealed", "inbox");
+        insert(&db, "bundle", "inbox");
+        db.update_cached_body("sealed", placeholder, None).unwrap();
+        db.update_cached_body("bundle", &format!("{} rest", marker), None).unwrap();
+        assert_eq!(db.list_ids_with_body(placeholder, 10).unwrap(), vec!["sealed".to_string()]);
+        let bundles = db.list_bodies_starting_with(marker, 10).unwrap();
+        assert_eq!(bundles.len(), 1);
+        assert_eq!(bundles[0].0, "bundle");
+    }
+
+    #[test]
+    fn list_cached_message_meta_omits_body() {
+        let (_d, db) = open_db();
+        insert(&db, "a1", "inbox");
+        let meta = db.list_cached_message_meta("inbox").unwrap();
+        assert_eq!(meta.len(), 1);
+        assert!(meta[0].body_text.is_none());
+        assert_eq!(meta[0].subject.as_deref(), Some("subj"));
+    }
+
+    #[test]
+    fn write_batch_reports_real_results_when_the_commit_fails() {
+        let (_d, db) = open_db();
+        insert(&db, "c1", "inbox");
+        insert(&db, "c2", "inbox");
+        db.assign_uid_if_missing("inbox", "c1").unwrap();
+        db.assign_uid_if_missing("inbox", "c2").unwrap();
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "PRAGMA foreign_keys = ON;
+                 CREATE TEMP TABLE fk_parent (id INTEGER PRIMARY KEY);
+                 CREATE TEMP TABLE fk_child (parent INTEGER REFERENCES fk_parent(id) DEFERRABLE INITIALLY DEFERRED);
+                 CREATE TEMP TRIGGER fail_on_flag_five AFTER UPDATE OF flags ON message_cache
+                   WHEN NEW.flags = 5
+                   BEGIN INSERT INTO fk_child (parent) VALUES (1); END;",
+            )
+        })
+        .unwrap();
+        let results = db.write_batch(|batch| {
+            (
+                batch.update_message_flags(1, "inbox", 5),
+                batch.update_message_flags(2, "inbox", 4),
+            )
+        });
+        assert!(results.0.is_err());
+        assert!(results.1.is_ok());
+        assert_eq!(db.get_cached_message("c1").unwrap().unwrap().flags, 0);
+        assert_eq!(db.get_cached_message("c2").unwrap().unwrap().flags, 4);
+    }
+
+    #[test]
+    fn write_batch_commits_every_write() {
+        let (_d, db) = open_db();
+        for id in ["b1", "b2", "b3"] {
+            insert(&db, id, "inbox");
+            db.assign_uid_if_missing("inbox", id).unwrap();
+        }
+        let moved_uid = db.write_batch(|batch| {
+            batch.update_message_flags(1, "inbox", 5).unwrap();
+            batch.set_message_keywords("b2", &["$Work".to_string()]).unwrap();
+            batch.delete_message_by_uid(3, "inbox").unwrap();
+            batch
+                .upsert_cached_message("b1", "archive", Some("subj"), None, None, None, 0, None, None)
+                .unwrap();
+            batch.remove_uid_mapping(1, "inbox").unwrap();
+            batch.assign_uid_if_missing("archive", "b1").unwrap()
+        });
+        assert_eq!(moved_uid, 1);
+        let b1 = db.get_cached_message("b1").unwrap().unwrap();
+        assert_eq!((b1.folder.as_str(), b1.flags, b1.imap_uid), ("archive", 5, 1));
+        assert!(b1.body_text.is_some(), "a move must keep the cached body");
+        assert_eq!(db.message_keywords("b2").unwrap(), vec!["$Work".to_string()]);
+        assert!(db.get_cached_message("b3").unwrap().is_none());
+        db.set_message_keywords("b2", &[]).unwrap();
+        assert!(db.message_keywords("b2").unwrap().is_empty());
+    }
+
+    #[test]
+    fn list_empty_folder_is_empty() {
+        let (_d, db) = open_db();
+        assert!(db.list_cached_messages("nothing").unwrap().is_empty());
+        assert!(db.list_cached_message_meta("nothing").unwrap().is_empty());
+    }
+
+    #[test]
+    fn count_cached_and_unread() {
+        let (_d, db) = open_db();
+        insert(&db, "a1", "inbox");
+        insert(&db, "a2", "inbox");
+        assert_eq!(db.count_cached_messages("inbox").unwrap(), 2);
+        assert_eq!(db.count_unread_messages("inbox").unwrap(), 2);
+        db.set_message_flags_by_id("a1", 1).unwrap();
+        assert_eq!(db.count_unread_messages("inbox").unwrap(), 1);
+        assert_eq!(db.count_cached_messages("empty").unwrap(), 0);
+    }
+
+    #[test]
+    fn flags_get_set_roundtrip() {
+        let (_d, db) = open_db();
+        insert(&db, "a1", "inbox");
+        assert_eq!(db.get_message_flags_by_id("a1").unwrap(), 0);
+        db.set_message_flags_by_id("a1", 5).unwrap();
+        assert_eq!(db.get_message_flags_by_id("a1").unwrap(), 5);
+    }
+
+    #[test]
+    fn get_flags_missing_errors() {
+        let (_d, db) = open_db();
+        assert!(db.get_message_flags_by_id("missing").is_err());
+    }
+
+    #[test]
+    fn update_message_flags_by_uid() {
+        let (_d, db) = open_db();
+        insert(&db, "a1", "inbox");
+        let uid = db.assign_uid_if_missing("inbox", "a1").unwrap();
+        db.update_message_flags(uid as i64, "inbox", 7).unwrap();
+        assert_eq!(db.get_message_flags_by_id("a1").unwrap(), 7);
+    }
+
+    #[test]
+    fn update_message_flags_unknown_uid_is_noop() {
+        let (_d, db) = open_db();
+        db.update_message_flags(999, "inbox", 7).unwrap();
+    }
+
+    #[test]
+    fn list_all_message_ids_returns_all() {
+        let (_d, db) = open_db();
+        insert(&db, "a1", "inbox");
+        insert(&db, "a2", "archive");
+        let ids = db.list_all_message_ids().unwrap();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&"a1".to_string()));
+        assert!(ids.contains(&"a2".to_string()));
+    }
+
+    #[test]
+    fn delete_message_by_aster_id_removes_cache_and_uid() {
+        let (_d, db) = open_db();
+        insert(&db, "a1", "inbox");
+        db.assign_uid_if_missing("inbox", "a1").unwrap();
+        db.delete_message_by_aster_id("a1").unwrap();
+        assert!(db.get_cached_message("a1").unwrap().is_none());
+        assert_eq!(db.max_uid("inbox").unwrap(), 0);
+    }
+
+    #[test]
+    fn delete_message_by_aster_id_missing_is_noop() {
+        let (_d, db) = open_db();
+        db.delete_message_by_aster_id("nope").unwrap();
+    }
+
+    #[test]
+    fn delete_message_by_uid_removes_both() {
+        let (_d, db) = open_db();
+        insert(&db, "a1", "inbox");
+        let uid = db.assign_uid_if_missing("inbox", "a1").unwrap();
+        db.delete_message_by_uid(uid as i64, "inbox").unwrap();
+        assert!(db.get_cached_message("a1").unwrap().is_none());
+    }
+
+    #[test]
+    fn delete_message_by_uid_unknown_is_noop() {
+        let (_d, db) = open_db();
+        db.delete_message_by_uid(123, "inbox").unwrap();
+    }
+
+    #[test]
+    fn uid_next_does_not_move_backwards_after_expunge() {
+        let (_d, db) = open_db();
+        assert_eq!(db.uid_next("inbox").unwrap(), 1);
+        insert(&db, "a1", "inbox");
+        insert(&db, "a2", "inbox");
+        db.assign_uid_if_missing("inbox", "a1").unwrap();
+        let top = db.assign_uid_if_missing("inbox", "a2").unwrap();
+        assert_eq!(db.uid_next("inbox").unwrap(), top + 1);
+        db.delete_message_by_uid(top as i64, "inbox").unwrap();
+        assert_eq!(db.max_uid("inbox").unwrap(), top - 1);
+        assert_eq!(db.uid_next("inbox").unwrap(), top + 1);
+        insert(&db, "a3", "inbox");
+        assert_eq!(db.assign_uid_if_missing("inbox", "a3").unwrap(), top + 1);
+    }
+
+    #[test]
+    fn remove_uid_mapping_drops_only_uid() {
+        let (_d, db) = open_db();
+        insert(&db, "a1", "inbox");
+        let uid = db.assign_uid_if_missing("inbox", "a1").unwrap();
+        db.remove_uid_mapping(uid as i64, "inbox").unwrap();
+        assert_eq!(db.max_uid("inbox").unwrap(), 0);
+        assert!(db.get_cached_message("a1").unwrap().is_some());
+    }
+
+    #[test]
+    fn assign_uid_is_stable_for_same_message() {
+        let (_d, db) = open_db();
+        insert(&db, "a1", "inbox");
+        let first = db.assign_uid_if_missing("inbox", "a1").unwrap();
+        let second = db.assign_uid_if_missing("inbox", "a1").unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn assign_uid_never_reused_after_delete() {
+        let (_d, db) = open_db();
+        insert(&db, "a", "inbox");
+        let uid_a = db.assign_uid_if_missing("inbox", "a").unwrap();
+        db.delete_message_by_aster_id("a").unwrap();
+        insert(&db, "b", "inbox");
+        let uid_b = db.assign_uid_if_missing("inbox", "b").unwrap();
+        assert!(uid_b > uid_a, "uid {} must exceed retired uid {}", uid_b, uid_a);
+    }
+
+    #[test]
+    fn assign_uid_monotonic_and_per_folder() {
+        let (_d, db) = open_db();
+        insert(&db, "i1", "inbox");
+        insert(&db, "i2", "inbox");
+        insert(&db, "ar1", "archive");
+        let i1 = db.assign_uid_if_missing("inbox", "i1").unwrap();
+        let i2 = db.assign_uid_if_missing("inbox", "i2").unwrap();
+        let ar1 = db.assign_uid_if_missing("archive", "ar1").unwrap();
+        assert!(i2 > i1);
+        assert_eq!(i1, 1);
+        assert_eq!(i2, 2);
+        assert_eq!(ar1, 1, "archive has an independent counter");
+    }
+
+    #[test]
+    fn assign_uid_high_water_mark_persists_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = [11u8; 32];
+        let uid_a;
+        {
+            let db = Database::open_with_key(dir.path(), &key).unwrap();
+            insert(&db, "a", "inbox");
+            uid_a = db.assign_uid_if_missing("inbox", "a").unwrap();
+            db.delete_message_by_aster_id("a").unwrap();
+        }
+        let db2 = Database::open_with_key(dir.path(), &key).unwrap();
+        insert(&db2, "b", "inbox");
+        let uid_b = db2.assign_uid_if_missing("inbox", "b").unwrap();
+        assert!(uid_b > uid_a, "high-water mark must survive reopen");
+    }
+
+    #[test]
+    fn set_folder_if_changed_moves_and_drops_old_uid() {
+        let (_d, db) = open_db();
+        insert(&db, "a1", "inbox");
+        db.assign_uid_if_missing("inbox", "a1").unwrap();
+        db.set_folder_if_changed("a1", "archive").unwrap();
+        let msg = db.get_cached_message("a1").unwrap().unwrap();
+        assert_eq!(msg.folder, "archive");
+        assert_eq!(db.max_uid("inbox").unwrap(), 0, "stale old-folder uid must be removed");
+        assert!(db.list_cached_messages("inbox").unwrap().is_empty());
+        assert_eq!(db.list_cached_messages("archive").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn set_folder_if_changed_noop_when_same() {
+        let (_d, db) = open_db();
+        insert(&db, "a1", "inbox");
+        let uid = db.assign_uid_if_missing("inbox", "a1").unwrap();
+        db.set_folder_if_changed("a1", "inbox").unwrap();
+        assert_eq!(db.max_uid("inbox").unwrap(), uid, "no-op must not drop the uid");
+    }
+
+    #[test]
+    fn max_uid_empty_is_zero() {
+        let (_d, db) = open_db();
+        assert_eq!(db.max_uid("inbox").unwrap(), 0);
+    }
+
+    #[test]
+    fn sync_state_get_set_and_missing() {
+        let (_d, db) = open_db();
+        assert!(db.get_sync_state("k").unwrap().is_none());
+        db.set_sync_state("k", "v1").unwrap();
+        assert_eq!(db.get_sync_state("k").unwrap().as_deref(), Some("v1"));
+        db.set_sync_state("k", "v2").unwrap();
+        assert_eq!(db.get_sync_state("k").unwrap().as_deref(), Some("v2"));
+    }
+
+    #[test]
+    fn update_message_thread_and_msgid_coalesces() {
+        let (_d, db) = open_db();
+        insert(&db, "a1", "inbox");
+        db.update_message_thread_and_msgid("a1", Some("t1"), Some("m1")).unwrap();
+        let msg = db.get_cached_message("a1").unwrap().unwrap();
+        assert_eq!(msg.thread_id.as_deref(), Some("t1"));
+        db.update_message_thread_and_msgid("a1", None, Some("m2")).unwrap();
+        let msg = db.get_cached_message("a1").unwrap().unwrap();
+        assert_eq!(msg.thread_id.as_deref(), Some("t1"), "null thread keeps prior value");
+    }
+
+    #[test]
+    fn find_aster_id_by_message_id_uses_column_then_headers() {
+        let (_d, db) = open_db();
+        insert(&db, "a1", "inbox");
+        db.update_message_thread_and_msgid("a1", None, Some("col@x.test")).unwrap();
+        db.upsert_cached_message("a2", "inbox", Some("s"), None, None, None, 1, None, Some(r#"{"message_id":"<json@x.test>"}"#))
+            .unwrap();
+        assert_eq!(db.find_aster_id_by_message_id("<col@x.test>").as_deref(), Some("a1"));
+        assert_eq!(db.find_aster_id_by_message_id("json@x.test").as_deref(), Some("a2"));
+        assert_eq!(db.find_aster_id_by_message_id("<json@x.test>").as_deref(), Some("a2"));
+        assert!(db.find_aster_id_by_message_id("missing@x.test").is_none());
+    }
+
+    #[test]
+    fn find_uid_by_message_id_only_answers_for_the_folder_holding_the_message() {
+        let (_d, db) = open_db();
+        insert(&db, "a1", "archive");
+        db.update_message_thread_and_msgid("a1", None, Some("col@x.test")).unwrap();
+        let uid = db.assign_uid_if_missing("archive", "a1").unwrap();
+        db.upsert_cached_message("a2", "inbox", Some("s"), None, None, None, 1, None, Some(r#"{"message_id":"<json@x.test>"}"#))
+            .unwrap();
+        let other = db.assign_uid_if_missing("inbox", "a2").unwrap();
+
+        assert_eq!(db.find_uid_by_message_id_in_folder("archive", "<col@x.test>"), Some(uid));
+        assert_eq!(db.find_uid_by_message_id_in_folder("archive", "col@x.test"), Some(uid));
+        assert_eq!(db.find_uid_by_message_id_in_folder("inbox", "<col@x.test>"), None);
+        assert_eq!(db.find_uid_by_message_id_in_folder("inbox", "json@x.test"), Some(other));
+        assert_eq!(db.find_uid_by_message_id_in_folder("archive", "<json@x.test>"), None);
+        assert_eq!(db.find_uid_by_message_id_in_folder("archive", "missing@x.test"), None);
+        assert_eq!(db.find_uid_by_message_id_in_folder("archive", " "), None);
+    }
+
+    #[test]
+    fn an_append_pin_blocks_only_writes_decided_before_the_append() {
+        let (_d, db) = open_db();
+        let before = std::time::Instant::now();
+        db.pin_appended("a1", "archive");
+
+        assert_eq!(db.unless_listing_predates_append("a1", "inbox", before, || 1), None);
+        assert_eq!(db.unless_listing_predates_append("a1", "archive", before, || 1), Some(1));
+        assert_eq!(db.unless_listing_predates_append("other", "inbox", before, || 1), Some(1));
+        assert_eq!(db.unless_appended_since("a1", before, || 1), None);
+        assert_eq!(db.unless_appended_since("other", before, || 1), Some(1));
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let after = std::time::Instant::now();
+        assert_eq!(db.unless_listing_predates_append("a1", "inbox", after, || 1), Some(1));
+        assert_eq!(db.unless_appended_since("a1", after, || 1), Some(1));
+    }
+
+    #[test]
+    fn seed_jmap_mailboxes_idempotent() {
+        let (_d, db) = open_db();
+        db.seed_jmap_mailboxes().unwrap();
+        db.seed_jmap_mailboxes().unwrap();
+        let boxes = db.list_jmap_mailboxes().unwrap();
+        assert_eq!(boxes.len(), 6);
+        assert_eq!(boxes[0].name, "Inbox");
+        assert_eq!(boxes[0].folder_label, "inbox");
+    }
+
+    #[test]
+    fn jmap_state_get_default_and_bump() {
+        let (_d, db) = open_db();
+        assert_eq!(db.jmap_state_get("Email").unwrap(), 0);
+        assert_eq!(db.jmap_state_bump("Email").unwrap(), 1);
+        assert_eq!(db.jmap_state_bump("Email").unwrap(), 2);
+        assert_eq!(db.jmap_state_get("Email").unwrap(), 2);
+        assert_eq!(db.jmap_state_get("Mailbox").unwrap(), 0);
+    }
+
+    #[test]
+    fn jmap_change_log_and_changes_since() {
+        let (_d, db) = open_db();
+        let s1 = db.jmap_state_bump("Email").unwrap();
+        db.jmap_change_log_append("Email", s1, "obj1", "created").unwrap();
+        let s2 = db.jmap_state_bump("Email").unwrap();
+        db.jmap_change_log_append("Email", s2, "obj2", "updated").unwrap();
+        let (entries, new_state, too_old, has_more) = db.jmap_changes_since("Email", 0).unwrap();
+        assert!(!too_old);
+        assert!(!has_more);
+        assert_eq!(new_state, s2);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0], ("obj1".to_string(), "created".to_string()));
+        assert_eq!(entries[1], ("obj2".to_string(), "updated".to_string()));
+    }
+
+    #[test]
+    fn jmap_changes_since_latest_is_empty() {
+        let (_d, db) = open_db();
+        let s1 = db.jmap_state_bump("Email").unwrap();
+        db.jmap_change_log_append("Email", s1, "obj1", "created").unwrap();
+        let (entries, new_state, too_old, _) = db.jmap_changes_since("Email", s1).unwrap();
+        assert!(entries.is_empty());
+        assert!(!too_old);
+        assert_eq!(new_state, s1);
+    }
+
+    #[test]
+    fn jmap_blob_put_get_and_gc() {
+        let (_d, db) = open_db();
+        db.jmap_blob_put("blob1", b"hello", Some("text/plain")).unwrap();
+        let got = db.jmap_blob_get("blob1").unwrap().unwrap();
+        assert_eq!(got.0, b"hello");
+        assert_eq!(got.1.as_deref(), Some("text/plain"));
+        assert!(db.jmap_blob_get("missing").unwrap().is_none());
+        let removed = db.jmap_blob_gc(-1).unwrap();
+        assert_eq!(removed, 1);
+        assert!(db.jmap_blob_get("blob1").unwrap().is_none());
+    }
+
+    #[test]
+    fn jmap_blob_gc_keeps_recent() {
+        let (_d, db) = open_db();
+        db.jmap_blob_put("blob1", b"x", None).unwrap();
+        let removed = db.jmap_blob_gc(100000).unwrap();
+        assert_eq!(removed, 0);
+        assert!(db.jmap_blob_get("blob1").unwrap().is_some());
+    }
+
+    #[test]
+    fn jmap_record_sync_batch_logs_ids() {
+        let (_d, db) = open_db();
+        let state = db.jmap_record_sync_batch("Email", &["x1", "x2"]).unwrap();
+        assert_eq!(state, 1);
+        let (entries, _, _, _) = db.jmap_changes_since("Email", 0).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].1, "created");
+    }
+
+    #[test]
+    fn replay_check_records_and_tracks_re_encryption() {
+        let (_d, db) = open_db();
+        assert!(db.replay_check_and_record("a1", "nonce1").unwrap());
+        assert!(db.replay_check_and_record("a1", "nonce1").unwrap(), "same nonce is allowed");
+        assert!(db.replay_check_and_record("a1", "nonce2").unwrap(), "re-encryption rotates the nonce and must not lock the item out");
+        assert!(db.replay_check_and_record("a1", "nonce2").unwrap(), "the rotated nonce becomes the recorded one");
+    }
+
+    #[test]
+    fn fts_search_and_snippet() {
+        let (_d, db) = open_db();
+        db.upsert_cached_message("a1", "inbox", Some("Hello World"), Some("alice@x"), None, Some("2026-01-01"), 0, Some("the quick brown fox"), None)
+            .unwrap();
+        let hits = db.fts_search("quick", 10).unwrap();
+        assert_eq!(hits, vec!["a1".to_string()]);
+        assert!(db.fts_search("", 10).unwrap().is_empty());
+        assert!(db.fts_search("nonexistentword", 10).unwrap().is_empty());
+        let snip = db.fts_snippet("a1", "quick").unwrap();
+        assert!(snip.is_some());
+        assert!(db.fts_snippet("a1", "").unwrap().is_none());
+    }
+
+    fn fts_subject(db: &Database, aster_id: &str) -> Option<String> {
+        db.with_conn(|conn| {
+            conn.query_row(
+                "SELECT subject FROM message_fts WHERE aster_id = ?1",
+                [aster_id],
+                |r| r.get(0),
+            )
+            .optional()
+        })
+        .unwrap()
+    }
+
+    fn mark_fts_row(db: &Database, aster_id: &str) {
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE message_fts SET subject = 'untouched' WHERE aster_id = ?1",
+                [aster_id],
+            )
+        })
+        .unwrap();
+    }
+
+    fn fts_rowids_match_cache(db: &Database) -> bool {
+        db.with_conn(|conn| {
+            conn.query_row(
+                "SELECT (SELECT COUNT(*) FROM message_fts) = (SELECT COUNT(*) FROM message_cache)
+                    AND (SELECT COUNT(*) FROM message_fts f
+                         JOIN message_cache c ON c.rowid = f.rowid AND c.aster_id = f.aster_id)
+                        = (SELECT COUNT(*) FROM message_cache)",
+                [],
+                |r| r.get(0),
+            )
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn fts_untouched_by_non_text_updates() {
+        let (_d, db) = open_db();
+        insert(&db, "a1", "inbox");
+        mark_fts_row(&db, "a1");
+
+        db.set_message_flags_by_id("a1", 3).unwrap();
+        db.set_folder_if_changed("a1", "archive").unwrap();
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE message_cache SET attachments_state = 2, attachment_attempts = 1 WHERE aster_id = 'a1'",
+                [],
+            )
+        })
+        .unwrap();
+        db.upsert_cached_message("a1", "archive", Some("subj"), Some("from@x"), Some("to@x"), Some("2026-01-02"), 11, Some("body"), Some("headers"))
+            .unwrap();
+
+        assert_eq!(fts_subject(&db, "a1").as_deref(), Some("untouched"));
+    }
+
+    #[test]
+    fn fts_follows_text_updates_and_deletes() {
+        let (_d, db) = open_db();
+        insert(&db, "a1", "inbox");
+        insert(&db, "a2", "inbox");
+        db.upsert_cached_message("a1", "inbox", Some("quarterly report"), Some("from@x"), Some("to@x"), Some("2026-01-01"), 10, None, None)
+            .unwrap();
+        assert_eq!(db.fts_search("quarterly", 10).unwrap(), vec!["a1".to_string()]);
+        db.update_cached_body("a2", "lighthouse keeper", None).unwrap();
+        assert_eq!(db.fts_search("lighthouse", 10).unwrap(), vec!["a2".to_string()]);
+        assert_eq!(fts_subject(&db, "a1").as_deref(), Some("quarterly report"));
+
+        db.delete_message_by_aster_id("a1").unwrap();
+        assert!(fts_subject(&db, "a1").is_none());
+        assert!(db.fts_search("quarterly", 10).unwrap().is_empty());
+        assert!(fts_rowids_match_cache(&db));
+    }
+
+    #[test]
+    fn legacy_fts_triggers_are_migrated() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = [7u8; 32];
+        let db = Database::open_with_key(dir.path(), &key).unwrap();
+        insert(&db, "a1", "inbox");
+        insert(&db, "a2", "inbox");
+        db.upsert_cached_message("a3", "inbox", Some("harbour lights"), None, None, Some("2026-01-03"), 0, None, None)
+            .unwrap();
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "DROP TRIGGER message_cache_ai;
+                 DROP TRIGGER message_cache_ad;
+                 DROP TRIGGER message_cache_au;
+                 DELETE FROM message_fts;
+                 INSERT INTO message_fts(rowid, aster_id, subject, sender, recipients, body_text)
+                 SELECT rowid + 100, aster_id, COALESCE(subject,''), COALESCE(sender,''),
+                        COALESCE(recipients,''), COALESCE(body_text,'')
+                 FROM message_cache;
+                 CREATE TRIGGER message_cache_ai AFTER INSERT ON message_cache BEGIN
+                     INSERT INTO message_fts(aster_id, subject, sender, recipients, body_text)
+                     VALUES (NEW.aster_id, COALESCE(NEW.subject,''), COALESCE(NEW.sender,''),
+                             COALESCE(NEW.recipients,''), COALESCE(NEW.body_text,''));
+                 END;
+                 CREATE TRIGGER message_cache_ad AFTER DELETE ON message_cache BEGIN
+                     DELETE FROM message_fts WHERE aster_id = OLD.aster_id;
+                 END;
+                 CREATE TRIGGER message_cache_au AFTER UPDATE ON message_cache BEGIN
+                     DELETE FROM message_fts WHERE aster_id = OLD.aster_id;
+                     INSERT INTO message_fts(aster_id, subject, sender, recipients, body_text)
+                     VALUES (NEW.aster_id, COALESCE(NEW.subject,''), COALESCE(NEW.sender,''),
+                             COALESCE(NEW.recipients,''), COALESCE(NEW.body_text,''));
+                 END;",
+            )
+        })
+        .unwrap();
+        assert!(!fts_rowids_match_cache(&db));
+        drop(db);
+
+        let db = Database::open_with_key(dir.path(), &key).unwrap();
+        assert!(fts_rowids_match_cache(&db));
+        let au: String = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'message_cache_au'",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .unwrap();
+        assert!(au.contains("UPDATE OF"));
+        assert_eq!(db.fts_search("harbour", 10).unwrap(), vec!["a3".to_string()]);
+
+        mark_fts_row(&db, "a1");
+        db.set_message_flags_by_id("a1", 1).unwrap();
+        assert_eq!(fts_subject(&db, "a1").as_deref(), Some("untouched"));
+        db.delete_message_by_aster_id("a3").unwrap();
+        assert!(db.fts_search("harbour", 10).unwrap().is_empty());
+        insert(&db, "a4", "inbox");
+        assert!(fts_rowids_match_cache(&db));
+        drop(db);
+
+        let db = Database::open_with_key(dir.path(), &key).unwrap();
+        assert_eq!(fts_subject(&db, "a1").as_deref(), Some("untouched"), "a migrated index is not rebuilt again");
+    }
+
+    #[test]
+    fn get_cached_messages_batches_and_skips_body() {
+        let (_d, db) = open_db();
+        for i in 0..1200 {
+            if i % 3 == 0 {
+                insert(&db, &format!("m{}", i), "inbox");
+            }
+        }
+        let att = |seq: i64| CachedAttachment {
+            seq,
+            name: format!("f{}.txt", seq),
+            content_type: "text/plain".to_string(),
+            content_id: None,
+            is_inline: false,
+            size: 3,
+            data: b"abc".to_vec(),
+        };
+        db.replace_message_attachments("m3", &[att(1), att(0)]).unwrap();
+        db.replace_message_attachments("m1197", &[att(0)]).unwrap();
+
+        let mut ids: Vec<String> = (0..1200).map(|i| format!("m{}", i)).collect();
+        ids.push("m0".to_string());
+        let with_body = db.get_cached_messages(&ids, true).unwrap();
+        assert_eq!(with_body.len(), 400);
+        let one = db.get_cached_message("m999").unwrap().unwrap();
+        let batched = &with_body["m999"];
+        assert_eq!(batched.body_text, one.body_text);
+        assert_eq!(batched.raw_headers, one.raw_headers);
+        assert_eq!(batched.subject, one.subject);
+
+        let meta_only = db.get_cached_messages(&ids, false).unwrap();
+        assert_eq!(meta_only.len(), 400);
+        assert!(meta_only.values().all(|m| m.body_text.is_none()));
+        assert_eq!(meta_only["m999"].subject, one.subject);
+
+        let atts = db.get_attachment_meta_for_messages(&ids).unwrap();
+        assert_eq!(atts.len(), 2);
+        let seqs: Vec<i64> = atts["m3"].iter().map(|a| a.seq).collect();
+        assert_eq!(seqs, vec![0, 1]);
+        assert!(atts["m3"].iter().all(|a| a.data.is_empty()));
+        assert_eq!(atts["m1197"].len(), 1);
+        assert!(db.get_cached_messages(&[], true).unwrap().is_empty());
+    }
+
+    #[test]
+    fn db_stats_counts() {
+        let (_d, db) = open_db();
+        insert(&db, "a1", "inbox");
+        db.set_sync_state("last_sync_ts", "1234").unwrap();
+        let (messages, passwords, last_sync) = db.db_stats().unwrap();
+        assert_eq!(messages, 1);
+        assert_eq!(passwords, 0);
+        assert_eq!(last_sync.as_deref(), Some("1234"));
+    }
+
+    #[test]
+    fn message_keywords_roundtrip_and_survive_sync_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        db.upsert_cached_message("kw-a", "inbox", Some("s"), None, None, None, 1, None, None).unwrap();
+        db.upsert_cached_message("kw-b", "archive", Some("s"), None, None, None, 1, None, None).unwrap();
+        db.set_message_keywords("kw-a", &["Work".to_string(), "$label1".to_string(), "WORK".to_string()])
+            .unwrap();
+        db.set_message_keywords("kw-b", &["$label2".to_string()]).unwrap();
+        assert_eq!(db.message_keywords("kw-a").unwrap(), vec!["$label1", "Work"]);
+
+        // A sync refresh of the message leaves them in place.
+        db.upsert_cached_message("kw-a", "inbox", Some("s2"), None, None, None, 2, None, None).unwrap();
+        let inbox = db.folder_keywords("inbox").unwrap();
+        assert_eq!(inbox.get("kw-a").unwrap(), &vec!["$label1".to_string(), "Work".to_string()]);
+        assert!(!inbox.contains_key("kw-b"));
+
+        db.set_message_keywords("kw-a", &[]).unwrap();
+        assert!(db.message_keywords("kw-a").unwrap().is_empty());
+
+        db.clear_all_user_data().unwrap();
+        assert!(db.message_keywords("kw-b").unwrap().is_empty());
+    }
+
+    fn custom_tag(token: &str, name: &str, keyword: Option<&str>) -> CustomTag {
+        CustomTag {
+            tag_token: token.to_string(),
+            server_id: format!("id-{}", token),
+            name: name.to_string(),
+            keyword: keyword.map(str::to_string),
+            position: 0,
+        }
+    }
+
+    #[test]
+    fn tag_keywords_join_the_stored_keywords_of_a_message() {
+        let (_d, db) = open_db();
+        insert(&db, "t-a", "inbox");
+        insert(&db, "t-b", "inbox");
+        db.set_message_keywords("t-a", &["$label1".to_string()]).unwrap();
+        assert!(db
+            .replace_custom_tags(&[
+                custom_tag("tok-work", "Work", Some("Work")),
+                custom_tag("tok-hidden", "work", None),
+            ])
+            .unwrap());
+        assert!(!db
+            .replace_custom_tags(&[
+                custom_tag("tok-hidden", "work", None),
+                custom_tag("tok-work", "Work", Some("Work")),
+            ])
+            .unwrap());
+
+        let ids = vec!["t-a".to_string(), "t-b".to_string()];
+        db.add_message_tag(&ids, "tok-work").unwrap();
+        db.add_message_tag(&ids[..1], "tok-hidden").unwrap();
+        assert_eq!(db.message_keywords("t-a").unwrap(), vec!["$label1", "Work"]);
+        assert_eq!(db.message_keywords("t-b").unwrap(), vec!["Work"]);
+        let inbox = db.folder_keywords("inbox").unwrap();
+        assert_eq!(
+            inbox.get("t-a").unwrap(),
+            &vec!["$label1".to_string(), "$label2".to_string(), "Work".to_string()]
+        );
+        assert_eq!(
+            db.message_tags(&ids).unwrap().get("t-a").unwrap(),
+            &vec!["tok-hidden".to_string(), "tok-work".to_string()]
+        );
+
+        db.set_message_keywords("t-b", &["work".to_string(), "Later".to_string()]).unwrap();
+        assert_eq!(db.message_keywords("t-b").unwrap(), vec!["Later", "Work"]);
+
+        db.remove_message_tag(&ids[1..], "tok-work").unwrap();
+        assert_eq!(db.message_keywords("t-b").unwrap(), vec!["Later"]);
+        assert!(db.set_message_tags("t-b", &["tok-work".to_string()]).unwrap());
+        assert!(!db.set_message_tags("t-b", &["tok-work".to_string()]).unwrap());
+
+        let mut affected = db.delete_custom_tag("tok-work").unwrap();
+        affected.sort();
+        assert_eq!(affected, ids);
+        assert_eq!(db.message_keywords("t-a").unwrap(), vec!["$label1"]);
+        assert_eq!(db.list_custom_tags().unwrap().len(), 1);
+
+        db.clear_all_user_data().unwrap();
+        assert!(db.list_custom_tags().unwrap().is_empty());
+        assert!(db.message_tags(&ids).unwrap().is_empty());
+    }
+
+    #[test]
+    fn upserting_a_tag_touches_one_row_and_never_duplicates_a_keyword() {
+        let (_d, db) = open_db();
+        insert(&db, "t-u", "inbox");
+        db.replace_custom_tags(&[custom_tag("tok-a", "A", Some("A")), custom_tag("tok-b", "B", Some("B"))])
+            .unwrap();
+        let ids = vec!["t-u".to_string()];
+        db.add_message_tag(&ids, "tok-a").unwrap();
+
+        db.upsert_custom_tag(&custom_tag("tok-c", "C", Some("C"))).unwrap();
+        db.upsert_custom_tag(&custom_tag("tok-c", "C", Some("C"))).unwrap();
+        let tags = db.list_custom_tags().unwrap();
+        assert_eq!(tags.len(), 3);
+        assert_eq!(tags[0], custom_tag("tok-a", "A", Some("A")));
+        assert_eq!(tags[1], custom_tag("tok-b", "B", Some("B")));
+        assert_eq!(tags[2], custom_tag("tok-c", "C", Some("C")));
+        assert_eq!(db.messages_with_tag("tok-a").unwrap(), ids);
+
+        db.upsert_custom_tag(&custom_tag("tok-d", "a", Some("a"))).unwrap();
+        let tags = db.list_custom_tags().unwrap();
+        assert_eq!(tags.len(), 4);
+        assert_eq!(tags[3], custom_tag("tok-d", "a", None));
+        assert_eq!(tags[0].keyword.as_deref(), Some("A"));
+
+        db.upsert_custom_tag(&custom_tag("tok-c", "C2", Some("C2"))).unwrap();
+        let tags = db.list_custom_tags().unwrap();
+        assert_eq!(tags.len(), 4);
+        assert_eq!(tags[2], custom_tag("tok-c", "C2", Some("C2")));
+    }
+
+    #[test]
+    fn replacing_tags_drops_assignments_of_removed_tags() {
+        let (_d, db) = open_db();
+        insert(&db, "t-c", "inbox");
+        db.replace_custom_tags(&[custom_tag("tok-a", "A", Some("A")), custom_tag("tok-b", "B", Some("B"))])
+            .unwrap();
+        let ids = vec!["t-c".to_string()];
+        db.add_message_tag(&ids, "tok-a").unwrap();
+        db.add_message_tag(&ids, "tok-b").unwrap();
+        assert_eq!(db.messages_with_tag("tok-a").unwrap(), ids);
+        db.replace_custom_tags(&[custom_tag("tok-b", "B2", Some("B2"))]).unwrap();
+        assert_eq!(db.message_keywords("t-c").unwrap(), vec!["B2"]);
+        assert!(db.messages_with_tag("tok-a").unwrap().is_empty());
+    }
+
+    fn named_tag(token: &str, name: &str) -> CustomTag {
+        custom_tag(token, name, crate::tags::keyword_for_name(name).as_deref())
+    }
+
+    #[test]
+    fn imap_keywords_carry_the_client_forms_of_a_label() {
+        let (dir, db) = open_db();
+        insert(&db, "t-x", "inbox");
+        insert(&db, "t-y", "inbox");
+        db.replace_custom_tags(&[named_tag("tok-fun", "\u{1F37F} Entretenimento")]).unwrap();
+        let own = crate::tags::keyword_for_name("\u{1F37F} Entretenimento").unwrap();
+        let legacy = "&2dzffw-_entretenimento".to_string();
+        let readable = "=f0=9f=8d=bf=20entretenimento".to_string();
+
+        db.set_message_keywords("t-x", &[legacy.to_uppercase(), readable.clone(), "$label1".to_string()])
+            .unwrap();
+        assert_eq!(db.message_keywords("t-x").unwrap(), vec!["$label1"]);
+
+        let ids = vec!["t-y".to_string()];
+        db.add_message_tag(&ids, "tok-fun").unwrap();
+        let mut expected = vec![own.clone(), legacy.clone(), readable.clone()];
+        expected.sort();
+        assert_eq!(db.message_keywords("t-y").unwrap(), vec![own.clone()]);
+        let mut fetched = db.folder_keywords("inbox").unwrap().remove("t-y").unwrap();
+        fetched.sort();
+        assert_eq!(fetched, expected);
+        let mut fetched = db.keywords_for_messages(&ids).unwrap().remove("t-y").unwrap();
+        fetched.sort();
+        assert_eq!(fetched, expected);
+
+        db.with_conn(|conn| conn.execute("DELETE FROM custom_tag_alias", [])).unwrap();
+        assert_eq!(db.folder_keywords("inbox").unwrap().remove("t-y").unwrap(), vec![own.clone()]);
+        drop(db);
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        let mut fetched = db.folder_keywords("inbox").unwrap().remove("t-y").unwrap();
+        fetched.sort();
+        assert_eq!(fetched, expected);
+
+        db.delete_custom_tag("tok-fun").unwrap();
+        db.upsert_custom_tag(&named_tag("tok-later", "Mais tarde")).unwrap();
+        db.add_message_tag(&ids, "tok-later").unwrap();
+        let mut fetched = db.folder_keywords("inbox").unwrap().remove("t-y").unwrap();
+        fetched.sort();
+        assert_eq!(fetched, vec!["$label5", "Mais&ACA-tarde", "mais=20tarde", "mais_tarde"]);
+        let stale: i64 = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM custom_tag_alias WHERE tag_token = 'tok-fun'",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(stale, 0);
+    }
+
+    #[test]
+    fn a_stored_client_form_moves_onto_its_label() {
+        let (_d, db) = open_db();
+        insert(&db, "t-z", "inbox");
+        db.set_message_keywords("t-z", &["mais_tarde".to_string(), "$label2".to_string()]).unwrap();
+        db.replace_custom_tags(&[named_tag("tok-later", "Mais tarde")]).unwrap();
+        db.add_message_tag(&["t-z".to_string()], "tok-later").unwrap();
+        assert_eq!(db.message_keywords("t-z").unwrap(), vec!["$label2", "Mais&ACA-tarde"]);
+
+        db.set_message_keywords("t-z", &["MAIS=20TARDE".to_string(), "$label2".to_string()]).unwrap();
+        assert_eq!(db.message_keywords("t-z").unwrap(), vec!["$label2", "Mais&ACA-tarde"]);
+    }
+
+    #[test]
+    fn repair_cache_wipes_messages() {
+        let (_d, db) = open_db();
+        insert(&db, "a1", "inbox");
+        db.assign_uid_if_missing("inbox", "a1").unwrap();
+        db.set_sync_state("k", "v").unwrap();
+        db.repair_cache().unwrap();
+        assert_eq!(db.count_cached_messages("inbox").unwrap(), 0);
+        assert_eq!(db.max_uid("inbox").unwrap(), 0);
+        assert!(db.get_sync_state("k").unwrap().is_none());
+    }
+
+    #[test]
+    fn recipient_pins_are_updated_in_place_and_outlive_a_cache_repair() {
+        use crate::crypto::recipient_trust::RecipientPin;
+
+        let (_d, db) = open_db();
+        assert!(db.recipient_pin_get("pin").unwrap().is_none());
+
+        let first = RecipientPin {
+            identity_fingerprint: "aa".to_string(),
+            owner_fingerprint: "BB".to_string(),
+            pq_seen: false,
+            pq_fingerprint: String::new(),
+            transcript_bound: false,
+            binding_epoch: 0,
+            binding_fingerprint: String::new(),
+            hosted: false,
+            flagged: false,
+        };
+        db.recipient_pin_put("pin", &first).unwrap();
+        assert_eq!(db.recipient_pin_get("pin").unwrap(), Some(first.clone()));
+
+        let rotated = RecipientPin {
+            identity_fingerprint: "cc".to_string(),
+            pq_seen: true,
+            pq_fingerprint: "dd".to_string(),
+            transcript_bound: true,
+            binding_epoch: 9,
+            binding_fingerprint: "ee".to_string(),
+            hosted: true,
+            flagged: true,
+            ..first
+        };
+        db.recipient_pin_put("pin", &rotated).unwrap();
+        db.repair_cache().unwrap();
+        db.clear_user_data().unwrap();
+        assert_eq!(db.recipient_pin_get("pin").unwrap(), Some(rotated));
+    }
+
+    #[test]
+    fn clear_user_data_wipes_passwords_and_outbox() {
+        let (_d, db) = open_db();
+        insert(&db, "a1", "inbox");
+        db.outbox_insert(b"mime", "from@x", "to@x").unwrap();
+        db.clear_user_data().unwrap();
+        assert_eq!(db.count_cached_messages("inbox").unwrap(), 0);
+        assert!(db.outbox_list_pending().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_failed_clear_removes_nothing_and_leaves_a_marker() {
+        let (dir, db) = open_db();
+        insert(&db, "a1", "inbox");
+        db.with_conn(|conn| conn.execute_batch("ALTER TABLE outbox RENAME TO outbox_aside;"))
+            .unwrap();
+
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        let outcome = rt.block_on(db.clear_user_data_or_defer(dir.path()));
+
+        assert!(outcome.is_err());
+        assert!(Database::clear_pending(dir.path()));
+        assert_eq!(db.count_cached_messages("inbox").unwrap(), 1);
+        assert!(db.finish_pending_clear(dir.path()).is_err());
+        assert!(Database::clear_pending(dir.path()));
+
+        db.with_conn(|conn| conn.execute_batch("ALTER TABLE outbox_aside RENAME TO outbox;"))
+            .unwrap();
+        assert_eq!(db.finish_pending_clear(dir.path()), Ok(true));
+        assert!(!Database::clear_pending(dir.path()));
+        assert_eq!(db.count_cached_messages("inbox").unwrap(), 0);
+        assert_eq!(db.finish_pending_clear(dir.path()), Ok(false));
+    }
+
+    #[test]
+    fn a_successful_clear_leaves_no_marker() {
+        let (dir, db) = open_db();
+        insert(&db, "a1", "inbox");
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        rt.block_on(db.clear_user_data_or_defer(dir.path())).unwrap();
+        assert!(!Database::clear_pending(dir.path()));
+        assert_eq!(db.count_cached_messages("inbox").unwrap(), 0);
+    }
+
+    #[test]
+    fn stored_size_counts_every_line_break_as_two_bytes() {
+        let (_d, db) = open_db();
+        let raw = "one\ntwo\r\nthree\rfour";
+        db.upsert_cached_message("a1", "inbox", None, None, None, None, 0, Some(raw), None)
+            .unwrap();
+        db.upsert_cached_message("a2", "inbox", None, None, None, None, 0, None, None)
+            .unwrap();
+        db.update_cached_body("a2", raw, None).unwrap();
+        let expected = "one\r\ntwo\r\nthree\r\nfour".len() as i64;
+        for id in ["a1", "a2"] {
+            let stored = db.get_cached_message(id).unwrap().unwrap();
+            assert_eq!(stored.size, expected, "{}", id);
+            assert_eq!(stored.body_text.as_deref(), Some(raw));
+        }
+        let meta = db.list_cached_message_meta("inbox").unwrap();
+        let full = db.list_cached_messages("inbox").unwrap();
+        for (m, f) in meta.iter().zip(full.iter()) {
+            assert_eq!(
+                crate::message_render::rendered_size(m, &[]),
+                crate::message_render::render_text(f, &[]).len()
+            );
+        }
+    }
+
+    #[test]
+    fn sizes_stored_before_line_break_normalizing_are_repaired_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let bodies = ["one\ntwo\r\nthree\rfour", "plain", "\n\n", "caf\u{e9}\n\u{1f600}\r\n"];
+        {
+            let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+            for (i, body) in bodies.iter().enumerate() {
+                let id = format!("m{}", i);
+                db.upsert_cached_message(&id, "inbox", None, None, None, None, 0, Some(body), None)
+                    .unwrap();
+            }
+            db.upsert_cached_message("nobody", "inbox", None, None, None, None, 4321, None, None)
+                .unwrap();
+            db.with_conn(|conn| {
+                conn.execute_batch(
+                    "UPDATE message_cache SET size = length(CAST(body_text AS BLOB)) WHERE body_text IS NOT NULL;
+                     PRAGMA user_version = 0;",
+                )
+            })
+            .unwrap();
+        }
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        for (i, body) in bodies.iter().enumerate() {
+            let stored = db.get_cached_message(&format!("m{}", i)).unwrap().unwrap();
+            assert_eq!(
+                stored.size,
+                crate::message_render::crlf_normalized_len(body) as i64,
+                "body {}",
+                i
+            );
+        }
+        assert_eq!(db.get_cached_message("nobody").unwrap().unwrap().size, 4321);
+        let revision: i64 = db
+            .with_conn(|conn| conn.query_row("PRAGMA user_version", [], |r| r.get(0)))
+            .unwrap();
+        assert_eq!(revision, WIRE_SIZE_REVISION);
+    }
+
+    #[test]
+    fn folder_metadata_is_read_without_touching_message_bodies() {
+        let (_d, db) = open_db();
+        let plan: Vec<String> = db
+            .with_conn(|conn| {
+                let mut stmt = conn.prepare(
+                    "EXPLAIN QUERY PLAN SELECT m.aster_id, m.folder, m.subject, m.sender, m.recipients, m.date, m.size, m.flags, m.raw_headers, m.thread_id, m.attachments_state
+                     FROM message_cache m WHERE m.folder = 'archive'",
+                )?;
+                let rows = stmt.query_map([], |r| r.get::<_, String>(3))?;
+                rows.collect::<Result<Vec<_>, _>>()
+            })
+            .unwrap();
+        assert!(plan.iter().any(|step| step.contains("COVERING INDEX idx_message_cache_folder_meta")), "{:?}", plan);
+    }
+
+    #[test]
+    fn clear_all_user_data_wipes_everything() {
+        let (_d, db) = open_db();
+        insert(&db, "a1", "inbox");
+        db.outbox_insert(b"mime", "from@x", "to@x").unwrap();
+        db.clear_all_user_data().unwrap();
+        assert_eq!(db.count_cached_messages("inbox").unwrap(), 0);
+        assert!(db.outbox_list_pending().unwrap().is_empty());
+    }
+
+    fn schema_tables(db: &Database) -> Vec<String> {
+        db.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name",
+            )?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })
+        .unwrap()
+    }
+
+    fn history_tables() -> Vec<&'static str> {
+        history::HISTORY_CLEAR_SQL
+            .split(';')
+            .filter_map(|stmt| stmt.trim().strip_prefix("DELETE FROM "))
+            .map(str::trim)
+            .collect()
+    }
+
+    const FTS_SHADOW_TABLES: &[&str] = &[
+        "message_fts_config",
+        "message_fts_content",
+        "message_fts_data",
+        "message_fts_docsize",
+        "message_fts_idx",
+    ];
+
+    #[test]
+    fn every_schema_table_is_wiped_on_sign_out() {
+        let (_d, db) = open_db();
+        let history = history_tables();
+        assert!(!history.is_empty());
+        let missed: Vec<String> = schema_tables(&db)
+            .into_iter()
+            .filter(|t| !USER_DATA_TABLES.contains(&t.as_str()))
+            .filter(|t| !history.contains(&t.as_str()))
+            .filter(|t| !FTS_SHADOW_TABLES.contains(&t.as_str()))
+            .collect();
+        assert!(missed.is_empty(), "tables not wiped by clear_all_user_data: {:?}", missed);
+    }
+
+    #[test]
+    fn clear_all_user_data_forgets_append_pins() {
+        let (_d, db) = open_db();
+        let since = std::time::Instant::now();
+        db.pin_appended("a1", "INBOX");
+        db.clear_all_user_data().unwrap();
+        assert_eq!(db.unless_appended_since("a1", since, || 1), Some(1));
+    }
+
+    #[test]
+    fn clear_all_user_data_leaves_no_account_rows() {
+        let (_d, db) = open_db();
+        db.upsert_cached_message("a1", "inbox", Some("zebrasecret"), Some("from@x"), Some("to@x"), None, 10, Some("quokkabody"), None)
+            .unwrap();
+        db.outbox_insert(b"mime", "from@x", "to@x").unwrap();
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO custom_folder (label_token, server_id, name) VALUES ('lt', 'sid', 'Private Folder');
+                 INSERT INTO jmap_mailbox (id, name, folder_label) VALUES ('mb', 'Private Folder', 'lt');
+                 INSERT INTO recipient_key_pin (pin_id, identity_fingerprint, owner_fingerprint, updated_at) VALUES ('p', 'if', 'of', 1);
+                 INSERT INTO jmap_change_log (type, state, object_id, op, ts) VALUES ('Email', 1, 'a1', 'created', 1);
+                 INSERT INTO listing_member (listing, aster_id) VALUES ('inbox', 'a1');",
+            )
+        })
+        .unwrap();
+        db.clear_all_user_data().unwrap();
+        for table in schema_tables(&db) {
+            if table == "message_fts_config" || table == "message_fts_data" {
+                continue;
+            }
+            let count: i64 = db
+                .with_conn(|conn| conn.query_row(&format!("SELECT COUNT(*) FROM \"{}\"", table), [], |r| r.get(0)))
+                .unwrap();
+            assert_eq!(count, 0, "{} still holds rows", table);
+        }
+        let leaked: i64 = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM message_fts_data WHERE instr(block, CAST('zebrasecret' AS BLOB)) > 0 OR instr(block, CAST('quokkabody' AS BLOB)) > 0",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(leaked, 0);
+    }
+
+    #[test]
+    fn outbox_insert_and_get() {
+        let (_d, db) = open_db();
+        let id = db.outbox_insert(b"raw", "from@x", "to@y").unwrap();
+        let row = db.outbox_get(id).unwrap().unwrap();
+        assert_eq!(row.raw_mime, b"raw");
+        assert_eq!(row.envelope_from, "from@x");
+        assert_eq!(row.envelope_to, "to@y");
+        assert_eq!(row.status, "pending");
+        assert_eq!(row.attempts, 0);
+        assert!(db.outbox_get(99999).unwrap().is_none());
+    }
+
+    #[test]
+    fn outbox_list_pending_includes_states() {
+        let (_d, db) = open_db();
+        let id1 = db.outbox_insert(b"a", "f", "t").unwrap();
+        let id2 = db.outbox_insert(b"b", "f", "t").unwrap();
+        db.outbox_mark_sent(id1).unwrap();
+        let pending = db.outbox_list_pending().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, id2);
+    }
+
+    #[test]
+    fn outbox_pending_count_matches_the_pending_list() {
+        let (_d, db) = open_db();
+        assert_eq!(db.outbox_pending_count().unwrap(), 0);
+        let sent = db.outbox_insert(b"a", "f", "t").unwrap();
+        let sending = db.outbox_insert(b"b", "f", "t").unwrap();
+        let failed = db.outbox_insert(b"c", "f", "t").unwrap();
+        db.outbox_insert(b"d", "f", "t").unwrap();
+        db.outbox_mark_sent(sent).unwrap();
+        db.outbox_mark_sending(sending).unwrap();
+        db.outbox_mark_failed(failed, "refused").unwrap();
+        assert_eq!(db.outbox_pending_count().unwrap(), 3);
+        assert_eq!(db.outbox_pending_count().unwrap(), db.outbox_list_pending().unwrap().len());
+    }
+
+    #[test]
+    fn outbox_mark_sending_transitions() {
+        let (_d, db) = open_db();
+        let id = db.outbox_insert(b"a", "f", "t").unwrap();
+        assert_eq!(db.outbox_mark_sending(id).unwrap(), 1);
+        assert_eq!(db.outbox_get(id).unwrap().unwrap().status, "sending");
+        assert_eq!(db.outbox_mark_sending(id).unwrap(), 0, "already sending cannot re-mark");
+    }
+
+    #[test]
+    fn outbox_mark_sent_and_failed() {
+        let (_d, db) = open_db();
+        let id = db.outbox_insert(b"a", "f", "t").unwrap();
+        db.outbox_mark_sent(id).unwrap();
+        let row = db.outbox_get(id).unwrap().unwrap();
+        assert_eq!(row.status, "sent");
+        assert!(row.last_error.is_none());
+
+        let id2 = db.outbox_insert(b"b", "f", "t").unwrap();
+        db.outbox_mark_failed(id2, "boom").unwrap();
+        let row2 = db.outbox_get(id2).unwrap().unwrap();
+        assert_eq!(row2.status, "failed");
+        assert_eq!(row2.last_error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn outbox_bump_attempt_increments_and_requeues() {
+        let (_d, db) = open_db();
+        let id = db.outbox_insert(b"a", "f", "t").unwrap();
+        db.outbox_mark_sending(id).unwrap();
+        db.outbox_bump_attempt(id, "retry").unwrap();
+        let row = db.outbox_get(id).unwrap().unwrap();
+        assert_eq!(row.attempts, 1);
+        assert_eq!(row.status, "pending");
+        assert_eq!(row.last_error.as_deref(), Some("retry"));
+    }
+
+    #[test]
+    fn outbox_reset_stale_sending_reclaims_row() {
+        let (_d, db) = open_db();
+        let id = db.outbox_insert(b"a", "f", "t").unwrap();
+        db.outbox_mark_sending(id).unwrap();
+        let n = db.outbox_reset_stale_sending(0).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(db.outbox_get(id).unwrap().unwrap().status, "pending");
+    }
+
+    #[test]
+    fn outbox_stats_buckets() {
+        let (_d, db) = open_db();
+        let id1 = db.outbox_insert(b"a", "f", "t").unwrap();
+        let id2 = db.outbox_insert(b"b", "f", "t").unwrap();
+        let id3 = db.outbox_insert(b"c", "f", "t").unwrap();
+        db.outbox_mark_sent(id1).unwrap();
+        db.outbox_mark_failed(id2, "e").unwrap();
+        let _ = id3;
+        let stats = db.outbox_stats().unwrap();
+        assert_eq!(stats.pending, 1);
+        assert_eq!(stats.failed, 1);
+        assert_eq!(stats.sent_24h, 1);
+    }
+
+    #[test]
+    fn a_reader_is_not_starved_by_a_sync_hammering_the_connection() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let (dir, db) = open_db();
+        for i in 0..200 {
+            insert(&db, &format!("m{}", i), "inbox");
+        }
+        let db = Arc::new(db);
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let mut hammers = Vec::new();
+        for _ in 0..4 {
+            let db = db.clone();
+            let stop = stop.clone();
+            hammers.push(std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = db.with_conn(|c| {
+                        c.query_row("SELECT COUNT(*) FROM cached_messages", [], |r| {
+                            r.get::<_, i64>(0)
+                        })
+                    });
+                }
+            }));
+        }
+
+        std::thread::sleep(Duration::from_millis(300));
+
+        let mut worst = Duration::ZERO;
+        for _ in 0..40 {
+            let started = Instant::now();
+            let _ = db.count_cached_messages("inbox");
+            worst = worst.max(started.elapsed());
+            std::thread::sleep(Duration::from_millis(25));
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        for h in hammers {
+            h.join().unwrap();
+        }
+        drop(dir);
+
+        assert!(
+            worst < Duration::from_secs(1),
+            "a connection waited {:?} for the database while a sync held it;              an IMAP client sees this as dead air and times out",
+            worst
+        );
+    }
+
+    #[test]
+    fn sign_out_wipe_empties_the_log_and_leaves_no_free_pages() {
+        let (dir, db) = open_db();
+        for i in 0..400 {
+            insert(&db, &format!("secret-{:04}-{}", i, "x".repeat(300)), "inbox");
+        }
+        let wal = dir.path().join("bridge.db-wal");
+        assert!(std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0) > 0);
+        db.clear_all_user_data().unwrap();
+        assert_eq!(std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0), 0);
+        let free: i64 = db.with_conn(|c| c.query_row("PRAGMA freelist_count", [], |r| r.get(0))).unwrap();
+        assert_eq!(free, 0);
+        let secure: i64 = db.with_conn(|c| c.query_row("PRAGMA secure_delete", [], |r| r.get(0))).unwrap();
+        assert_eq!(secure, 1);
+        assert!(db.get_cached_message("secret-0000-x").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn sign_out_deletes_old_database_copies_and_keeps_other_files() {
+        let (dir, db) = open_db();
+        let copies = [
+            "bridge.db.unreadable.1",
+            "bridge.db.incompatible.2",
+            "bridge.db.incompatible.2-wal",
+            "bridge.db.incompatible.2-shm",
+            "bridge.db.enc",
+        ];
+        for name in copies {
+            std::fs::write(dir.path().join(name), b"old account data").unwrap();
+        }
+        std::fs::write(dir.path().join("bridge.dbx"), b"keep").unwrap();
+        std::fs::write(dir.path().join("config.toml"), b"keep").unwrap();
+        db.clear_user_data_or_defer(dir.path()).await.unwrap();
+        for name in copies {
+            assert!(!dir.path().join(name).exists(), "{} survived sign-out", name);
+        }
+        assert!(dir.path().join("bridge.dbx").exists());
+        assert!(dir.path().join("config.toml").exists());
+        assert!(dir.path().join("bridge.db").exists());
+    }
+
+    #[test]
+    fn sign_out_deletes_a_copy_quarantined_for_a_wrong_key() {
+        let dir = tempfile::tempdir().unwrap();
+        drop(Database::open_with_key(dir.path(), &[1u8; 32]).unwrap());
+        let db = Database::open_with_key(dir.path(), &[2u8; 32]).unwrap();
+        let unreadable = |dir: &Path| {
+            std::fs::read_dir(dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().starts_with("bridge.db.unreadable."))
+                .count()
+        };
+        assert_eq!(unreadable(dir.path()), 1);
+        db.clear_all_user_data().unwrap();
+        assert_eq!(unreadable(dir.path()), 0);
+    }
+
+    #[test]
+    fn destroying_the_cache_removes_every_database_file() {
+        let (dir, db) = open_db();
+        insert(&db, "a1", "inbox");
+        drop(db);
+        std::fs::write(dir.path().join("bridge.db.incompatible.9"), b"old").unwrap();
+        std::fs::write(dir.path().join("bridge.db-journal"), b"old").unwrap();
+        std::fs::write(dir.path().join("bridge.dbx"), b"keep").unwrap();
+        destroy_cache_files(dir.path()).unwrap();
+        let left: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(left, vec!["bridge.dbx".to_string()]);
+    }
+
+    fn slot_tags() -> Vec<CustomTag> {
+        vec![
+            named_tag("t-atencao", "Aten\u{E7}\u{E3}o"),
+            named_tag("t-trabalho", "\u{1F4BC} Trabalho"),
+            named_tag("t-tarde", "Mais tarde"),
+            named_tag("t-despesas", "Despesas"),
+        ]
+    }
+
+    #[test]
+    fn builtin_tag_keywords_follow_their_matched_labels() {
+        let (_d, db) = open_db();
+        insert(&db, "t-x", "inbox");
+        insert(&db, "t-y", "inbox");
+        db.replace_custom_tags(&slot_tags()).unwrap();
+        assert_eq!(
+            db.builtin_tag_slots().unwrap(),
+            vec![None, Some("t-trabalho".to_string()), None, None, Some("t-tarde".to_string())]
+        );
+
+        db.add_message_tag(&["t-x".to_string()], "t-tarde").unwrap();
+        let fetched = db.folder_keywords("inbox").unwrap().remove("t-x").unwrap();
+        assert!(fetched.contains(&"$label5".to_string()), "{:?}", fetched);
+        let fetched = db.keywords_for_messages(&["t-x".to_string()]).unwrap().remove("t-x").unwrap();
+        assert!(fetched.contains(&"$label5".to_string()), "{:?}", fetched);
+
+        db.set_message_keywords("t-y", &["$Label5".to_string(), "$label1".to_string(), "$label3".to_string()])
+            .unwrap();
+        assert_eq!(db.message_keywords("t-y").unwrap(), vec!["$label1", "$label3"]);
+    }
+
+    #[test]
+    fn choosing_a_label_for_a_builtin_tag_maps_moves_and_turns_off() {
+        let (_d, db) = open_db();
+        insert(&db, "t-x", "inbox");
+        insert(&db, "t-y", "inbox");
+        db.replace_custom_tags(&slot_tags()).unwrap();
+        db.add_message_tag(&["t-x".to_string()], "t-atencao").unwrap();
+        db.add_message_tag(&["t-y".to_string()], "t-trabalho").unwrap();
+
+        assert!(db.set_builtin_tag_slot(0, Some(&crate::tags::SlotOverride::Off)).is_err());
+        assert!(db.set_builtin_tag_slot(6, Some(&crate::tags::SlotOverride::Off)).is_err());
+        assert!(db
+            .set_builtin_tag_slot(1, Some(&crate::tags::SlotOverride::Label("t-missing".to_string())))
+            .is_err());
+
+        let changed = db
+            .set_builtin_tag_slot(1, Some(&crate::tags::SlotOverride::Label("t-atencao".to_string())))
+            .unwrap();
+        assert_eq!(changed, vec!["t-x".to_string()]);
+        assert_eq!(db.builtin_tag_slots().unwrap()[0].as_deref(), Some("t-atencao"));
+        let fetched = db.folder_keywords("inbox").unwrap().remove("t-x").unwrap();
+        assert!(fetched.contains(&"$label1".to_string()), "{:?}", fetched);
+
+        let changed = db
+            .set_builtin_tag_slot(4, Some(&crate::tags::SlotOverride::Label("t-atencao".to_string())))
+            .unwrap();
+        assert_eq!(changed, vec!["t-x".to_string()]);
+        let slots = db.builtin_tag_slots().unwrap();
+        assert_eq!(slots[0], None);
+        assert_eq!(slots[3].as_deref(), Some("t-atencao"));
+        let fetched = db.folder_keywords("inbox").unwrap().remove("t-x").unwrap();
+        assert!(fetched.contains(&"$label4".to_string()), "{:?}", fetched);
+        assert!(!fetched.contains(&"$label1".to_string()), "{:?}", fetched);
+
+        let changed = db.set_builtin_tag_slot(2, Some(&crate::tags::SlotOverride::Off)).unwrap();
+        assert_eq!(changed, vec!["t-y".to_string()]);
+        assert_eq!(db.builtin_tag_slots().unwrap()[1], None);
+        let fetched = db.folder_keywords("inbox").unwrap().remove("t-y").unwrap();
+        assert!(!fetched.contains(&"$label2".to_string()), "{:?}", fetched);
+
+        let changed = db.set_builtin_tag_slot(2, None).unwrap();
+        assert_eq!(changed, vec!["t-y".to_string()]);
+        assert_eq!(db.builtin_tag_slots().unwrap()[1].as_deref(), Some("t-trabalho"));
+        assert!(db.set_builtin_tag_slot(2, None).unwrap().is_empty());
+
+        db.replace_custom_tags(&slot_tags()[1..]).unwrap();
+        assert_eq!(db.builtin_tag_slots().unwrap()[3], None);
+
+        db.clear_all_user_data().unwrap();
+        assert!(db.builtin_tag_slot_overrides().unwrap().is_empty());
+    }
+}

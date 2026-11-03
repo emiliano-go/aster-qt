@@ -1,0 +1,1098 @@
+//
+// Aster Communications Inc.
+//
+// Copyright (c) 2026 Aster Communications Inc.
+//
+// This file is part of this project.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+//
+use std::sync::{Arc, Mutex as StdMutex, Weak};
+use std::time::Duration;
+
+use tokio::sync::{mpsc, watch, RwLock};
+use tokio::task::JoinHandle;
+
+use crate::api_client::ApiClient;
+use crate::auth::app_passwords::AppPasswords;
+use crate::auth::session::Session;
+use crate::config::BridgeConfig;
+use crate::db::Database;
+use crate::error::BridgeError;
+use crate::port_picker::{self, Occupant};
+use crate::sync::poller::{self, PollExit, PollTuning, SyncTrigger, SyncTriggerTx};
+
+pub const LOOPBACK_HOST: &str = "127.0.0.1";
+const PLAN_CHECK_ATTEMPTS: u8 = 3;
+const SESSION_EXPIRED_AFTER_FAILURES: u32 = 5;
+const DEVICE_REVOKED_AFTER_FAILURES: u32 = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Service {
+    Imap,
+    Imaps,
+    Smtp,
+    Smtps,
+    Jmap,
+    Carddav,
+    Pop3,
+    Pop3s,
+    Sync,
+    Gc,
+    Outbox,
+    TokenRefresh,
+}
+
+impl Service {
+    pub fn label(self) -> &'static str {
+        match self {
+            Service::Imap => "IMAP",
+            Service::Imaps => "IMAPS",
+            Service::Smtp => "SMTP",
+            Service::Smtps => "SMTPS",
+            Service::Jmap => "JMAP",
+            Service::Carddav => "CardDAV",
+            Service::Pop3 => "POP3",
+            Service::Pop3s => "POP3S",
+            Service::Sync => "sync",
+            Service::Gc => "cache cleanup",
+            Service::Outbox => "outbox",
+            Service::TokenRefresh => "session refresh",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "reason", content = "detail", rename_all = "snake_case")]
+pub enum StopReason {
+    UserRequested,
+    AccessRevoked,
+    DeviceRevoked,
+    Fatal(String),
+}
+
+impl StopReason {
+    pub fn code(&self) -> &'static str {
+        match self {
+            StopReason::UserRequested => "user_requested",
+            StopReason::AccessRevoked => "access_revoked",
+            StopReason::DeviceRevoked => "device_revoked",
+            StopReason::Fatal(_) => "fatal",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartError {
+    BridgeAccessRequired { plan_code: Option<String> },
+    PlanCheckFailed(String),
+    NotSignedIn,
+    DeviceRevoked,
+    PortUnavailable {
+        service: Service,
+        port: u16,
+        message: String,
+        held_by_bridge: bool,
+    },
+    Io(String),
+    Database(String),
+}
+
+impl StartError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            StartError::BridgeAccessRequired { .. } => "bridge_access_required",
+            StartError::PlanCheckFailed(_) => "plan_check_failed",
+            StartError::NotSignedIn => "not_signed_in",
+            StartError::DeviceRevoked => "device_revoked",
+            StartError::PortUnavailable { .. } => "port_unavailable",
+            StartError::Io(_) => "io",
+            StartError::Database(_) => "database",
+        }
+    }
+}
+
+impl std::fmt::Display for StartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StartError::BridgeAccessRequired { .. } => f.write_str("bridge_access_required"),
+            StartError::PlanCheckFailed(e) => write!(f, "could not confirm your plan: {}", e),
+            StartError::NotSignedIn => f.write_str("not authenticated - run setup first"),
+            StartError::DeviceRevoked => f.write_str("this device was removed from your account"),
+            StartError::PortUnavailable { message, .. } => f.write_str(message),
+            StartError::Io(e) => f.write_str(e),
+            StartError::Database(e) => f.write_str(e),
+        }
+    }
+}
+
+impl std::error::Error for StartError {}
+
+#[derive(Debug, Clone)]
+pub struct PlanGrant {
+    plan_code: String,
+}
+
+impl PlanGrant {
+    pub fn plan_code(&self) -> &str {
+        &self.plan_code
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientProfile {
+    Desktop,
+    Cli,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RuntimeTuning {
+    pub poll: PollTuning,
+    pub plan_retry_delay: Duration,
+    pub token_refresh_interval: Duration,
+    pub token_retry_interval: Duration,
+    pub blob_gc_interval: Duration,
+}
+
+impl RuntimeTuning {
+    pub fn for_config(config: &BridgeConfig) -> Self {
+        Self {
+            poll: PollTuning {
+                full_history: config.full_mail_history,
+                ..PollTuning::from_interval_secs(Some(config.poll_interval_secs))
+            },
+            plan_retry_delay: Duration::from_secs(2),
+            token_refresh_interval: Duration::from_secs(50 * 60),
+            token_retry_interval: Duration::from_secs(60),
+            blob_gc_interval: Duration::from_secs(3600),
+        }
+    }
+}
+
+pub async fn check_bridge_access(
+    client: &ApiClient,
+    session: &Arc<RwLock<Session>>,
+    retry_delay: Duration,
+) -> Result<PlanGrant, StartError> {
+    let mut last_error = String::new();
+    for attempt in 0..PLAN_CHECK_ATTEMPTS {
+        if attempt > 0 {
+            tokio::time::sleep(retry_delay).await;
+        }
+        let token = {
+            let s = session.read().await;
+            (*s.access_token).clone()
+        };
+        match client.get_plan_info(&token).await {
+            Ok(info) if info.has_bridge_access => {
+                return Ok(PlanGrant {
+                    plan_code: info.plan_code,
+                })
+            }
+            Ok(info) => {
+                return Err(StartError::BridgeAccessRequired {
+                    plan_code: Some(info.plan_code),
+                })
+            }
+            Err(BridgeError::PlanUpgradeRequired(_)) => {
+                return Err(StartError::BridgeAccessRequired { plan_code: None })
+            }
+            Err(e) => {
+                tracing::warn!("plan check attempt {} failed: {}", attempt + 1, e);
+                last_error = e.to_string();
+            }
+        }
+    }
+    Err(StartError::PlanCheckFailed(last_error))
+}
+
+pub fn token_refresh_wait(
+    tuning: &RuntimeTuning,
+    consecutive_failures: u32,
+    network_retry: bool,
+) -> Duration {
+    if network_retry {
+        return tuning.token_retry_interval;
+    }
+    if consecutive_failures == 0 {
+        return tuning.token_refresh_interval;
+    }
+    let exponent = (consecutive_failures - 1).min(6);
+    tuning
+        .token_retry_interval
+        .saturating_mul(1u32 << exponent)
+        .min(tuning.token_refresh_interval.max(tuning.token_retry_interval))
+}
+
+const EARLY_REFRESH_MIN_GAP: Duration = Duration::from_secs(60);
+
+fn should_refresh_early(
+    consecutive_failures: u32,
+    last_attempt: tokio::time::Instant,
+    now: tokio::time::Instant,
+) -> bool {
+    consecutive_failures == 0 && now.duration_since(last_attempt) >= EARLY_REFRESH_MIN_GAP
+}
+
+fn device_revocation_confirmed(definitive_failures: u32) -> bool {
+    definitive_failures >= DEVICE_REVOKED_AFTER_FAILURES
+}
+
+pub fn is_definitive_device_failure(error: &BridgeError) -> bool {
+    match error {
+        BridgeError::Api(msg) => msg.starts_with("401") || msg.starts_with("404"),
+        _ => false,
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct BoundPorts {
+    pub imap: u16,
+    pub smtp: u16,
+    pub jmap: u16,
+    pub carddav: u16,
+    pub imaps: u16,
+    pub smtps: u16,
+    pub pop3: u16,
+    pub pop3s: u16,
+}
+
+impl BoundPorts {
+    pub fn apply_to_config(&self, config: &mut BridgeConfig) -> bool {
+        let mut dirty = false;
+        let mut update = |slot: &mut u16, value: u16| {
+            if value != 0 && *slot != value {
+                *slot = value;
+                dirty = true;
+            }
+        };
+        update(&mut config.imap_port, self.imap);
+        update(&mut config.smtp_port, self.smtp);
+        update(&mut config.jmap_port, self.jmap);
+        update(&mut config.carddav_port, self.carddav);
+        dirty
+    }
+}
+
+pub struct RuntimeDeps {
+    pub session: Arc<RwLock<Session>>,
+    pub db: Arc<Database>,
+    pub client: Arc<ApiClient>,
+    pub passwords: Arc<AppPasswords>,
+}
+
+pub struct StartOptions {
+    pub config: BridgeConfig,
+    pub tls: Option<Arc<rustls::ServerConfig>>,
+    pub device_id: uuid::Uuid,
+    pub signing_key: ed25519_dalek::SigningKey,
+    pub profile: ClientProfile,
+    pub tuning: RuntimeTuning,
+}
+
+struct Inner {
+    handles: StdMutex<Vec<(Service, JoinHandle<()>)>>,
+    stopping: StdMutex<Vec<JoinHandle<()>>>,
+    stop_tx: watch::Sender<Option<StopReason>>,
+    sync_trigger: SyncTriggerTx,
+    connections: crate::shutdown::ShutdownTrigger,
+}
+
+impl Inner {
+    fn stop(&self, reason: StopReason) {
+        let mut first = false;
+        self.stop_tx.send_if_modified(|current| {
+            if current.is_none() {
+                *current = Some(reason.clone());
+                first = true;
+                true
+            } else {
+                false
+            }
+        });
+        self.connections.close_connections();
+        let handles = match self.handles.lock() {
+            Ok(mut guard) => std::mem::take(&mut *guard),
+            Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
+        };
+        let mut stopping = match self.stopping.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        for (_, handle) in handles {
+            handle.abort();
+            stopping.push(handle);
+        }
+        drop(stopping);
+        if first {
+            poller::clear_global_sync_trigger_if(&self.sync_trigger);
+            tracing::info!("bridge stopped ({})", reason.code());
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct RunningBridge {
+    inner: Arc<Inner>,
+    ports: BoundPorts,
+    outbox_trigger: mpsc::Sender<i64>,
+    stop_rx: watch::Receiver<Option<StopReason>>,
+}
+
+impl RunningBridge {
+    pub fn bound_ports(&self) -> BoundPorts {
+        self.ports
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.stop_rx.borrow().is_none()
+    }
+
+    pub fn stop_reason(&self) -> Option<StopReason> {
+        self.stop_rx.borrow().clone()
+    }
+
+    pub fn service_running(&self, service: Service) -> bool {
+        if !self.is_running() {
+            return false;
+        }
+        match self.inner.handles.lock() {
+            Ok(guard) => guard
+                .iter()
+                .any(|(s, h)| *s == service && !h.is_finished()),
+            Err(_) => false,
+        }
+    }
+
+    pub fn stop(&self, reason: StopReason) {
+        self.inner.stop(reason);
+    }
+
+    pub fn is_drained(&self) -> bool {
+        if self.is_running() {
+            return false;
+        }
+        let stopping_done = match self.inner.stopping.lock() {
+            Ok(guard) => guard.iter().all(|h| h.is_finished()),
+            Err(_) => false,
+        };
+        stopping_done && self.inner.connections.is_idle()
+    }
+
+    pub async fn stop_and_wait(&self, reason: StopReason) {
+        self.inner.stop(reason);
+        let stopping = match self.inner.stopping.lock() {
+            Ok(mut guard) => std::mem::take(&mut *guard),
+            Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
+        };
+        for handle in stopping {
+            let _ = handle.await;
+        }
+        self.inner.connections.close_and_wait().await;
+    }
+
+    pub async fn wait(&self) -> StopReason {
+        let mut rx = self.stop_rx.clone();
+        let reason = rx.wait_for(|v| v.is_some()).await.ok().and_then(|v| v.clone());
+        reason.unwrap_or(StopReason::UserRequested)
+    }
+
+    pub fn sync_trigger(&self) -> Option<SyncTriggerTx> {
+        self.is_running().then(|| self.inner.sync_trigger.clone())
+    }
+
+    pub fn outbox_trigger(&self) -> Option<mpsc::Sender<i64>> {
+        self.is_running().then(|| self.outbox_trigger.clone())
+    }
+
+    pub async fn sync_now(&self) -> Result<(), String> {
+        let trigger = self
+            .sync_trigger()
+            .ok_or_else(|| "bridge is not running".to_string())?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        trigger
+            .send(SyncTrigger { done: tx })
+            .await
+            .map_err(|_| "sync worker not available".to_string())?;
+        match rx.await {
+            Ok(result) => result,
+            Err(_) => Err("sync worker dropped completion channel".to_string()),
+        }
+    }
+}
+
+struct PortPlan {
+    ports: BoundPorts,
+    jmap_enabled: bool,
+    carddav_enabled: bool,
+}
+
+fn port_error(service: Service, port: u16, message: String) -> StartError {
+    let held_by_bridge = matches!(
+        port_picker::probe_occupant(LOOPBACK_HOST, port),
+        Occupant::AsterBridge
+    );
+    StartError::PortUnavailable {
+        service,
+        port,
+        message,
+        held_by_bridge,
+    }
+}
+
+fn plan_ports(config: &BridgeConfig, tls: bool) -> Result<PortPlan, StartError> {
+    let host = LOOPBACK_HOST;
+    let imap = port_picker::pick_startup_port(host, config.imap_port)
+        .map_err(|e| port_error(Service::Imap, config.imap_port, e))?;
+    let smtp = port_picker::pick_startup_port(host, config.smtp_port)
+        .map_err(|e| port_error(Service::Smtp, config.smtp_port, e))?;
+    let configured = [
+        config.imap_port,
+        config.smtp_port,
+        config.imap_implicit_tls_port,
+        config.smtp_implicit_tls_port,
+        config.jmap_port,
+        config.pop3_port,
+        config.pop3s_port,
+        config.carddav_port,
+    ];
+    let mut chosen = vec![imap, smtp];
+    let mut pick_free = |preferred: u16| -> Result<u16, String> {
+        let avoid: Vec<u16> = configured
+            .iter()
+            .copied()
+            .filter(|&p| p != preferred)
+            .chain(chosen.iter().copied())
+            .collect();
+        let port = port_picker::pick_free_port_avoiding(host, preferred, &avoid)?;
+        chosen.push(port);
+        Ok(port)
+    };
+    let jmap = if config.jmap_enabled {
+        pick_free(config.jmap_port).map_err(|e| port_error(Service::Jmap, config.jmap_port, e))?
+    } else {
+        0
+    };
+    let carddav = if config.carddav_enabled {
+        match pick_free(config.carddav_port) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("CardDAV listener disabled: {}", e);
+                0
+            }
+        }
+    } else {
+        0
+    };
+    let pick_tls = |service: Service, preferred: u16| -> u16 {
+        if !tls {
+            return 0;
+        }
+        match port_picker::pick_startup_port(host, preferred) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!("{} listener disabled: {}", service.label(), e);
+                0
+            }
+        }
+    };
+    let imaps = pick_tls(Service::Imaps, config.imap_implicit_tls_port);
+    let smtps = pick_tls(Service::Smtps, config.smtp_implicit_tls_port);
+    let pop3 = pick_free(config.pop3_port).unwrap_or(0);
+    let pop3s = if tls {
+        pick_free(config.pop3s_port).unwrap_or(0)
+    } else {
+        0
+    };
+    Ok(PortPlan {
+        ports: BoundPorts {
+            imap,
+            smtp,
+            jmap,
+            carddav,
+            imaps,
+            smtps,
+            pop3,
+            pop3s,
+        },
+        jmap_enabled: config.jmap_enabled,
+        carddav_enabled: config.carddav_enabled && carddav != 0,
+    })
+}
+
+type StopSender = mpsc::UnboundedSender<StopReason>;
+
+fn spawn_listener<F, E>(
+    service: Service,
+    fatal: Option<StopSender>,
+    shutdown: crate::shutdown::ConnectionShutdown,
+    fut: F,
+) -> JoinHandle<()>
+where
+    F: std::future::Future<Output = Result<(), E>> + Send + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
+    tokio::spawn(shutdown.scope(async move {
+        if let Err(e) = fut.await {
+            tracing::error!("{} server error: {}", service.label(), e);
+            if let Some(tx) = fatal {
+                let _ = tx.send(StopReason::Fatal(format!(
+                    "{} listener failed: {}",
+                    service.label(),
+                    e
+                )));
+            }
+        }
+    }))
+}
+
+fn spawn_worker<F>(shutdown: crate::shutdown::ConnectionShutdown, fut: F) -> JoinHandle<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let held = shutdown.hold();
+    tokio::spawn(async move {
+        let Some(_held) = held else {
+            return;
+        };
+        let _ = shutdown
+            .clone()
+            .scope(crate::shutdown::until_closed(shutdown, fut))
+            .await;
+    })
+}
+
+pub struct BridgeRuntime;
+
+impl BridgeRuntime {
+    pub async fn start(
+        grant: PlanGrant,
+        deps: RuntimeDeps,
+        opts: StartOptions,
+    ) -> Result<RunningBridge, StartError> {
+        tracing::info!("starting bridge on plan {}", grant.plan_code());
+        deps.db.app_password_cache.clear();
+        let tls_cfg = if opts.config.tls_enabled {
+            opts.tls.clone()
+        } else {
+            None
+        };
+        let has_tls = tls_cfg.is_some();
+        let config = opts.config.clone();
+        let plan = tokio::task::spawn_blocking(move || plan_ports(&config, has_tls))
+            .await
+            .map_err(|e| StartError::Io(format!("port selection failed: {}", e)))??;
+        let ports = plan.ports;
+        let host = LOOPBACK_HOST;
+        let jmap_https = opts.config.jmap_https_enabled && has_tls;
+        let carddav_https = opts.config.carddav_https_enabled && has_tls;
+
+        let RuntimeDeps {
+            session,
+            db,
+            client,
+            passwords,
+        } = deps;
+
+        let (stop_signal_tx, mut stop_signal_rx) = mpsc::unbounded_channel::<StopReason>();
+        let mut handles: Vec<(Service, JoinHandle<()>)> = Vec::new();
+        let broadcaster = crate::jmap::state::broadcaster();
+        let (connections, conn_shutdown) = crate::shutdown::channel();
+
+        {
+            let addr = format!("{}:{}", host, ports.imap);
+            let (s, d, c, p, b, t) = (
+                session.clone(),
+                db.clone(),
+                client.clone(),
+                passwords.clone(),
+                broadcaster.clone(),
+                tls_cfg.clone(),
+            );
+            let fut = async move { crate::imap::server::run(&addr, s, d, c, p, b, t).await };
+            handles.push((
+                Service::Imap,
+                spawn_listener(Service::Imap, Some(stop_signal_tx.clone()), conn_shutdown.clone(), fut),
+            ));
+        }
+
+        if let (Some(cfg), true) = (tls_cfg.clone(), ports.imaps != 0) {
+            let addr = format!("{}:{}", host, ports.imaps);
+            let (s, d, c, p, b) = (
+                session.clone(),
+                db.clone(),
+                client.clone(),
+                passwords.clone(),
+                broadcaster.clone(),
+            );
+            let fut = async move {
+                crate::imap::server::run_implicit_tls(&addr, s, d, c, p, b, cfg).await
+            };
+            handles.push((Service::Imaps, spawn_listener(Service::Imaps, None, conn_shutdown.clone(), fut)));
+        }
+
+        {
+            let addr = format!("{}:{}", host, ports.smtp);
+            let (s, c, p, d, t) = (
+                session.clone(),
+                client.clone(),
+                passwords.clone(),
+                db.clone(),
+                tls_cfg.clone(),
+            );
+            let fut = async move { crate::smtp::server::run(&addr, s, c, p, d, t).await };
+            handles.push((
+                Service::Smtp,
+                spawn_listener(Service::Smtp, Some(stop_signal_tx.clone()), conn_shutdown.clone(), fut),
+            ));
+        }
+
+        if let (Some(cfg), true) = (tls_cfg.clone(), ports.smtps != 0) {
+            let addr = format!("{}:{}", host, ports.smtps);
+            let (s, c, p, d) = (
+                session.clone(),
+                client.clone(),
+                passwords.clone(),
+                db.clone(),
+            );
+            let fut = async move {
+                crate::smtp::server::run_implicit_tls(&addr, s, c, p, d, cfg).await
+            };
+            handles.push((Service::Smtps, spawn_listener(Service::Smtps, None, conn_shutdown.clone(), fut)));
+        }
+
+        if plan.jmap_enabled {
+            let addr = format!("{}:{}", host, ports.jmap);
+            let (s, d, c, p, b) = (
+                session.clone(),
+                db.clone(),
+                client.clone(),
+                passwords.clone(),
+                broadcaster.clone(),
+            );
+            let t = if jmap_https { tls_cfg.clone() } else { None };
+            let fut = async move { crate::jmap::server::run(&addr, s, d, c, p, b, t).await };
+            handles.push((Service::Jmap, spawn_listener(Service::Jmap, None, conn_shutdown.clone(), fut)));
+        }
+
+        if plan.carddav_enabled {
+            let addr = format!("{}:{}", host, ports.carddav);
+            let (s, c, p) = (session.clone(), client.clone(), passwords.clone());
+            let t = if carddav_https { tls_cfg.clone() } else { None };
+            let fut = async move { crate::dav::server::run(&addr, s, c, p, t).await };
+            handles.push((Service::Carddav, spawn_listener(Service::Carddav, None, conn_shutdown.clone(), fut)));
+        }
+
+        if ports.pop3 != 0 {
+            let addr = format!("{}:{}", host, ports.pop3);
+            let (s, d, c, p, t) = (
+                session.clone(),
+                db.clone(),
+                client.clone(),
+                passwords.clone(),
+                tls_cfg.clone(),
+            );
+            let fut = async move { crate::pop3::server::run(&addr, s, d, c, p, t).await };
+            handles.push((Service::Pop3, spawn_listener(Service::Pop3, None, conn_shutdown.clone(), fut)));
+        }
+
+        if let (Some(cfg), true) = (tls_cfg.clone(), ports.pop3s != 0) {
+            let addr = format!("{}:{}", host, ports.pop3s);
+            let (s, d, c, p) = (
+                session.clone(),
+                db.clone(),
+                client.clone(),
+                passwords.clone(),
+            );
+            let fut = async move {
+                crate::pop3::server::run_implicit_tls(&addr, s, d, c, p, cfg).await
+            };
+            handles.push((Service::Pop3s, spawn_listener(Service::Pop3s, None, conn_shutdown.clone(), fut)));
+        }
+
+        let (sync_tx, sync_rx) = poller::sync_trigger_channel();
+        {
+            let (s, c, d, b) = (
+                session.clone(),
+                client.clone(),
+                db.clone(),
+                Some(broadcaster.clone()),
+            );
+            let tuning = opts.tuning.poll;
+            let stop = stop_signal_tx.clone();
+            handles.push((
+                Service::Sync,
+                spawn_worker(conn_shutdown.clone(), async move {
+                    if poller::run_poll_loop_tuned(s, c, d, b, sync_rx, tuning).await
+                        == PollExit::AccessRevoked
+                    {
+                        let _ = stop.send(StopReason::AccessRevoked);
+                    }
+                }),
+            ));
+        }
+        poller::set_global_sync_trigger(Some(sync_tx.clone()));
+
+        {
+            let gc_db = db.clone();
+            let every = opts.tuning.blob_gc_interval;
+            handles.push((
+                Service::Gc,
+                spawn_worker(conn_shutdown.clone(), async move {
+                    let mut tick = tokio::time::interval(every);
+                    loop {
+                        tick.tick().await;
+                        match gc_db.jmap_blob_gc(24 * 3600) {
+                            Ok(0) => {}
+                            Ok(n) => tracing::debug!("jmap_blob GC removed {} expired blobs", n),
+                            Err(e) => tracing::warn!("jmap_blob GC failed: {}", e),
+                        }
+                    }
+                }),
+            ));
+        }
+
+        let _ = db.outbox_reset_stale_sending(0);
+        let (outbox_tx, outbox_rx) = crate::outbox::outbox_trigger_channel();
+        {
+            let (s, c, d) = (session.clone(), client.clone(), db.clone());
+            handles.push((
+                Service::Outbox,
+                spawn_worker(conn_shutdown.clone(), async move {
+                    crate::outbox::run_outbox_loop(s, c, d, outbox_rx).await;
+                }),
+            ));
+        }
+
+        {
+            let s = session.clone();
+            let c = client.clone();
+            let device_id = opts.device_id;
+            let signing_key = opts.signing_key.clone();
+            let profile = opts.profile;
+            let tuning = opts.tuning;
+            let stop = stop_signal_tx.clone();
+            handles.push((
+                Service::TokenRefresh,
+                spawn_worker(conn_shutdown.clone(), async move {
+                    crate::auth::session::set_session_rejected(false);
+                    let mut consecutive_failures: u32 = 0;
+                    let mut definitive_failures: u32 = 0;
+                    let mut last_attempt = tokio::time::Instant::now();
+                    let mut due =
+                        last_attempt + token_refresh_wait(&tuning, consecutive_failures, false);
+                    loop {
+                        tokio::select! {
+                            _ = tokio::time::sleep_until(due) => {}
+                            _ = crate::auth::session::token_refresh_requested() => {
+                                let now = tokio::time::Instant::now();
+                                if !should_refresh_early(consecutive_failures, last_attempt, now) {
+                                    continue;
+                                }
+                                tracing::info!("refreshing the access token early");
+                            }
+                        }
+                        last_attempt = tokio::time::Instant::now();
+                        let network_retry = match crate::auth::session::refresh_access_token(
+                            &s,
+                            device_id,
+                            &signing_key,
+                            &c,
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                if consecutive_failures > 0 {
+                                    tracing::info!("access token refresh recovered");
+                                }
+                                consecutive_failures = 0;
+                                definitive_failures = 0;
+                                crate::auth::session::set_session_rejected(false);
+                                false
+                            }
+                            Err(e @ BridgeError::Network(_)) => {
+                                tracing::warn!(
+                                    "proactive token refresh could not reach the server: {}",
+                                    e
+                                );
+                                true
+                            }
+                            Err(e) => {
+                                consecutive_failures = consecutive_failures.saturating_add(1);
+                                tracing::warn!(
+                                    "proactive token refresh failed (attempt {}): {}",
+                                    consecutive_failures,
+                                    e
+                                );
+                                if is_definitive_device_failure(&e) {
+                                    definitive_failures = definitive_failures.saturating_add(1);
+                                    crate::auth::session::set_session_rejected(true);
+                                } else {
+                                    definitive_failures = 0;
+                                }
+                                if profile == ClientProfile::Cli
+                                    && device_revocation_confirmed(definitive_failures)
+                                {
+                                    poller::emit_session_expired();
+                                    let _ = stop.send(StopReason::DeviceRevoked);
+                                    return;
+                                }
+                                if consecutive_failures == SESSION_EXPIRED_AFTER_FAILURES {
+                                    poller::emit_session_expired();
+                                }
+                                false
+                            }
+                        };
+                        due = tokio::time::Instant::now()
+                            + token_refresh_wait(&tuning, consecutive_failures, network_retry);
+                    }
+                }),
+            ));
+        }
+        drop(stop_signal_tx);
+
+        let (stop_tx, stop_rx) = watch::channel(None);
+        let inner = Arc::new(Inner {
+            handles: StdMutex::new(handles),
+            stopping: StdMutex::new(Vec::new()),
+            stop_tx,
+            sync_trigger: sync_tx,
+            connections,
+        });
+
+        let weak: Weak<Inner> = Arc::downgrade(&inner);
+        tokio::spawn(async move {
+            if let Some(reason) = stop_signal_rx.recv().await {
+                if let Some(inner) = weak.upgrade() {
+                    inner.stop(reason);
+                }
+            }
+        });
+
+        tracing::info!(
+            "bridge started - IMAP on {}:{}, SMTP on {}:{}, JMAP on {}:{} (enabled={}, tls={})",
+            host,
+            ports.imap,
+            host,
+            ports.smtp,
+            host,
+            ports.jmap,
+            plan.jmap_enabled,
+            has_tls,
+        );
+
+        Ok(RunningBridge {
+            inner,
+            ports,
+            outbox_trigger: outbox_tx,
+            stop_rx,
+        })
+    }
+}
+
+#[cfg(test)]
+mod token_refresh_wait_tests {
+    use super::*;
+
+    #[test]
+    fn failed_refreshes_back_off_up_to_the_normal_interval() {
+        let tuning = RuntimeTuning::for_config(&BridgeConfig::default());
+        let waits: Vec<u64> = (0..10)
+            .map(|failures| token_refresh_wait(&tuning, failures, false).as_secs())
+            .collect();
+
+        assert_eq!(waits, vec![3000, 60, 120, 240, 480, 960, 1920, 3000, 3000, 3000]);
+    }
+
+    #[test]
+    fn network_failures_retry_at_the_short_interval() {
+        let tuning = RuntimeTuning::for_config(&BridgeConfig::default());
+        for failures in [0, 1, 4, 9] {
+            assert_eq!(token_refresh_wait(&tuning, failures, true).as_secs(), 60);
+        }
+    }
+
+    #[test]
+    fn an_early_refresh_waits_out_failures_and_recent_attempts() {
+        let start = tokio::time::Instant::now();
+        let later = start + Duration::from_secs(120);
+        assert!(should_refresh_early(0, start, later));
+        assert!(!should_refresh_early(0, start, start + Duration::from_secs(5)));
+        assert!(!should_refresh_early(2, start, later));
+    }
+
+    #[test]
+    fn one_rejected_sign_in_does_not_confirm_a_revoked_device() {
+        assert!(!device_revocation_confirmed(0));
+        assert!(!device_revocation_confirmed(1));
+        assert!(!device_revocation_confirmed(DEVICE_REVOKED_AFTER_FAILURES - 1));
+        assert!(device_revocation_confirmed(DEVICE_REVOKED_AFTER_FAILURES));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jmap_drifting_off_a_busy_port_does_not_take_the_carddav_port() {
+        let imap_probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let smtp_probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let busy = held.local_addr().unwrap().port();
+        if busy > u16::MAX - 40 {
+            return;
+        }
+        let mut config = BridgeConfig::default();
+        config.imap_port = imap_probe.local_addr().unwrap().port();
+        config.smtp_port = smtp_probe.local_addr().unwrap().port();
+        config.jmap_port = busy;
+        config.carddav_port = busy + 1;
+        config.pop3_port = busy + 2;
+        config.jmap_enabled = true;
+        config.carddav_enabled = true;
+        drop(imap_probe);
+        drop(smtp_probe);
+        if crate::config::validate_ports(&config).is_err() {
+            return;
+        }
+
+        let plan = plan_ports(&config, false).unwrap_or_else(|_| panic!("ports must plan"));
+        let ports = plan.ports;
+        assert_ne!(ports.jmap, busy);
+        assert_ne!(ports.jmap, ports.carddav);
+        assert_ne!(ports.jmap, config.carddav_port);
+        assert_ne!(ports.jmap, config.pop3_port);
+        if ports.carddav != 0 && ports.pop3 != 0 {
+            assert_ne!(ports.carddav, ports.pop3);
+        }
+
+        let mut saved = config.clone();
+        ports.apply_to_config(&mut saved);
+        crate::config::validate_ports(&saved).expect("saved ports must stay distinct");
+        drop(held);
+    }
+
+    fn bridge_with<F>(spawn: F) -> (RunningBridge, crate::shutdown::ConnectionShutdown)
+    where
+        F: FnOnce(crate::shutdown::ConnectionShutdown) -> Vec<(Service, JoinHandle<()>)>,
+    {
+        let (connections, conn_shutdown) = crate::shutdown::channel();
+        let handles = spawn(conn_shutdown.clone());
+        let (stop_tx, stop_rx) = watch::channel(None);
+        let (sync_tx, _sync_rx) = poller::sync_trigger_channel();
+        let (outbox_tx, _outbox_rx) = crate::outbox::outbox_trigger_channel();
+        let inner = Arc::new(Inner {
+            handles: StdMutex::new(handles),
+            stopping: StdMutex::new(Vec::new()),
+            stop_tx,
+            sync_trigger: sync_tx,
+            connections,
+        });
+        (
+            RunningBridge {
+                inner,
+                ports: BoundPorts::default(),
+                outbox_trigger: outbox_tx,
+                stop_rx,
+            },
+            conn_shutdown,
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sign_out_waits_for_background_writes_and_none_start_after_the_wipe() {
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        let writes = Arc::new(AtomicU32::new(0));
+        let writing = Arc::new(AtomicBool::new(false));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (w, busy) = (writes.clone(), writing.clone());
+        let (bridge, _) = bridge_with(move |shutdown| {
+            let mut started = Some(started_tx);
+            vec![
+                (
+                    Service::Sync,
+                    spawn_worker(shutdown.clone(), async move {
+                        loop {
+                            let (w, busy) = (w.clone(), busy.clone());
+                            let first = started.take();
+                            let out = crate::shutdown::spawn_blocking_held(move || {
+                                busy.store(true, Ordering::SeqCst);
+                                if let Some(tx) = first {
+                                    let _ = tx.send(());
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(200));
+                                w.fetch_add(1, Ordering::SeqCst);
+                                busy.store(false, Ordering::SeqCst);
+                            })
+                            .await;
+                            if out.is_none() {
+                                return;
+                            }
+                        }
+                    }),
+                ),
+                (
+                    Service::Outbox,
+                    spawn_worker(shutdown, async move {
+                        std::future::pending::<()>().await;
+                    }),
+                ),
+            ]
+        });
+        started_rx.await.unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            bridge.stop_and_wait(StopReason::UserRequested),
+        )
+        .await
+        .unwrap();
+        assert!(!writing.load(Ordering::SeqCst));
+        let after_wipe = writes.load(Ordering::SeqCst);
+        assert!(after_wipe >= 1);
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert_eq!(writes.load(Ordering::SeqCst), after_wipe);
+        assert!(bridge.is_drained());
+    }
+
+    #[tokio::test]
+    async fn a_stopped_bridge_is_drained_only_once_its_work_is_released() {
+        let (bridge, shutdown) = bridge_with(|shutdown| {
+            vec![(
+                Service::Gc,
+                spawn_worker(shutdown, async { std::future::pending::<()>().await }),
+            )]
+        });
+        assert!(!bridge.is_drained());
+        let connection = shutdown.hold().unwrap();
+        bridge.stop(StopReason::UserRequested);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!bridge.is_drained());
+        drop(connection);
+        assert!(bridge.is_drained());
+    }
+
+    #[tokio::test]
+    async fn a_worker_does_not_start_once_connections_are_closed() {
+        let (trigger, shutdown) = crate::shutdown::channel();
+        trigger.close_and_wait().await;
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = ran.clone();
+        spawn_worker(shutdown, async move { seen.store(true, std::sync::atomic::Ordering::SeqCst) })
+            .await
+            .unwrap();
+        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
+    }
+}
