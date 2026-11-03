@@ -43,6 +43,7 @@ pub mod qobject {
         #[qproperty(QString, toast_text, cxx_name = "toastText")]
         #[qproperty(QString, pgp_json, cxx_name = "pgpJson")]
         #[qproperty(QString, contacts_json, cxx_name = "contactsJson")]
+        #[qproperty(QString, gpg_json, cxx_name = "gpgJson")]
         #[qproperty(QString, thread_json, cxx_name = "threadJson")]
         #[qproperty(QString, lists_json, cxx_name = "listsJson")]
         #[qproperty(QString, outbox_json, cxx_name = "outboxJson")]
@@ -152,6 +153,14 @@ pub mod qobject {
         fn delete_contact(self: &Self, uid: &QString);
 
         #[qinvokable]
+        #[cxx_name = "importGpgKey"]
+        fn import_gpg_key(self: &Self);
+
+        #[qinvokable]
+        #[cxx_name = "refreshGpgStatus"]
+        fn refresh_gpg_status(self: Pin<&mut Self>);
+
+        #[qinvokable]
         #[cxx_name = "publishPgp"]
         fn publish_pgp(self: &Self, kind: &QString);
 
@@ -220,6 +229,7 @@ pub(crate) enum Command {
     PgpPublish(String),
     SaveContact { uid: String, vcard: String },
     DeleteContact(String),
+    ImportGpgKey,
     SaveAttachment { id: String, seq: i64 },
 }
 
@@ -244,6 +254,7 @@ pub struct AppControllerRust {
     toast_text: QString,
     pgp_json: QString,
     contacts_json: QString,
+    gpg_json: QString,
     thread_json: QString,
     lists_json: QString,
     outbox_json: QString,
@@ -289,6 +300,7 @@ impl Default for AppControllerRust {
             toast_text: QString::default(),
             pgp_json: "{}".into(),
             contacts_json: "[]".into(),
+            gpg_json: "{}".into(),
             thread_json: "[]".into(),
             lists_json: "[]".into(),
             outbox_json: "[]".into(),
@@ -544,6 +556,26 @@ impl qobject::AppController {
                         let _ = qt.queue(move |mut q| q.as_mut().set_toast_text(message.into()));
                         snapshot_needed = false;
                     }
+                    Command::ImportGpgKey => {
+                        let result = rt.block_on(async {
+                            runtime
+                                .import_pgp_to_gpg_agent()
+                                .await
+                                .map(|status| serde_json::to_string(&status).unwrap_or_default())
+                        });
+                        match result {
+                            Ok(json) => {
+                                let _ = qt.queue(move |mut q| {
+                                    q.as_mut().set_gpg_json(json.into());
+                                    q.as_mut().set_toast_text("Aster key imported into gpg-agent".into());
+                                });
+                            }
+                            Err(err) => {
+                                let _ = qt.queue(move |mut q| q.as_mut().set_toast_text(err.to_string().into()));
+                            }
+                        }
+                        snapshot_needed = false;
+                    }
                     Command::DeleteContact(uid) => {
                         let result = rt.block_on(async {
                             runtime.delete_contact(&uid).await.map_err(|e| e.to_string())
@@ -707,6 +739,18 @@ impl qobject::AppController {
                 attachments: attachments_json.to_string(),
             });
         }
+    }
+
+    pub fn import_gpg_key(self: &Self) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Command::ImportGpgKey);
+        }
+    }
+
+    pub fn refresh_gpg_status(mut self: Pin<&mut Self>) {
+        let status = aster_client_core::pgp_agent::detect();
+        let json = serde_json::to_string(&status).unwrap_or_else(|_| "{}".into());
+        self.as_mut().set_gpg_json(json.into());
     }
 
     pub fn save_attachment(self: &Self, id: &QString, seq: i64) {
@@ -969,11 +1013,13 @@ async fn push_settings_data(
         .await
         .map(|value| serde_json::to_string(&value).unwrap_or_else(|_| "[]".into()))
         .unwrap_or_else(|_| "[]".into());
+    let gpg = serde_json::to_string(&runtime.gpg_status()).unwrap_or_else(|_| "{}".into());
     let _ = qt.queue(move |mut q| {
         q.as_mut().set_rules_json(rules.into());
         q.as_mut().set_identities_json(identities.into());
         q.as_mut().set_pgp_json(pgp.into());
         q.as_mut().set_contacts_json(contacts.into());
+        q.as_mut().set_gpg_json(gpg.into());
     });
 }
 
@@ -1257,6 +1303,15 @@ async fn handle_rpc(
             )
             .map_err(|e| e.to_string())?)
         }
+        "gpg_status" => Ok(serde_json::to_value(runtime.gpg_status())
+            .map_err(|e| e.to_string())?),
+        "gpg_import_key" => Ok(serde_json::to_value(
+            runtime
+                .import_pgp_to_gpg_agent()
+                .await
+                .map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?),
         "pgp_key_info" => Ok(runtime.pgp_key().await.map_err(|e| e.to_string())?),
         "pgp_status" => {
             let wkd = runtime.wkd_status().await.unwrap_or_else(|_| serde_json::json!({}));

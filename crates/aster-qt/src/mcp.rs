@@ -183,6 +183,8 @@ fn tools() -> Value {
         { "name": "mailing_lists_list", "description": "List mailing lists discovered from List-Id headers.", "inputSchema": { "type": "object", "properties": {} } },
         { "name": "drafts_list", "description": "List drafts.", "inputSchema": { "type": "object", "properties": { "limit": { "type": "number" } } } },
         { "name": "mail_send", "description": "Send a Markdown message. Requires Send from MCP to be enabled in Settings.", "inputSchema": { "type": "object", "properties": { "to": { "type": "string" }, "cc": { "type": "string" }, "bcc": { "type": "string" }, "subject": { "type": "string" }, "markdown": { "type": "string" } }, "required": ["to", "subject", "markdown"] } },
+        { "name": "gpg_status", "description": "Report system gpg and gpg-agent status plus secret key fingerprints.", "inputSchema": { "type": "object", "properties": {} } },
+        { "name": "gpg_import_key", "description": "Import the Aster PGP key into the system gpg-agent. No export file is written.", "inputSchema": { "type": "object", "properties": {} } },
         { "name": "pgp_key_info", "description": "Return the account PGP key metadata and public key.", "inputSchema": { "type": "object", "properties": {} } },
         { "name": "pgp_status", "description": "Return WKD and keyserver publication status.", "inputSchema": { "type": "object", "properties": {} } },
         { "name": "pgp_publish", "description": "Publish the PGP key to WKD or a keyserver.", "inputSchema": { "type": "object", "properties": { "kind": { "type": "string" }, "addresses": { "type": "array", "items": { "type": "string" } } }, "required": ["kind"] } }

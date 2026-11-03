@@ -21,10 +21,11 @@
 - MCP send is disabled unless enabled in Settings.
 - Permanent delete always opens a UI dialog and requires typing `delete`.
 - Attachment saves use sanitized filenames under Downloads.
+- The Aster PGP key can be imported into the user's existing gpg-agent through a 0600 temp file. No passphrase is passed on a command line and no export file is created.
 
 ## Known gaps
 
-- Private PGP key export is not exposed in the app or MCP yet. It requires password and TOTP re-authentication. The preferred design is to keep private key operations in the system gpg-agent and never export the key at all.
+- Private PGP key export is not exposed in the app or MCP yet. It requires password and TOTP re-authentication. The implemented safer path is gpg-agent import, which keeps private key operations in gpg-agent and never writes an export file.
 - MCP tokens are not rotated while the app runs. They rotate on restart.
 - Audit logs are local and not signed.
 - No independent security audit has been performed.

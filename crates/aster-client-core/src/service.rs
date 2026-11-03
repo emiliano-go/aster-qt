@@ -398,6 +398,22 @@ impl ClientRuntime {
         Ok(())
     }
 
+    pub fn gpg_status(&self) -> crate::pgp_agent::GpgStatus {
+        crate::pgp_agent::detect()
+    }
+
+    pub async fn import_pgp_to_gpg_agent(&self) -> ClientResult<crate::pgp_agent::GpgStatus> {
+        let key = self
+            .session()
+            .read()
+            .await
+            .identity_key
+            .clone()
+            .ok_or_else(|| ClientError::Session("PGP key is not unlocked".into()))?;
+        crate::pgp_agent::import_secret_key(&key)
+            .map_err(|err| ClientError::Protocol(format!("gpg-agent import failed: {err}")))
+    }
+
     pub async fn pgp_key(&self) -> ClientResult<serde_json::Value> {
         let token = self.access_token().await;
         self.client()

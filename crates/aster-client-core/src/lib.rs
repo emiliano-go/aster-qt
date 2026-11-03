@@ -5,6 +5,7 @@ pub mod error;
 pub mod rules;
 pub mod runtime;
 pub mod service;
+pub mod pgp_agent;
 pub mod settings;
 
 pub use config::ClientConfig;

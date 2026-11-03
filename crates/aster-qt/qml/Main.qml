@@ -158,6 +158,7 @@ ApplicationWindow {
     readonly property var rules: rulesData.rules || []
     readonly property var identities: parse(app.identitiesJson, [])
     readonly property var pgp: parse(app.pgpJson, ({}))
+    readonly property var gpg: parse(app.gpgJson, ({}))
     readonly property var contacts: parse(app.contactsJson, [])
     readonly property var threadMessages: parse(app.threadJson, [])
     readonly property var mailingLists: parse(app.listsJson, [])
@@ -2472,6 +2473,30 @@ ApplicationWindow {
                                                 LinkText { text: "Publish WKD"; action: function() { app.publishPgp("wkd") } }
                                                 LinkText { text: "Unpublish WKD"; action: function() { app.publishPgp("wkd-off") } }
                                                 LinkText { text: "Publish keyserver"; action: function() { app.publishPgp("keyserver") } }
+                                                Item { Layout.fillWidth: true }
+                                            }
+                                        }
+                                    }
+                                    Rectangle {
+                                        Layout.fillWidth: true
+                                        implicitHeight: gpgCol.implicitHeight + n("space-3", 12) * 2
+                                        radius: n("radius-control", 8)
+                                        color: c("card", "#23262c")
+                                        border.width: n("border-width", 1)
+                                        border.color: c("border", "#171b1e23")
+                                        ColumnLayout {
+                                            id: gpgCol
+                                            anchors.fill: parent
+                                            anchors.margins: n("space-3", 12)
+                                            spacing: 3
+                                            Text { text: "System GnuPG agent"; color: c("text", "#ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-small", 12); font.weight: n("font-weight-semibold", 600) }
+                                            Text { text: root.gpg.installed ? (root.gpg.version || "gpg detected") : "gpg not detected"; color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-micro", 9); wrapMode: Text.WordWrap; Layout.fillWidth: true }
+                                            Text { visible: root.gpg.agent_socket; text: root.gpg.agent_socket || ""; color: c("muted", "#a8ece7de"); font.family: c("font-mono", "JetBrains Mono"); font.pixelSize: n("font-size-micro", 9); elide: Text.ElideMiddle; Layout.fillWidth: true }
+                                            Text { text: (root.gpg.secret_keys ? root.gpg.secret_keys.length : 0) + " secret keys in gpg-agent"; color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-micro", 9) }
+                                            RowLayout {
+                                                Layout.fillWidth: true
+                                                LinkText { text: "Import Aster key"; action: function() { app.importGpgKey() } }
+                                                LinkText { text: "Refresh"; action: function() { app.refreshGpgStatus() } }
                                                 Item { Layout.fillWidth: true }
                                             }
                                         }
