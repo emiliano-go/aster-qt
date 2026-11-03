@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 use aster_bridge_core::db::CachedMessage;
+use mail_builder::headers::address::Address;
+use mail_builder::MessageBuilder;
 use serde::Serialize;
 
 use crate::error::{ClientError, ClientResult};
@@ -184,6 +186,115 @@ impl ClientRuntime {
             .find(|a| a.seq == seq)
             .map(|a| a.data)
             .ok_or_else(|| ClientError::Protocol(format!("attachment {}:{} not found", id, seq)))
+    }
+
+    pub async fn send_markdown(
+        &self,
+        from: Option<&str>,
+        to: &[String],
+        cc: &[String],
+        bcc: &[String],
+        subject: &str,
+        markdown: &str,
+    ) -> ClientResult<i64> {
+        if to.is_empty() && cc.is_empty() && bcc.is_empty() {
+            return Err(ClientError::Protocol("add at least one recipient".into()));
+        }
+        let from = match from {
+            Some(value) if !value.trim().is_empty() => value.to_string(),
+            _ => self.session().read().await.default_sender_address(),
+        };
+        let (plain, html) = crate::compose::markdown_to_email(markdown);
+        let mut builder = MessageBuilder::new();
+        builder = builder.from(Address::new_address(None::<String>, from.clone()));
+        builder = builder.subject(subject.to_string());
+        if !to.is_empty() {
+            builder = builder.to(Address::new_list(
+                to.iter()
+                    .map(|email| Address::new_address(None::<String>, email.clone()))
+                    .collect(),
+            ));
+        }
+        if !cc.is_empty() {
+            builder = builder.cc(Address::new_list(
+                cc.iter()
+                    .map(|email| Address::new_address(None::<String>, email.clone()))
+                    .collect(),
+            ));
+        }
+        if !bcc.is_empty() {
+            builder = builder.bcc(Address::new_list(
+                bcc.iter()
+                    .map(|email| Address::new_address(None::<String>, email.clone()))
+                    .collect(),
+            ));
+        }
+        builder = builder.text_body(plain).html_body(html);
+        let raw = builder
+            .write_to_vec()
+            .map_err(|e| ClientError::Protocol(format!("build message: {e}")))?;
+        let envelope_to = to
+            .iter()
+            .chain(cc.iter())
+            .chain(bcc.iter())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(",");
+        let id = self
+            .db()
+            .outbox_insert(&raw, &from, &envelope_to)
+            .map_err(ClientError::Storage)?;
+        self.outbox_tx
+            .send(id)
+            .await
+            .map_err(|_| ClientError::Session("outbox worker is not running".into()))?;
+        Ok(id)
+    }
+
+    pub async fn move_messages(&self, ids: &[String], folder_token: &str) -> ClientResult<()> {
+        let token = self.access_token().await;
+        self.client()
+            .move_to_folder(&token, ids, folder_token)
+            .await
+            .map_err(ClientError::from_bridge)
+    }
+
+    pub async fn set_read(&self, ids: &[String], read: bool) -> ClientResult<()> {
+        let token = self.access_token().await;
+        for id in ids {
+            self.client()
+                .set_read_status(&token, id, read)
+                .await
+                .map_err(ClientError::from_bridge)?;
+        }
+        Ok(())
+    }
+
+    pub async fn set_starred(&self, ids: &[String], starred: bool) -> ClientResult<()> {
+        let token = self.access_token().await;
+        for id in ids {
+            self.client()
+                .set_mailbox_flags(&token, id, serde_json::json!({ "is_starred": starred }))
+                .await
+                .map_err(ClientError::from_bridge)?;
+        }
+        Ok(())
+    }
+
+    pub async fn trash_messages(&self, ids: &[String]) -> ClientResult<()> {
+        self.move_messages(ids, "trash").await
+    }
+
+    pub async fn delete_messages_permanent(&self, ids: &[String]) -> ClientResult<()> {
+        let token = self.access_token().await;
+        for id in ids {
+            self.client()
+                .delete_mail_item_permanent(&token, id)
+                .await
+                .map_err(ClientError::from_bridge)?;
+            let _ = self.db().delete_message_by_aster_id(id);
+        }
+        Ok(())
     }
 
     pub async fn send_identities(&self) -> Vec<SendIdentityView> {
@@ -445,11 +556,12 @@ fn safe_body_html(body: &str, is_html: bool) -> String {
             "cellspacing", "bgcolor", "color", "face", "size",
         ])
         .add_url_schemes(&["http", "https", "mailto", "cid"]);
-    let cleaned = builder.clean(body).to_string();
+    let inlined = css_inline::inline(body).unwrap_or_else(|_| body.to_string());
+    let cleaned = builder.clean(&inlined).to_string();
     format!(
         "<style>\
          html,body{{margin:0;padding:0;background:transparent;}}\
-         body{{font-family:Inter,system-ui,sans-serif;font-size:15px;line-height:1.5;color:#1c1b19;word-break:break-word;}}\
+         body{{font-family:Inter,system-ui,sans-serif;font-size:15px;line-height:1.5;color:#1c1b19;word-break:break-word;padding:16px;}}\
          img{{max-width:100%;height:auto;}}\
          img[src^=\"http\"]{{display:none !important;}}\
          a{{color:#0b5fff;}}\

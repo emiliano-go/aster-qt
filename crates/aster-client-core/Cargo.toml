@@ -12,6 +12,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 zeroize = { workspace = true }
 ammonia = "4"
+css-inline = { version = "0.23", default-features = false }
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+mail-builder = "2"
 tracing = { workspace = true }
 thiserror = "2"
 anyhow = "1"

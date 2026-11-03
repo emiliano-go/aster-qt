@@ -3,6 +3,7 @@ members = [
     "crates/aster-client-core",
     "crates/aster-theme",
     "crates/aster-qt",
+    "crates/aster-mcp",
     "vendor/Aster-Bridge/src-tauri/crates/aster_bridge_core",
 ]
 resolver = "2"

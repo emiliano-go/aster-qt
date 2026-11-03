@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 mod bridge;
+mod mcp;
 mod theme_bridge;
 
 use cxx_qt_lib::{QGuiApplication, QQmlApplicationEngine, QUrl};

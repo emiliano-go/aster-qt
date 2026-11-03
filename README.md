@@ -127,6 +127,21 @@ Theme contrast checks use Playwright against the CSS tokens:
 NODE_PATH=<path to playwright node_modules> node scripts/check-theme-contrast.cjs
 ```
 
+## MCP
+
+Aster Qt hosts a dedicated MCP endpoint on 127.0.0.1 while the app is running. The endpoint details and a 0600 token file are written to `<data>/mcp.json`. Nothing is exposed on the network.
+
+Build and run the stdio bridge:
+
+```bash
+cargo build -p aster-mcp
+aster-mcp
+```
+
+The bridge reads `mcp.json` and proxies MCP JSON-RPC to the running app. Tools cover status, mailboxes, aliases, mail listing, search, reading, moving, read state, stars, trash, rules, mailbox creation, alias routing, and sync.
+
+Permanent delete is intentionally gated. The MCP tool opens a confirmation dialog in the Aster Qt window, and deletion only proceeds after the user types `delete` and confirms. If the app is not running, MCP is unavailable.
+
 ## Security
 
 - Mail is decrypted locally by the bridge core and stored in a SQLCipher database.

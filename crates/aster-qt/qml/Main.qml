@@ -68,6 +68,10 @@ ApplicationWindow {
     property string settingsTab: "appearance"
     property bool readerOpen: true
     property bool toastVisible: false
+    property bool deleteConfirmOpen: false
+    property string pendingDeleteToken: ""
+    property string pendingDeleteIds: "[]"
+    property string deleteConfirmWord: ""
     property bool narrow: width < 1160
     property bool sidebarVisible: width >= 860
     readonly property bool systemDark: Application.styleHints.colorScheme === Qt.Dark
@@ -193,7 +197,17 @@ ApplicationWindow {
     Shortcut { sequence: "j"; onActivated: root.move(1) }
     Shortcut { sequence: "k"; onActivated: root.move(-1) }
     Shortcut { sequences: ["Ctrl+N", "c"]; onActivated: root.composeOpen = true }
-    Shortcut { sequence: "Escape"; onActivated: root.composeOpen = false }
+    Shortcut {
+        sequence: "Escape"
+        onActivated: {
+            if (root.deleteConfirmOpen) {
+                app.resolveDelete(root.pendingDeleteToken, false);
+                root.deleteConfirmOpen = false;
+            } else {
+                root.composeOpen = false;
+            }
+        }
+    }
     Shortcut { sequence: "/"; onActivated: searchInput.forceActiveFocus() }
     Shortcut { sequence: "Ctrl+,"; onActivated: root.openSettings("appearance") }
 
@@ -1215,6 +1229,12 @@ ApplicationWindow {
             root.toastVisible = app.toastText.length > 0;
             toastTimer.restart();
         }
+        function onConfirmDelete(token, ids) {
+            root.pendingDeleteToken = token;
+            root.pendingDeleteIds = ids;
+            root.deleteConfirmWord = "";
+            root.deleteConfirmOpen = true;
+        }
     }
 
     Timer {
@@ -1692,11 +1712,88 @@ ApplicationWindow {
     Rectangle {
         anchors.fill: parent
         color: c("overlay", "#8c000000")
+        visible: root.deleteConfirmOpen
+        MouseArea { anchors.fill: parent }
+        Rectangle {
+            width: 420
+            height: 210
+            anchors.centerIn: parent
+            radius: n("radius-panel", 16)
+            color: c("surface", "#1b1e23")
+            border.width: n("border-width", 1)
+            border.color: c("border-strong", "#292e323a")
+            ColumnLayout {
+                anchors.fill: parent
+                anchors.margins: n("space-5", 24)
+                spacing: n("space-3", 12)
+                Text {
+                    text: "Permanently delete mail?"
+                    color: c("text", "#ece7de")
+                    font.family: c("font-family", "Inter")
+                    font.pixelSize: n("font-size-title", 16)
+                    font.weight: n("font-weight-semibold", 600)
+                }
+                Text {
+                    text: "An MCP agent requested permanent deletion of " + JSON.parse(root.pendingDeleteIds || "[]").length + " message(s). This cannot be undone."
+                    color: c("text-2", "#dbebe7de")
+                    font.family: c("font-family", "Inter")
+                    font.pixelSize: n("font-size-small", 12)
+                    wrapMode: Text.WordWrap
+                    Layout.fillWidth: true
+                }
+                SettingsField {
+                    id: deleteWord
+                    Layout.fillWidth: true
+                    placeholder: 'Type delete to confirm'
+                    onEdited: function(value) { root.deleteConfirmWord = value }
+                }
+                Item { Layout.fillHeight: true }
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: n("space-2", 8)
+                    Item { Layout.fillWidth: true }
+                    Rectangle {
+                        implicitWidth: 80
+                        implicitHeight: n("control-height", 36)
+                        radius: n("radius-control", 8)
+                        color: cancelHover.hovered ? c("hover", "#2e2e323a") : "transparent"
+                        HoverHandler { id: cancelHover }
+                        Text { anchors.centerIn: parent; text: "Cancel"; color: c("text-2", "#dbebe7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-small", 12) }
+                        MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: { app.resolveDelete(root.pendingDeleteToken, false); root.deleteConfirmOpen = false; } }
+                    }
+                    Rectangle {
+                        implicitWidth: 96
+                        implicitHeight: n("control-height", 36)
+                        radius: n("radius-control", 8)
+                        color: root.deleteConfirmWord.toLowerCase() === "delete"
+                               ? (deleteHover.hovered ? Qt.lighter(c("danger", "#d97a72"), 1.08) : c("danger", "#d97a72"))
+                               : c("surface-strong", "#2e323a")
+                        opacity: root.deleteConfirmWord.toLowerCase() === "delete" ? 1.0 : 0.5
+                        HoverHandler { id: deleteHover }
+                        Text { anchors.centerIn: parent; text: "Delete"; color: root.deleteConfirmWord.toLowerCase() === "delete" ? c("accent-ink", "#171717") : c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-small", 12); font.weight: n("font-weight-semibold", 600) }
+                        MouseArea {
+                            anchors.fill: parent
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: {
+                                if (root.deleteConfirmWord.toLowerCase() !== "delete") return;
+                                app.resolveDelete(root.pendingDeleteToken, true);
+                                root.deleteConfirmOpen = false;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Rectangle {
+        anchors.fill: parent
+        color: c("overlay", "#8c000000")
         visible: root.composeOpen
         MouseArea { anchors.fill: parent; onClicked: root.composeOpen = false }
         Rectangle {
-            width: Math.min(root.width - 80, 720)
-            height: Math.min(root.height - 80, 600)
+            width: Math.min(root.width - 80, 760)
+            height: Math.min(root.height - 80, 640)
             anchors.centerIn: parent
             radius: n("radius-panel", 16)
             color: c("surface", "#1b1e23")
@@ -1717,60 +1814,49 @@ ApplicationWindow {
                         font.weight: n("font-weight-semibold", 600)
                         Layout.fillWidth: true
                     }
-                    IconButton { icon: "close"; label: "Close"; onClicked: root.composeOpen = false }
-                }
-                Repeater {
-                    model: [{ label: "To", value: "" }, { label: "Subject", value: "" }]
-                    delegate: Rectangle {
-                        Layout.fillWidth: true
-                        Layout.preferredHeight: n("control-height", 36)
-                        radius: n("radius-control", 8)
-                        color: c("input", "#221b1e23")
-                        border.width: n("border-width", 1)
-                        border.color: c("border", "#171b1e23")
-                        RowLayout {
-                            anchors.fill: parent
-                            anchors.leftMargin: n("space-3", 12)
-                            anchors.rightMargin: n("space-3", 12)
-                            spacing: n("space-2", 8)
-                            Text {
-                                text: modelData.label
-                                color: c("muted", "#a8ece7de")
-                                font.family: c("font-family", "Inter")
-                                font.pixelSize: n("font-size-small", 12)
-                                Layout.preferredWidth: 48
-                            }
-                            TextInput {
-                                Layout.fillWidth: true
-                                color: c("text", "#ece7de")
-                                selectionColor: c("accent", "#d98e5c")
-                                selectedTextColor: c("accent-ink", "#171717")
-                                font.family: c("font-family", "Inter")
-                                font.pixelSize: n("font-size-small", 12)
-                                verticalAlignment: TextInput.AlignVCenter
-                            }
-                        }
+                    Text {
+                        text: "Markdown"
+                        color: c("accent-text", "#e7a97f")
+                        font.family: c("font-mono", "JetBrains Mono")
+                        font.pixelSize: n("font-size-micro", 9)
                     }
+                    IconButton { icon: "close"; label: "Close composer"; onClicked: root.composeOpen = false }
+                }
+                SettingsField { id: composeTo; Layout.fillWidth: true; placeholder: "To, comma separated" }
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: n("space-2", 8)
+                    SettingsField { id: composeCc; Layout.fillWidth: true; placeholder: "Cc" }
+                    SettingsField { id: composeBcc; Layout.fillWidth: true; placeholder: "Bcc" }
+                }
+                SettingsField { id: composeSubject; Layout.fillWidth: true; placeholder: "Subject" }
+                Text {
+                    text: "BODY · MARKDOWN"
+                    color: c("muted", "#a8ece7de")
+                    font.family: c("font-family", "Inter")
+                    font.pixelSize: n("font-size-micro", 9)
+                    font.letterSpacing: 1
                 }
                 Rectangle {
                     Layout.fillWidth: true
                     Layout.fillHeight: true
                     radius: n("radius-control", 8)
                     color: c("input", "#221b1e23")
-                    border.width: n("border-width", 1)
-                    border.color: c("border", "#171b1e23")
+                    border.width: composeBody.activeFocus ? n("border-width-focus", 1.5) : n("border-width", 1)
+                    border.color: composeBody.activeFocus ? c("accent", "#d98e5c") : c("border", "#171b1e23")
                     TextArea {
+                        id: composeBody
                         anchors.fill: parent
                         anchors.margins: n("space-3", 12)
                         color: c("text", "#ece7de")
-                        placeholderText: "Write a message..."
+                        placeholderText: "# Hello\n\nWrite in Markdown. Bold, lists, links, quotes and code blocks are converted to email HTML and plain text."
                         placeholderTextColor: c("muted", "#a8ece7de")
                         selectionColor: c("accent", "#d98e5c")
                         selectedTextColor: c("accent-ink", "#171717")
                         wrapMode: TextArea.Wrap
                         background: null
-                        font.family: c("font-mail", "Inter")
-                        font.pixelSize: n("font-size-body", 14)
+                        font.family: c("font-mono", "JetBrains Mono")
+                        font.pixelSize: n("font-size-small", 12)
                     }
                 }
                 RowLayout {
@@ -1779,17 +1865,17 @@ ApplicationWindow {
                     IconButton { icon: "attach"; label: "Attach" }
                     Item { Layout.fillWidth: true }
                     Text {
-                        text: "Sending is wired in the next milestone"
+                        text: "Markdown is converted to HTML and plain text before sending."
                         color: c("muted", "#a8ece7de")
                         font.family: c("font-family", "Inter")
                         font.pixelSize: n("font-size-micro", 9)
                     }
                     Rectangle {
-                        implicitWidth: 88
+                        implicitWidth: 96
                         implicitHeight: n("control-height", 36)
                         radius: n("radius-control", 8)
-                        color: c("accent-button", "#d98e5c")
-                        opacity: 0.45
+                        color: sendHover.hovered ? Qt.lighter(c("accent-button", "#d98e5c"), 1.06) : c("accent-button", "#d98e5c")
+                        HoverHandler { id: sendHover }
                         Text {
                             anchors.centerIn: parent
                             text: "Send"
@@ -1797,6 +1883,14 @@ ApplicationWindow {
                             font.family: c("font-family", "Inter")
                             font.pixelSize: n("font-size-small", 12)
                             font.weight: n("font-weight-semibold", 600)
+                        }
+                        MouseArea {
+                            anchors.fill: parent
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: {
+                                app.sendMessage(composeTo.text, composeCc.text, composeBcc.text, composeSubject.text, composeBody.text);
+                                root.composeOpen = false;
+                            }
                         }
                     }
                 }

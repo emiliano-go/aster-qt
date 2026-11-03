@@ -2,6 +2,7 @@
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use aster_client_core::settings as app_settings;
@@ -48,6 +49,14 @@ pub mod qobject {
         #[qinvokable]
         fn boot(self: Pin<&mut Self>);
 
+        #[qsignal]
+        #[cxx_name = "confirmDelete"]
+        fn confirm_delete(self: Pin<&mut Self>, token: QString, ids: QString);
+
+        #[qinvokable]
+        #[cxx_name = "resolveDelete"]
+        fn resolve_delete(self: &Self, token: &QString, approved: bool);
+
         #[qinvokable]
         #[cxx_name = "refreshMail"]
         fn refresh_mail(self: &Self);
@@ -85,6 +94,17 @@ pub mod qobject {
         fn create_mailbox(self: &Self, name: &QString);
 
         #[qinvokable]
+        #[cxx_name = "sendMessage"]
+        fn send_message(
+            self: &Self,
+            to: &QString,
+            cc: &QString,
+            bcc: &QString,
+            subject: &QString,
+            markdown: &QString,
+        );
+
+        #[qinvokable]
         #[cxx_name = "applySettings"]
         fn apply_settings(self: Pin<&mut Self>, patch: &QString);
 
@@ -116,7 +136,7 @@ pub mod qobject {
     impl cxx_qt::Threading for AppController {}
 }
 
-enum Command {
+pub(crate) enum Command {
     Refresh,
     OpenMailbox(String),
     Select(String),
@@ -126,6 +146,18 @@ enum Command {
     RunRule(String),
     RouteAlias(String, String),
     CreateMailbox(String),
+    SendMessage {
+        to: String,
+        cc: String,
+        bcc: String,
+        subject: String,
+        markdown: String,
+    },
+    Rpc {
+        tool: String,
+        args: serde_json::Value,
+        reply: std::sync::mpsc::Sender<Result<serde_json::Value, String>>,
+    },
 }
 
 pub struct AppControllerRust {
@@ -152,6 +184,7 @@ pub struct AppControllerRust {
     ready: bool,
     started: bool,
     tx: Option<Sender<Command>>,
+    pending_delete: Arc<Mutex<Option<(String, std::sync::mpsc::Sender<bool>)>>>,
 }
 
 impl Default for AppControllerRust {
@@ -191,6 +224,7 @@ impl Default for AppControllerRust {
             ready: false,
             started: false,
             tx: None,
+            pending_delete: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -205,8 +239,11 @@ impl qobject::AppController {
         self.as_mut().set_status_text("Opening your mailbox".into());
 
         let (tx, rx) = mpsc::channel::<Command>();
-        self.as_mut().rust_mut().tx = Some(tx);
+        self.as_mut().rust_mut().tx = Some(tx.clone());
         let qt = self.as_ref().qt_thread();
+        let pending = self.pending_delete.clone();
+        let mcp_dir = PathBuf::from(self.data_dir.to_string());
+        crate::mcp::start(tx.clone(), mcp_dir);
 
         thread::spawn(move || {
             let rt = match tokio::runtime::Builder::new_multi_thread()
@@ -318,6 +355,49 @@ impl qobject::AppController {
                         notify_result(&qt, result, "Mailbox created");
                         rt.block_on(push_settings_data(&runtime, &qt));
                     }
+                    Command::SendMessage {
+                        to,
+                        cc,
+                        bcc,
+                        subject,
+                        markdown,
+                    } => {
+                        let result = rt.block_on(async {
+                            let parse = |value: String| -> Vec<String> {
+                                value
+                                    .split(',')
+                                    .map(str::trim)
+                                    .filter(|part| !part.is_empty())
+                                    .map(str::to_string)
+                                    .collect()
+                            };
+                            runtime
+                                .send_markdown(
+                                    None,
+                                    &parse(to),
+                                    &parse(cc),
+                                    &parse(bcc),
+                                    &subject,
+                                    &markdown,
+                                )
+                                .await
+                                .map(|_| ())
+                                .map_err(|e| e.to_string())
+                        });
+                        notify_result(&qt, result, "Message queued for sending");
+                        snapshot_needed = false;
+                    }
+                    Command::Rpc { tool, args, reply } => {
+                        let result = rt.block_on(handle_rpc(
+                            &runtime,
+                            &pending,
+                            &qt,
+                            &tool,
+                            &args,
+                        ));
+                        let _ = reply.send(result);
+                        snapshot_needed = false;
+                    }
                 }
                 if snapshot_needed {
                     rt.block_on(snapshot(&runtime, &folder, selected.as_deref(), &qt));
@@ -381,6 +461,37 @@ impl qobject::AppController {
     pub fn create_mailbox(self: &Self, name: &QString) {
         if let Some(tx) = &self.tx {
             let _ = tx.send(Command::CreateMailbox(name.to_string()));
+        }
+    }
+
+    pub fn send_message(
+        self: &Self,
+        to: &QString,
+        cc: &QString,
+        bcc: &QString,
+        subject: &QString,
+        markdown: &QString,
+    ) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Command::SendMessage {
+                to: to.to_string(),
+                cc: cc.to_string(),
+                bcc: bcc.to_string(),
+                subject: subject.to_string(),
+                markdown: markdown.to_string(),
+            });
+        }
+    }
+
+    pub fn resolve_delete(self: &Self, token: &QString, approved: bool) {
+        let mut guard = match self.pending_delete.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some((pending_token, tx)) = guard.take() {
+            if pending_token == token.to_string() {
+                let _ = tx.send(approved);
+            }
         }
     }
 
@@ -583,4 +694,189 @@ fn notify_result(
         Err(err) => err,
     };
     let _ = qt.queue(move |mut q| q.as_mut().set_toast_text(message.into()));
+}
+
+async fn handle_rpc(
+    runtime: &ClientRuntime,
+    pending: &Arc<Mutex<Option<(String, std::sync::mpsc::Sender<bool>)>>>,
+    qt: &cxx_qt::CxxQtThread<qobject::AppController>,
+    tool: &str,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let ids = || {
+        args.get("ids")
+            .and_then(|value| value.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_string))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    match tool {
+        "status" => Ok(serde_json::to_value(runtime.status().await).map_err(|e| e.to_string())?),
+        "mailboxes_list" => Ok(serde_json::to_value(
+            runtime.mailboxes().map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?),
+        "identities" => Ok(serde_json::to_value(runtime.send_identities().await)
+            .map_err(|e| e.to_string())?),
+        "mail_list" => {
+            let folder = args
+                .get("folder")
+                .and_then(|value| value.as_str())
+                .unwrap_or("inbox");
+            let limit = args
+                .get("limit")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(50) as usize;
+            Ok(serde_json::to_value(
+                runtime
+                    .messages(folder, limit, 0)
+                    .map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?)
+        }
+        "mail_search" => {
+            let query = args
+                .get("query")
+                .and_then(|value| value.as_str())
+                .ok_or("query is required")?;
+            let limit = args
+                .get("limit")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(50) as usize;
+            Ok(serde_json::to_value(
+                runtime.search(query, limit).map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?)
+        }
+        "mail_get" => {
+            let id = args
+                .get("id")
+                .and_then(|value| value.as_str())
+                .ok_or("id is required")?;
+            Ok(serde_json::to_value(runtime.message(id).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?)
+        }
+        "mail_move" => {
+            let folder = args
+                .get("folder_token")
+                .and_then(|value| value.as_str())
+                .ok_or("folder_token is required")?;
+            runtime
+                .move_messages(&ids(), folder)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({ "ok": true }))
+        }
+        "mail_set_read" => {
+            let read = args
+                .get("read")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(true);
+            runtime
+                .set_read(&ids(), read)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({ "ok": true }))
+        }
+        "mail_star" => {
+            let starred = args
+                .get("starred")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(true);
+            runtime
+                .set_starred(&ids(), starred)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({ "ok": true }))
+        }
+        "mail_trash" => {
+            runtime
+                .trash_messages(&ids())
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({ "ok": true }))
+        }
+        "mail_delete" => {
+            let ids = ids();
+            if ids.is_empty() {
+                return Err("ids is required".into());
+            }
+            let token = uuid::Uuid::new_v4().to_string();
+            let (tx, rx) = std::sync::mpsc::channel();
+            {
+                let mut guard = pending.lock().map_err(|e| e.to_string())?;
+                *guard = Some((token.clone(), tx));
+            }
+            let ids_json = serde_json::to_string(&ids).map_err(|e| e.to_string())?;
+            {
+                let qt = qt.clone();
+                let token = token.clone();
+                let _ = qt.queue(move |mut q| {
+                    q.as_mut().confirm_delete(token.into(), ids_json.into());
+                });
+            }
+            let approved = tokio::task::spawn_blocking(move || {
+                rx.recv_timeout(std::time::Duration::from_secs(120))
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+            if let Ok(mut guard) = pending.lock() {
+                *guard = None;
+            }
+            if !matches!(approved, Ok(true)) {
+                return Err("delete denied by the user".into());
+            }
+            runtime
+                .delete_messages_permanent(&ids)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({ "ok": true }))
+        }
+        "rules_list" => Ok(runtime.rules().await.map_err(|e| e.to_string())?),
+        "rules_create" => {
+            let rule = args.get("rule").cloned().ok_or("rule is required")?;
+            Ok(runtime.create_rule(rule).await.map_err(|e| e.to_string())?)
+        }
+        "rules_delete" => {
+            let id = args
+                .get("id")
+                .and_then(|value| value.as_str())
+                .ok_or("id is required")?;
+            runtime.delete_rule(id).await.map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({ "ok": true }))
+        }
+        "mailbox_create" => {
+            let name = args
+                .get("name")
+                .and_then(|value| value.as_str())
+                .ok_or("name is required")?;
+            Ok(serde_json::json!({
+                "token": runtime.create_mailbox(name).await.map_err(|e| e.to_string())?
+            }))
+        }
+        "alias_route" => {
+            let alias = args
+                .get("alias")
+                .and_then(|value| value.as_str())
+                .ok_or("alias is required")?;
+            let mailbox = args
+                .get("mailbox")
+                .and_then(|value| value.as_str())
+                .ok_or("mailbox is required")?;
+            let (token, rule_id) = runtime
+                .route_alias_to_mailbox(alias, mailbox)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({ "folder_token": token, "rule_id": rule_id }))
+        }
+        "sync_now" => {
+            runtime.sync_now().await.map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({ "ok": true }))
+        }
+        _ => Err(format!("unknown tool: {tool}")),
+    }
 }

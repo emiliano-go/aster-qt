@@ -64,7 +64,7 @@ pub struct ClientRuntime {
     plan_code: String,
     broadcaster: broadcast::Sender<StateChange>,
     sync_tx: mpsc::Sender<SyncTrigger>,
-    outbox_tx: mpsc::Sender<i64>,
+    pub(crate) outbox_tx: mpsc::Sender<i64>,
     workers: Vec<JoinHandle<()>>,
     _lock: File,
 }
