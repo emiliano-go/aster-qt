@@ -1403,13 +1403,14 @@ async fn push_settings_data(
     runtime: &ClientRuntime,
     qt: &cxx_qt::CxxQtThread<qobject::AppController>,
 ) {
+    let identities = serde_json::to_string(&runtime.send_identities().await)
+        .unwrap_or_else(|_| "[]".into());
+    let _ = qt.queue(move |mut q| q.as_mut().set_identities_json(identities.into()));
     let rules = runtime
         .rules()
         .await
         .map(|value| value.to_string())
         .unwrap_or_else(|_| "{}".into());
-    let identities = serde_json::to_string(&runtime.send_identities().await)
-        .unwrap_or_else(|_| "[]".into());
     let pgp = runtime
         .pgp_key()
         .await
@@ -1437,7 +1438,6 @@ async fn push_settings_data(
         .unwrap_or_else(|_| "[]".into());
     let _ = qt.queue(move |mut q| {
         q.as_mut().set_rules_json(rules.into());
-        q.as_mut().set_identities_json(identities.into());
         q.as_mut().set_pgp_json(pgp.into());
         q.as_mut().set_contacts_json(contacts.into());
         q.as_mut().set_gpg_json(gpg.into());

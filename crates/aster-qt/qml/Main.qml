@@ -48,6 +48,7 @@ ApplicationWindow {
         }
         var current = message;
         var depth = 0;
+        var walked = false;
         while (current && depth < 24) {
             var parentId = normId(current.in_reply_to);
             if (!parentId && current.references) {
@@ -57,9 +58,11 @@ ApplicationWindow {
             var parent = parentId ? byId[parentId] : null;
             if (!parent || parent === current) break;
             current = parent;
+            walked = true;
             depth += 1;
         }
-        return (current && current.message_id) ? normId(current.message_id) : (subjectKey(message.subject) || message.id);
+        if (walked && current && current.message_id) return normId(current.message_id);
+        return subjectKey(message.subject) || (current && current.message_id) || message.id;
     }
 
     readonly property var threadSiblings: {
@@ -146,6 +149,8 @@ ApplicationWindow {
     property string categoryFilter: ""
     property bool composeOpen: false
     property bool settingsOpen: false
+    property bool identityOpen: false
+    property bool identityLoading: false
     property string settingsTab: "appearance"
     property bool readerOpen: true
     property bool threadListOpen: false
@@ -370,10 +375,34 @@ ApplicationWindow {
     }
 
     function openSettings(tab) {
+        root.closeIdentityPopup();
+        searchFilterPopup.close();
+        outboxPopup.close();
         root.settingsTab = tab || "appearance";
         root.settingsOpen = true;
         app.loadSettingsData();
         app.refreshThemes();
+    }
+
+    function toggleIdentityPopup() {
+        if (root.identityOpen) {
+            root.closeIdentityPopup();
+            return;
+        }
+        root.identityOpen = true;
+        root.identityLoading = true;
+        identityLoadTimer.restart();
+        searchFilterPopup.close();
+        outboxPopup.close();
+        app.loadSettingsData();
+        identityPanel.forceActiveFocus();
+    }
+
+    function closeIdentityPopup() {
+        if (!root.identityOpen) return;
+        root.identityOpen = false;
+        root.identityLoading = false;
+        accountCard.forceActiveFocus();
     }
 
     function move(delta) {
@@ -410,7 +439,7 @@ ApplicationWindow {
     function useIdentity(address) {
         root.activeIdentity = address;
         root.composeFrom = address;
-        identityPopup.close();
+        root.closeIdentityPopup();
     }
 
     function applySavedSearch(search) {
@@ -466,6 +495,9 @@ ApplicationWindow {
     }
 
     function openCompose() {
+        root.closeIdentityPopup();
+        searchFilterPopup.close();
+        outboxPopup.close();
         root.resetCompose();
         root.composeOpen = true;
     }
@@ -632,8 +664,8 @@ ApplicationWindow {
                 root.composeOpen = false;
             } else if (root.settingsOpen) {
                 root.settingsOpen = false;
-            } else if (identityPopup.opened) {
-                identityPopup.close();
+            } else if (root.identityOpen) {
+                root.closeIdentityPopup();
             } else if (searchFilterPopup.opened) {
                 searchFilterPopup.close();
             } else if (outboxPopup.opened) {
@@ -663,6 +695,13 @@ ApplicationWindow {
         app.boot();
     }
 
+    Connections {
+        target: app
+        function onReadyChanged() {
+            if (app.ready) app.loadSettingsData();
+        }
+    }
+
 
     Timer {
         interval: 8000
@@ -676,6 +715,13 @@ ApplicationWindow {
         property string label
         property bool active: false
         signal clicked()
+        activeFocusOnTab: true
+        Accessible.role: Accessible.Button
+        Accessible.name: label
+        Accessible.id: "chip-" + label.toLowerCase().replace(/[^a-z0-9]+/g, "-")
+        Accessible.onPressAction: clicked()
+        Keys.onSpacePressed: clicked()
+        Keys.onReturnPressed: clicked()
         implicitWidth: chipText.implicitWidth + n("space-3", 12) * 2
         implicitHeight: 28
         radius: n("radius-control", 2)
@@ -705,6 +751,18 @@ ApplicationWindow {
         property bool active: false
         implicitHeight: 30
         radius: n("radius-control", 2)
+        activeFocusOnTab: true
+        Accessible.role: Accessible.Button
+        Accessible.name: entry && entry.name ? entry.name : "Theme"
+        Accessible.id: "theme-" + (entry && entry.id ? entry.id : "unknown")
+        Accessible.selected: active
+        Accessible.onPressAction: themeRow.activate()
+        Keys.onSpacePressed: themeRow.activate()
+        Keys.onReturnPressed: themeRow.activate()
+        function activate() {
+            if (!themeRow.entry) return;
+            app.setThemeSlot(themeRow.entry.id, themeRow.entry.light ? "light" : "dark");
+        }
         color: active ? c("selected", "#3d2e323a") : (themeHover.hovered ? c("hover", "#2e2e323a") : "transparent")
         HoverHandler { id: themeHover }
         RowLayout {
@@ -736,21 +794,27 @@ ApplicationWindow {
         MouseArea {
             anchors.fill: parent
             cursorShape: Qt.PointingHandCursor
-            onClicked: {
-                if (!themeRow.entry) return;
-                app.setThemeSlot(themeRow.entry.id, themeRow.entry.light ? "light" : "dark");
-                themePopup.close();
-            }
+            onClicked: themeRow.activate()
         }
     }
 
 
     component Toggle: Rectangle {
         property bool checked: false
+        property string testId: ""
         signal toggled()
         implicitWidth: 40
         implicitHeight: 22
         radius: n("radius-control", 2)
+        activeFocusOnTab: true
+        Accessible.role: Accessible.Switch
+        Accessible.name: testId.length > 0 ? testId : "Toggle"
+        Accessible.id: testId
+        Accessible.checkable: true
+        Accessible.checked: checked
+        Accessible.onPressAction: toggled()
+        Keys.onSpacePressed: toggled()
+        Keys.onReturnPressed: toggled()
         color: checked ? c("accent-button", "#d98e5c") : c("surface-strong", "#2e323a")
         border.width: checked ? 0 : n("border-width", 1)
         border.color: c("border-strong", "#292e323a")
@@ -770,6 +834,7 @@ ApplicationWindow {
         id: fieldRoot
         property alias text: field.text
         property string placeholder: ""
+        property string testId: ""
         signal edited(string value)
         implicitHeight: n("control-height", 36)
         radius: n("radius-control", 2)
@@ -784,6 +849,11 @@ ApplicationWindow {
             topPadding: 0
             bottomPadding: 0
             verticalAlignment: TextInput.AlignVCenter
+            Accessible.role: Accessible.EditableText
+            Accessible.name: fieldRoot.placeholder
+            Accessible.editable: true
+            Accessible.focusable: true
+            Accessible.id: fieldRoot.testId
             color: c("text", "#ece7de")
             selectionColor: c("accent", "#d98e5c")
             selectedTextColor: c("accent-ink", "#171717")
@@ -814,6 +884,8 @@ ApplicationWindow {
         activeFocusOnTab: true
         Accessible.role: Accessible.Button
         Accessible.name: label
+        Accessible.id: "settings-tab-" + tab
+        Accessible.selected: active
         Accessible.onPressAction: root.settingsTab = tab
         Keys.onSpacePressed: root.settingsTab = tab
         Keys.onReturnPressed: root.settingsTab = tab
@@ -857,6 +929,14 @@ ApplicationWindow {
 
     component LinkText: Text {
         property var action: null
+        activeFocusOnTab: true
+        Accessible.role: Accessible.Link
+        Accessible.name: text
+        Accessible.id: "link-" + text.toLowerCase().replace(/[^a-z0-9]+/g, "-")
+        Accessible.onPressAction: if (action) action()
+        Keys.onSpacePressed: if (action) action()
+        Keys.onReturnPressed: if (action) action()
+        Keys.onEnterPressed: if (action) action()
         color: c("accent-text", "#e7a97f")
         font.family: c("font-family", "Inter")
         font.pixelSize: n("font-size-small", 12)
@@ -869,6 +949,19 @@ ApplicationWindow {
         property bool active: app.folderId === folder.folder_label
         implicitHeight: 32
         radius: n("radius-control", 2)
+        activeFocusOnTab: true
+        Accessible.role: Accessible.Button
+        Accessible.name: root.folderLabel(folderRow.folder.name || folderRow.folder.folder_label)
+        Accessible.id: "folder-" + folderRow.folder.folder_label
+        Accessible.selected: active
+        Accessible.onPressAction: folderRow.activate()
+        Keys.onSpacePressed: folderRow.activate()
+        Keys.onReturnPressed: folderRow.activate()
+        function activate() {
+            root.currentIndex = 0;
+            root.listFilter = "";
+            app.openMailbox(folderRow.folder.folder_label);
+        }
         color: active ? c("selected", "#3d2e323a") : (folderHover.hovered ? c("hover", "#2e2e323a") : "transparent")
         Behavior on color { ColorAnimation { duration: n("motion-fast", 110) } }
         HoverHandler { id: folderHover }
@@ -907,11 +1000,7 @@ ApplicationWindow {
         MouseArea {
             anchors.fill: parent
             cursorShape: Qt.PointingHandCursor
-            onClicked: {
-                root.currentIndex = 0;
-                root.listFilter = "";
-                app.openMailbox(folderRow.folder.folder_label)
-            }
+            onClicked: folderRow.activate()
         }
     }
 
@@ -932,6 +1021,8 @@ ApplicationWindow {
         activeFocusOnTab: true
         Accessible.role: Accessible.Button
         Accessible.name: label
+        Accessible.id: label
+        Accessible.onPressAction: iconButton.clicked()
         HoverHandler { id: iconHover }
         Icon {
             anchors.centerIn: parent
@@ -986,6 +1077,7 @@ ApplicationWindow {
         activeFocusOnTab: true
         Accessible.role: Accessible.CheckBox
         Accessible.name: box.label
+        Accessible.id: "select-" + box.label.toLowerCase().replace(/[^a-z0-9]+/g, "-")
         Accessible.checkable: true
         Accessible.checked: box.checked
         Accessible.onPressAction: box.toggled()
@@ -1011,6 +1103,22 @@ ApplicationWindow {
         property var item
         property bool selected: item && root.detail.id === item.id
         implicitHeight: 88
+        Accessible.role: Accessible.ListItem
+        Accessible.name: item ? ((item.sender || "Unknown sender") + ". " + (item.subject || item.preview || "")) : ""
+        Accessible.id: "message-" + (item && item.id ? item.id : "")
+        Accessible.selected: selected
+        Accessible.onPressAction: row.activate()
+        function activate() {
+            if (!row.item) return;
+            if (root.selectionMode) {
+                root.toggleSelected(row.item.id);
+                return;
+            }
+            root.currentIndex = index;
+            root.readerOpen = true;
+            root.threadListOpen = false;
+            app.selectMessage(row.item.id);
+        }
         color: selected ? c("surface-strong", "#2e323a") : (rowHover.hovered ? c("hover", "#2e2e323a") : "transparent")
         Behavior on color { ColorAnimation { duration: n("motion-fast", 110) } }
         HoverHandler { id: rowHover }
@@ -1119,16 +1227,7 @@ ApplicationWindow {
         MouseArea {
             anchors.fill: parent
             cursorShape: Qt.PointingHandCursor
-            onClicked: {
-                if (root.selectionMode) {
-                    root.toggleSelected(row.item.id);
-                    return;
-                }
-                root.currentIndex = index;
-                root.readerOpen = true;
-                root.threadListOpen = false;
-                app.selectMessage(row.item.id)
-            }
+            onClicked: row.activate()
         }
     }
 
@@ -1145,7 +1244,12 @@ ApplicationWindow {
         Behavior on color { ColorAnimation { duration: n("motion-fast", 110) } }
         Accessible.role: Accessible.ListItem
         Accessible.name: (item ? (item.sender || "Unknown sender") + ". " + (item.subject || item.preview || "") : "")
+        Accessible.id: "thread-message-" + (item && item.id ? item.id : "")
         Accessible.selected: selected
+        Accessible.onPressAction: if (threadRow.item) root.selectThreadMessage(threadRow.item.id)
+        activeFocusOnTab: true
+        Keys.onSpacePressed: if (threadRow.item) root.selectThreadMessage(threadRow.item.id)
+        Keys.onReturnPressed: if (threadRow.item) root.selectThreadMessage(threadRow.item.id)
         HoverHandler { id: threadHover }
         RowLayout {
             anchors.fill: parent
@@ -1253,6 +1357,12 @@ ApplicationWindow {
                         TextInput {
                             id: searchInput
                             Layout.fillWidth: true
+                            Accessible.role: Accessible.EditableText
+                            Accessible.name: "Search mail"
+                            Accessible.id: "search-input"
+                            Accessible.editable: true
+                            Accessible.searchEdit: true
+                            Accessible.focusable: true
                             color: c("text", "#ece7de")
                             selectionColor: c("accent", "#d98e5c")
                             selectedTextColor: c("accent-ink", "#171717")
@@ -1322,6 +1432,13 @@ ApplicationWindow {
                         implicitWidth: composeRow.implicitWidth + n("space-4", 16) * 2
                         implicitHeight: n("control-height", 36)
                         radius: n("radius-control", 2)
+                        activeFocusOnTab: true
+                        Accessible.role: Accessible.Button
+                        Accessible.name: "Compose"
+                        Accessible.id: "compose-open"
+                        Accessible.onPressAction: root.openCompose()
+                        Keys.onSpacePressed: root.openCompose()
+                        Keys.onReturnPressed: root.openCompose()
                         color: composeHover.hovered ? Qt.lighter(c("accent-button", "#d98e5c"), 1.06) : c("accent-button", "#d98e5c")
                         HoverHandler { id: composeHover }
                         RowLayout {
@@ -1388,10 +1505,11 @@ ApplicationWindow {
                         activeFocusOnTab: true
                         Accessible.role: Accessible.Button
                         Accessible.name: "Switch alias, currently " + (root.activeIdentity.length > 0 ? root.activeIdentity : (app.accountEmail || "Aster Mail"))
-                        Accessible.onPressAction: identityPopup.open()
-                        Keys.onSpacePressed: identityPopup.open()
-                        Keys.onReturnPressed: identityPopup.open()
-                        Keys.onEnterPressed: identityPopup.open()
+                        Accessible.id: "account-switcher"
+                        Accessible.onPressAction: root.toggleIdentityPopup()
+                        Keys.onSpacePressed: root.toggleIdentityPopup()
+                        Keys.onReturnPressed: root.toggleIdentityPopup()
+                        Keys.onEnterPressed: root.toggleIdentityPopup()
                         border.width: accountCard.activeFocus ? n("border-width-focus", 1.5) : 0
                         border.color: c("focus", "#d98e5c")
                         HoverHandler { id: accountHover }
@@ -1441,7 +1559,7 @@ ApplicationWindow {
                         MouseArea {
                             anchors.fill: parent
                             cursorShape: Qt.PointingHandCursor
-                            onClicked: identityPopup.open()
+                            onClicked: root.toggleIdentityPopup()
                         }
                     }
 
@@ -1482,6 +1600,7 @@ ApplicationWindow {
                         activeFocusOnTab: true
                         Accessible.role: Accessible.Button
                         Accessible.name: "Create or manage custom mailboxes"
+                        Accessible.id: "custom-mailboxes"
                         Accessible.onPressAction: root.openSettings("aliases")
                         Keys.onSpacePressed: root.openSettings("aliases")
                         Keys.onReturnPressed: root.openSettings("aliases")
@@ -1536,6 +1655,14 @@ ApplicationWindow {
                         Layout.fillWidth: true
                         implicitHeight: 28
                         radius: n("radius-control", 2)
+                        activeFocusOnTab: true
+                        Accessible.role: Accessible.Button
+                        Accessible.name: "All mail"
+                        Accessible.id: "mailing-list-all"
+                        Accessible.selected: root.listFilter === ""
+                        Accessible.onPressAction: root.listFilter = ""
+                        Keys.onSpacePressed: root.listFilter = ""
+                        Keys.onReturnPressed: root.listFilter = ""
                         color: root.listFilter === "" ? c("hover", "#2e2e323a") : "transparent"
                         Text {
                             anchors.verticalCenter: parent.verticalCenter
@@ -1558,6 +1685,18 @@ ApplicationWindow {
                             Layout.fillWidth: true
                             implicitHeight: 28
                             radius: n("radius-control", 2)
+                            activeFocusOnTab: true
+                            Accessible.role: Accessible.Button
+                            Accessible.name: modelData.name
+                            Accessible.id: "mailing-list-" + modelData.list_id
+                            Accessible.selected: root.listFilter === modelData.list_id
+                            Accessible.onPressAction: activate()
+                            Keys.onSpacePressed: activate()
+                            Keys.onReturnPressed: activate()
+                            function activate() {
+                                root.listFilter = modelData.list_id;
+                                app.openMailbox("inbox");
+                            }
                             color: root.listFilter === modelData.list_id ? c("selected", "#3d2e323a") : (listHover.hovered ? c("hover", "#2e2e323a") : "transparent")
                             HoverHandler { id: listHover }
                             RowLayout {
@@ -1584,10 +1723,7 @@ ApplicationWindow {
                             MouseArea {
                                 anchors.fill: parent
                                 cursorShape: Qt.PointingHandCursor
-                                onClicked: {
-                                    root.listFilter = modelData.list_id;
-                                    app.openMailbox("inbox");
-                                }
+                                onClicked: activate()
                             }
                         }
                     }
@@ -1628,6 +1764,13 @@ ApplicationWindow {
                             Layout.fillWidth: true
                             implicitHeight: 28
                             radius: n("radius-control", 8)
+                            activeFocusOnTab: true
+                            Accessible.role: Accessible.Button
+                            Accessible.name: "Saved search " + modelData.name
+                            Accessible.id: "saved-search-" + modelData.name.toLowerCase().replace(/[^a-z0-9]+/g, "-")
+                            Accessible.onPressAction: root.applySavedSearch(modelData)
+                            Keys.onSpacePressed: root.applySavedSearch(modelData)
+                            Keys.onReturnPressed: root.applySavedSearch(modelData)
                             color: savedHover.hovered ? c("hover", "#2e2e323a") : "transparent"
                             HoverHandler { id: savedHover }
                             Text {
@@ -1742,6 +1885,14 @@ ApplicationWindow {
                             Rectangle {
                                 implicitWidth: 28; implicitHeight: 28
                                 radius: n("radius-control", 2)
+                                activeFocusOnTab: true
+                                Accessible.role: Accessible.Switch
+                                Accessible.name: "Unread only"
+                                Accessible.id: "unread-only"
+                                Accessible.checkable: true
+                                Accessible.checked: root.unreadOnly
+                                Accessible.onPressAction: root.unreadOnly = !root.unreadOnly
+                                Keys.onSpacePressed: root.unreadOnly = !root.unreadOnly
                                 color: root.unreadOnly ? c("selected", "#3d2e323a") : "transparent"
                                 Icon { anchors.centerIn: parent; name: "inbox"; size: n("icon-small", 16); color: root.unreadOnly ? c("accent-text", "#e7a97f") : c("muted", "#a8ece7de") }
                                 MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.unreadOnly = !root.unreadOnly }
@@ -2169,6 +2320,7 @@ ApplicationWindow {
                                         }
                                         Accessible.role: Accessible.StaticText
                                         Accessible.name: "Message body"
+                                        Accessible.id: "reader-body"
                                     }
                                 }
 
@@ -2354,7 +2506,11 @@ ApplicationWindow {
         anchors.fill: parent
         color: c("overlay", "#8c000000")
         visible: root.settingsOpen
-        MouseArea { anchors.fill: parent; onClicked: root.settingsOpen = false }
+        MouseArea {
+            anchors.fill: parent
+            onClicked: root.settingsOpen = false
+            onWheel: function(wheel) { wheel.accepted = true }
+        }
         Rectangle {
             id: settingsPanel
             width: Math.min(root.width - 64, 1040)
@@ -2364,7 +2520,10 @@ ApplicationWindow {
             color: c("surface", "#1b1e23")
             border.width: n("border-width", 1)
             border.color: c("border-strong", "#292e323a")
-            MouseArea { anchors.fill: parent }
+            MouseArea {
+                anchors.fill: parent
+                onWheel: function(wheel) { wheel.accepted = true }
+            }
             RowLayout {
                 anchors.fill: parent
                 spacing: 0
@@ -2501,6 +2660,7 @@ ApplicationWindow {
                                             Text { text: "Index every message, not only the newest 2,000 per folder."; color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-micro", 11); wrapMode: Text.WordWrap; Layout.fillWidth: true }
                                         }
                                         Toggle {
+                                            testId: "settings-full-history"
                                             checked: root.settings.mail ? root.settings.mail.full_history !== false : true
                                             onToggled: app.applySettings(JSON.stringify({ mail: { full_history: !checked } }))
                                         }
@@ -2515,6 +2675,7 @@ ApplicationWindow {
                                             id: pollField
                                             Layout.preferredWidth: 96
                                             placeholder: "30"
+                                            testId: "settings-poll-interval"
                                             text: root.settings.mail ? String(root.settings.mail.poll_interval_secs || 30) : "30"
                                         }
                                         LinkText {
@@ -2538,6 +2699,11 @@ ApplicationWindow {
                                             id: signatureField
                                             anchors.fill: parent
                                             anchors.margins: n("space-2", 8)
+                                            Accessible.role: Accessible.EditableText
+                                            Accessible.name: "Signature"
+                                            Accessible.id: "settings-signature"
+                                            Accessible.editable: true
+                                            Accessible.multiLine: true
                                             text: root.settings.compose ? (root.settings.compose.signature || "") : ""
                                             color: c("text", "#ece7de")
                                             wrapMode: TextArea.Wrap
@@ -2559,6 +2725,11 @@ ApplicationWindow {
                                             id: templateField
                                             anchors.fill: parent
                                             anchors.margins: n("space-2", 8)
+                                            Accessible.role: Accessible.EditableText
+                                            Accessible.name: "Template"
+                                            Accessible.id: "settings-template"
+                                            Accessible.editable: true
+                                            Accessible.multiLine: true
                                             text: root.settings.compose ? (root.settings.compose.template || "") : ""
                                             color: c("text", "#ece7de")
                                             wrapMode: TextArea.Wrap
@@ -2577,6 +2748,7 @@ ApplicationWindow {
                                         Layout.fillWidth: true
                                         Text { text: "Server-side undo send"; color: c("text-2", "#dbebe7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-small", 12); Layout.fillWidth: true }
                                         Toggle {
+                                            testId: "settings-server-undo-send"
                                             checked: root.settings.compose ? root.settings.compose.server_undo_send === true : false
                                             onToggled: app.applySettings(JSON.stringify({ compose: { server_undo_send: !checked } }))
                                         }
@@ -2635,7 +2807,7 @@ ApplicationWindow {
                                     RowLayout {
                                         Layout.fillWidth: true
                                         spacing: n("space-2", 8)
-                                        SettingsField { id: ruleName; Layout.fillWidth: true; placeholder: "Rule name" }
+                                        SettingsField { id: ruleName; Layout.fillWidth: true; placeholder: "Rule name"; testId: "settings-rule-name" }
                                         ModeChip { label: "All"; active: root.ruleMatchAll; onClicked: root.ruleMatchAll = true }
                                         ModeChip { label: "Any"; active: !root.ruleMatchAll; onClicked: root.ruleMatchAll = false }
                                     }
@@ -2718,6 +2890,11 @@ ApplicationWindow {
                                             id: ruleJson
                                             anchors.fill: parent
                                             anchors.margins: n("space-2", 8)
+                                            Accessible.role: Accessible.EditableText
+                                            Accessible.name: "New rule JSON"
+                                            Accessible.id: "settings-rule-json"
+                                            Accessible.editable: true
+                                            Accessible.multiLine: true
                                             color: c("text", "#ece7de")
                                             placeholderText: '{"name":"Invoices","color":"#d98e5c","enabled":true,"match_mode":"all","conditions":[{"field":"subject","op":"matches_regex","value":"(?i)invoice|receipt"}],"actions":[{"type":"move_to","folder_token":"<mailbox-token>"}]}' 
                                             placeholderTextColor: c("muted", "#a8ece7de")
@@ -2747,7 +2924,7 @@ ApplicationWindow {
                                     RowLayout {
                                         Layout.fillWidth: true
                                         spacing: n("space-2", 8)
-                                        SettingsField { id: newMailboxName; Layout.fillWidth: true; placeholder: "Mailbox name" }
+                                        SettingsField { id: newMailboxName; Layout.fillWidth: true; placeholder: "Mailbox name"; testId: "settings-new-mailbox" }
                                         LinkText { text: "Create mailbox"; action: function() { app.createMailbox(newMailboxName.text) } }
                                         LinkText {
                                             visible: root.aliasSelection.length > 0
@@ -2789,7 +2966,7 @@ ApplicationWindow {
                                     RowLayout {
                                         Layout.fillWidth: true
                                         spacing: n("space-2", 8)
-                                        SettingsField { id: newTagName; Layout.fillWidth: true; placeholder: "New tag name" }
+                                        SettingsField { id: newTagName; Layout.fillWidth: true; placeholder: "New tag name"; testId: "settings-new-tag" }
                                         LinkText { text: "Create tag"; action: function() { app.createTag(newTagName.text) } }
                                     }
                                     Repeater {
@@ -2803,7 +2980,7 @@ ApplicationWindow {
                                     }
                                     Text { visible: root.tags.length === 0; text: "No tags yet."; color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-micro", 11) }
                                     Text { text: "FOLDER MANAGEMENT"; color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-micro", 9); font.letterSpacing: 1; Layout.topMargin: n("space-2", 8) }
-                                    SettingsField { id: folderRenameName; Layout.fillWidth: true; placeholder: "New folder name" }
+                                    SettingsField { id: folderRenameName; Layout.fillWidth: true; placeholder: "New folder name"; testId: "settings-folder-rename" }
                                     Repeater {
                                         model: root.customFolders
                                         delegate: RowLayout {
@@ -2838,7 +3015,7 @@ ApplicationWindow {
                                     RowLayout {
                                         Layout.fillWidth: true
                                         spacing: n("space-2", 8)
-                                        SettingsField { id: contactUid; Layout.preferredWidth: 180; placeholder: "uid" }
+                                        SettingsField { id: contactUid; Layout.preferredWidth: 180; placeholder: "uid"; testId: "settings-contact-uid" }
                                         LinkText { text: "Save vCard"; action: function() { app.saveContact(contactUid.text, contactVcard.text) } }
                                         Item { Layout.fillWidth: true }
                                     }
@@ -2853,6 +3030,11 @@ ApplicationWindow {
                                             id: contactVcard
                                             anchors.fill: parent
                                             anchors.margins: n("space-2", 8)
+                                            Accessible.role: Accessible.EditableText
+                                            Accessible.name: "Contact vCard"
+                                            Accessible.id: "settings-contact-vcard"
+                                            Accessible.editable: true
+                                            Accessible.multiLine: true
                                             color: c("text", "#ece7de")
                                             placeholderText: "BEGIN:VCARD\nVERSION:3.0\nFN:Name\nEMAIL:name@example.com\nEND:VCARD"
                                             placeholderTextColor: c("muted", "#a8ece7de")
@@ -2973,6 +3155,7 @@ ApplicationWindow {
                                                 spacing: n("space-3", 12)
                                                 Text { text: "Sign outgoing mail with gpg-agent"; color: c("text-2", "#dbebe7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-small", 12); Layout.fillWidth: true }
                                                 Toggle {
+                                                    testId: "settings-gpg-sign-outgoing"
                                                     checked: root.settings.security ? root.settings.security.gpg_sign_outgoing === true : false
                                                     onToggled: app.applySettings(JSON.stringify({ security: { gpg_sign_outgoing: !checked } }))
                                                 }
@@ -3000,6 +3183,7 @@ ApplicationWindow {
                                             Text { text: "Block sends to Aster recipients whose keys do not support PQ."; color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-micro", 11); wrapMode: Text.WordWrap; Layout.fillWidth: true }
                                         }
                                         Toggle {
+                                            testId: "settings-require-pq"
                                             checked: root.settings.security ? root.settings.security.require_post_quantum === true : false
                                             onToggled: app.applySettings(JSON.stringify({ security: { require_post_quantum: !checked } }))
                                         }
@@ -3011,6 +3195,7 @@ ApplicationWindow {
                                             Text { text: "Use Aster end-to-end encryption whenever recipient keys are available."; color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-micro", 11); wrapMode: Text.WordWrap; Layout.fillWidth: true }
                                         }
                                         Toggle {
+                                            testId: "settings-encrypt-default"
                                             checked: root.settings.security ? root.settings.security.encrypt_emails !== false : true
                                             onToggled: app.applySettings(JSON.stringify({ security: { encrypt_emails: !checked } }))
                                         }
@@ -3027,17 +3212,17 @@ ApplicationWindow {
                                     RowLayout {
                                         Layout.fillWidth: true
                                         Text { text: "Enable MCP server"; color: c("text", "#ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-small", 12); Layout.fillWidth: true }
-                                        Toggle { checked: root.settings.mcp ? root.settings.mcp.enabled === true : false; onToggled: app.applySettings(JSON.stringify({ mcp: { enabled: !checked } })) }
+                                        Toggle { testId: "settings-mcp-enabled"; checked: root.settings.mcp ? root.settings.mcp.enabled === true : false; onToggled: app.applySettings(JSON.stringify({ mcp: { enabled: !checked } })) }
                                     }
                                     RowLayout {
                                         Layout.fillWidth: true
                                         Text { text: "Allow sending mail"; color: c("text", "#ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-small", 12); Layout.fillWidth: true }
-                                        Toggle { checked: root.settings.mcp ? root.settings.mcp.allow_send === true : false; onToggled: app.applySettings(JSON.stringify({ mcp: { allow_send: !checked } })) }
+                                        Toggle { testId: "settings-mcp-allow-send"; checked: root.settings.mcp ? root.settings.mcp.allow_send === true : false; onToggled: app.applySettings(JSON.stringify({ mcp: { allow_send: !checked } })) }
                                     }
                                     RowLayout {
                                         Layout.fillWidth: true
                                         Text { text: "Allow destructive actions"; color: c("text", "#ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-small", 12); Layout.fillWidth: true }
-                                        Toggle { checked: root.settings.mcp ? root.settings.mcp.allow_destructive === true : false; onToggled: app.applySettings(JSON.stringify({ mcp: { allow_destructive: !checked } })) }
+                                        Toggle { testId: "settings-mcp-allow-destructive"; checked: root.settings.mcp ? root.settings.mcp.allow_destructive === true : false; onToggled: app.applySettings(JSON.stringify({ mcp: { allow_destructive: !checked } })) }
                                     }
                                 }
 
@@ -3102,7 +3287,10 @@ ApplicationWindow {
         anchors.fill: parent
         color: c("overlay", "#8c000000")
         visible: root.unsubConfirmOpen
-        MouseArea { anchors.fill: parent }
+        MouseArea {
+            anchors.fill: parent
+            onWheel: function(wheel) { wheel.accepted = true }
+        }
         Rectangle {
             width: 460; height: 210
             anchors.centerIn: parent
@@ -3131,7 +3319,10 @@ ApplicationWindow {
         anchors.fill: parent
         color: c("overlay", "#8c000000")
         visible: root.emptyConfirmOpen
-        MouseArea { anchors.fill: parent }
+        MouseArea {
+            anchors.fill: parent
+            onWheel: function(wheel) { wheel.accepted = true }
+        }
         Rectangle {
             width: 420; height: 190
             anchors.centerIn: parent
@@ -3160,7 +3351,10 @@ ApplicationWindow {
         anchors.fill: parent
         color: c("overlay", "#8c000000")
         visible: root.deleteConfirmOpen
-        MouseArea { anchors.fill: parent }
+        MouseArea {
+            anchors.fill: parent
+            onWheel: function(wheel) { wheel.accepted = true }
+        }
         Rectangle {
             width: 420
             height: 210
@@ -3192,6 +3386,7 @@ ApplicationWindow {
                     id: deleteWord
                     Layout.fillWidth: true
                     placeholder: 'Type delete to confirm'
+                    testId: "delete-confirm-word"
                     onEdited: function(value) { root.deleteConfirmWord = value }
                 }
                 Item { Layout.fillHeight: true }
@@ -3203,15 +3398,33 @@ ApplicationWindow {
                         implicitWidth: 80
                         implicitHeight: n("control-height", 36)
                         radius: n("radius-control", 2)
+                        activeFocusOnTab: true
+                        Accessible.role: Accessible.Button
+                        Accessible.name: "Cancel delete"
+                        Accessible.id: "delete-cancel"
+                        Accessible.onPressAction: cancelDelete()
+                        Keys.onSpacePressed: cancelDelete()
+                        function cancelDelete() { app.resolveDelete(root.pendingDeleteToken, false); root.deleteConfirmOpen = false; }
                         color: cancelHover.hovered ? c("hover", "#2e2e323a") : "transparent"
                         HoverHandler { id: cancelHover }
                         Text { anchors.centerIn: parent; text: "Cancel"; color: c("text-2", "#dbebe7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-small", 12) }
-                        MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: { app.resolveDelete(root.pendingDeleteToken, false); root.deleteConfirmOpen = false; } }
+                        MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: cancelDelete() }
                     }
                     Rectangle {
                         implicitWidth: 96
                         implicitHeight: n("control-height", 36)
                         radius: n("radius-control", 2)
+                        activeFocusOnTab: true
+                        Accessible.role: Accessible.Button
+                        Accessible.name: "Delete permanently"
+                        Accessible.id: "delete-confirm"
+                        Accessible.onPressAction: confirmDelete()
+                        Keys.onSpacePressed: confirmDelete()
+                        function confirmDelete() {
+                            if (root.deleteConfirmWord.toLowerCase() !== "delete") return;
+                            app.resolveDelete(root.pendingDeleteToken, true);
+                            root.deleteConfirmOpen = false;
+                        }
                         color: root.deleteConfirmWord.toLowerCase() === "delete"
                                ? (deleteHover.hovered ? Qt.lighter(c("danger", "#d97a72"), 1.08) : c("danger", "#d97a72"))
                                : c("surface-strong", "#2e323a")
@@ -3221,11 +3434,7 @@ ApplicationWindow {
                         MouseArea {
                             anchors.fill: parent
                             cursorShape: Qt.PointingHandCursor
-                            onClicked: {
-                                if (root.deleteConfirmWord.toLowerCase() !== "delete") return;
-                                app.resolveDelete(root.pendingDeleteToken, true);
-                                root.deleteConfirmOpen = false;
-                            }
+                            onClicked: confirmDelete()
                         }
                     }
                 }
@@ -3237,7 +3446,11 @@ ApplicationWindow {
         anchors.fill: parent
         color: c("overlay", "#8c000000")
         visible: root.composeOpen
-        MouseArea { anchors.fill: parent; onClicked: root.composeOpen = false }
+        MouseArea {
+            anchors.fill: parent
+            onClicked: root.composeOpen = false
+            onWheel: function(wheel) { wheel.accepted = true }
+        }
         Rectangle {
             width: Math.min(root.width - 80, 760)
             height: Math.min(root.height - 80, 640)
@@ -3291,6 +3504,7 @@ ApplicationWindow {
                                 root.composeFrom = root.identities[currentIndex].address;
                         }
                         Accessible.name: "Send from"
+                        Accessible.id: "compose-from"
                         background: Rectangle {
                             radius: n("radius-control", 2)
                             color: c("input", "#221b1e23")
@@ -3317,14 +3531,14 @@ ApplicationWindow {
                         }
                     }
                 }
-                SettingsField { id: composeTo; Layout.fillWidth: true; placeholder: "To, comma separated" }
+                SettingsField { id: composeTo; Layout.fillWidth: true; placeholder: "To, comma separated"; testId: "compose-to" }
                 RowLayout {
                     Layout.fillWidth: true
                     spacing: n("space-2", 8)
-                    SettingsField { id: composeCc; Layout.fillWidth: true; placeholder: "Cc" }
-                    SettingsField { id: composeBcc; Layout.fillWidth: true; placeholder: "Bcc" }
+                    SettingsField { id: composeCc; Layout.fillWidth: true; placeholder: "Cc"; testId: "compose-cc" }
+                    SettingsField { id: composeBcc; Layout.fillWidth: true; placeholder: "Bcc"; testId: "compose-bcc" }
                 }
-                SettingsField { id: composeSubject; Layout.fillWidth: true; placeholder: "Subject" }
+                SettingsField { id: composeSubject; Layout.fillWidth: true; placeholder: "Subject"; testId: "compose-subject" }
                 RowLayout {
                     Layout.fillWidth: true
                     spacing: n("space-3", 12)
@@ -3362,6 +3576,12 @@ ApplicationWindow {
                         id: composeBody
                         anchors.fill: parent
                         anchors.margins: n("space-3", 12)
+                        Accessible.role: Accessible.EditableText
+                        Accessible.name: "Message body"
+                        Accessible.id: "compose-body"
+                        Accessible.editable: true
+                        Accessible.multiLine: true
+                        Accessible.focusable: true
                         color: c("text", "#ece7de")
                         placeholderText: "# Hello\n\nWrite in Markdown. Bold, lists, links, quotes and code blocks are converted to email HTML and plain text."
                         placeholderTextColor: c("muted", "#a8ece7de")
@@ -3418,7 +3638,7 @@ ApplicationWindow {
                 RowLayout {
                     Layout.fillWidth: true
                     spacing: n("space-2", 8)
-                    SettingsField { id: scheduleAtField; Layout.fillWidth: true; placeholder: "Send at YYYY-MM-DD HH:MM" }
+                    SettingsField { id: scheduleAtField; Layout.fillWidth: true; placeholder: "Send at YYYY-MM-DD HH:MM"; testId: "compose-schedule-at" }
                     LinkText { text: "Schedule"; action: function() { root.scheduleCurrentSend() } }
                 }
                 RowLayout {
@@ -3436,6 +3656,21 @@ ApplicationWindow {
                         implicitWidth: 96
                         implicitHeight: n("control-height", 36)
                         radius: n("radius-control", 2)
+                        activeFocusOnTab: true
+                        Accessible.role: Accessible.Button
+                        Accessible.name: "Send"
+                        Accessible.id: "compose-send"
+                        Accessible.onPressAction: send()
+                        Keys.onSpacePressed: send()
+                        Keys.onReturnPressed: send()
+                        function send() {
+                            if (root.settings.compose && root.settings.compose.server_undo_send === true) {
+                                app.sendQueued(root.composeFrom, composeTo.text, composeCc.text, composeBcc.text, composeSubject.text, composeBody.text, JSON.stringify(root.composeAttachments), 10);
+                                root.composeOpen = false;
+                            } else {
+                                root.sendWithUndo();
+                            }
+                        }
                         color: sendHover.hovered ? Qt.lighter(c("accent-button", "#d98e5c"), 1.06) : c("accent-button", "#d98e5c")
                         HoverHandler { id: sendHover }
                         Text {
@@ -3449,14 +3684,7 @@ ApplicationWindow {
                         MouseArea {
                             anchors.fill: parent
                             cursorShape: Qt.PointingHandCursor
-                            onClicked: {
-                                if (root.settings.compose && root.settings.compose.server_undo_send === true) {
-                                    app.sendQueued(root.composeFrom, composeTo.text, composeCc.text, composeBcc.text, composeSubject.text, composeBody.text, JSON.stringify(root.composeAttachments), 10);
-                                    root.composeOpen = false;
-                                } else {
-                                    root.sendWithUndo();
-                                }
-                            }
+                            onClicked: send()
                         }
                     }
                 }
@@ -3464,21 +3692,46 @@ ApplicationWindow {
         }
     }
 
-    Popup {
-        id: identityPopup
-        width: accountCard.width
+    Rectangle {
+        id: identityScrim
+        anchors.fill: parent
+        z: 90
+        color: "transparent"
+        visible: root.identityOpen
+        MouseArea {
+            anchors.fill: parent
+            onClicked: root.closeIdentityPopup()
+            onWheel: function(wheel) { wheel.accepted = true }
+        }
+    }
+
+    Rectangle {
+        id: identityPanel
+        z: 91
+        visible: root.identityOpen
         x: accountCard.mapToItem(null, 0, accountCard.height).x
         y: accountCard.mapToItem(null, 0, accountCard.height).y
-        modal: false
+        width: Math.max(accountCard.width, 300)
+        height: Math.max(96, Math.min(400, 36 + root.identities.length * 44))
+        radius: n("radius-panel", 8)
+        color: c("surface-strong", "#2e323a")
+        border.width: n("border-width-focus", 1.5)
+        border.color: c("accent", "#d98e5c")
         focus: true
-        closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
-        onOpened: app.loadSettingsData()
-        background: Rectangle {
-            color: c("menu", "#23262c")
-            border.width: n("border-width", 1)
-            border.color: c("border-strong", "#292e323a")
-            radius: n("radius-panel", 8)
+        onVisibleChanged: if (visible) forceActiveFocus()
+        Keys.onEscapePressed: root.closeIdentityPopup()
+        Timer {
+            id: identityLoadTimer
+            interval: 1200
+            onTriggered: root.identityLoading = false
         }
+        Connections {
+            target: root
+            function onActiveChanged() {
+                if (!root.active) root.closeIdentityPopup();
+            }
+        }
+        MouseArea { anchors.fill: parent; onWheel: function(wheel) { wheel.accepted = true } }
         ColumnLayout {
             anchors.fill: parent
             anchors.margins: n("space-2", 8)
@@ -3504,6 +3757,7 @@ ApplicationWindow {
                     activeFocusOnTab: true
                     Accessible.role: Accessible.Button
                     Accessible.name: "Send from " + modelData.address
+                    Accessible.id: "identity-" + modelData.address
                     Accessible.onPressAction: root.useIdentity(modelData.address)
                     Keys.onSpacePressed: root.useIdentity(modelData.address)
                     Keys.onReturnPressed: root.useIdentity(modelData.address)
@@ -3516,11 +3770,17 @@ ApplicationWindow {
                         anchors.leftMargin: n("space-2", 8)
                         anchors.rightMargin: n("space-2", 8)
                         spacing: n("space-2", 8)
-                        Icon {
-                            name: "check"
-                            size: n("icon-small", 16)
-                            color: c("accent-text", "#e7a97f")
-                            visible: identityRow.active
+                        Item {
+                            width: n("icon-small", 16)
+                            height: width
+                            Layout.alignment: Qt.AlignVCenter
+                            Icon {
+                                anchors.centerIn: parent
+                                name: "check"
+                                size: n("icon-small", 16)
+                                color: c("accent-text", "#e7a97f")
+                                visible: identityRow.active
+                            }
                         }
                         ColumnLayout {
                             Layout.fillWidth: true
@@ -3550,8 +3810,15 @@ ApplicationWindow {
                 }
             }
             Text {
-                visible: root.identities.length === 0
+                visible: root.identities.length === 0 && !root.identityLoading
                 text: "No aliases available."
+                color: c("muted", "#a8ece7de")
+                font.family: c("font-family", "Inter")
+                font.pixelSize: n("font-size-small", 12)
+            }
+            Text {
+                visible: root.identities.length === 0 && root.identityLoading
+                text: "Loading aliases…"
                 color: c("muted", "#a8ece7de")
                 font.family: c("font-family", "Inter")
                 font.pixelSize: n("font-size-small", 12)
@@ -3589,14 +3856,14 @@ ApplicationWindow {
                 LinkText { text: "Clear"; action: function() { root.clearSearchFilters() } }
                 IconButton { icon: "close"; label: "Close filters"; onClicked: searchFilterPopup.close() }
             }
-            SettingsField { placeholder: "From contains"; text: root.filterFrom; onEdited: root.filterFrom = value }
-            SettingsField { placeholder: "Subject contains"; text: root.filterSubject; onEdited: root.filterSubject = value }
-            SettingsField { placeholder: "Body or preview contains"; text: root.filterBody; onEdited: root.filterBody = value }
+            SettingsField { placeholder: "From contains"; testId: "filter-from"; text: root.filterFrom; onEdited: root.filterFrom = value }
+            SettingsField { placeholder: "Subject contains"; testId: "filter-subject"; text: root.filterSubject; onEdited: root.filterSubject = value }
+            SettingsField { placeholder: "Body or preview contains"; testId: "filter-body"; text: root.filterBody; onEdited: root.filterBody = value }
             RowLayout {
                 Layout.fillWidth: true
                 spacing: n("space-2", 8)
-                SettingsField { Layout.fillWidth: true; placeholder: "Since YYYY-MM-DD"; text: root.filterSince; onEdited: root.filterSince = value }
-                SettingsField { Layout.fillWidth: true; placeholder: "Until YYYY-MM-DD"; text: root.filterUntil; onEdited: root.filterUntil = value }
+                SettingsField { Layout.fillWidth: true; placeholder: "Since YYYY-MM-DD"; testId: "filter-since"; text: root.filterSince; onEdited: root.filterSince = value }
+                SettingsField { Layout.fillWidth: true; placeholder: "Until YYYY-MM-DD"; testId: "filter-until"; text: root.filterUntil; onEdited: root.filterUntil = value }
             }
             RowLayout {
                 Layout.fillWidth: true
@@ -3608,7 +3875,7 @@ ApplicationWindow {
                     font.pixelSize: n("font-size-small", 12)
                     Layout.fillWidth: true
                 }
-                Toggle { checked: root.filterStarred; onToggled: root.filterStarred = !root.filterStarred }
+                Toggle { testId: "filter-starred"; checked: root.filterStarred; onToggled: root.filterStarred = !root.filterStarred }
             }
             RowLayout {
                 Layout.fillWidth: true
@@ -3620,12 +3887,12 @@ ApplicationWindow {
                     font.pixelSize: n("font-size-small", 12)
                     Layout.fillWidth: true
                 }
-                Toggle { checked: root.filterAttachmentsOnly; onToggled: root.filterAttachmentsOnly = !root.filterAttachmentsOnly }
+                Toggle { testId: "filter-attachments-only"; checked: root.filterAttachmentsOnly; onToggled: root.filterAttachmentsOnly = !root.filterAttachmentsOnly }
             }
             RowLayout {
                 Layout.fillWidth: true
                 spacing: n("space-2", 8)
-                SettingsField { id: savedSearchName; Layout.fillWidth: true; placeholder: "Saved search name" }
+                SettingsField { id: savedSearchName; Layout.fillWidth: true; placeholder: "Saved search name"; testId: "filter-saved-name" }
                 LinkText { text: "Save search"; action: function() { root.saveCurrentSearch(savedSearchName.text) } }
             }
             Item { Layout.fillHeight: true }
