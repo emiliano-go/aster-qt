@@ -47,6 +47,7 @@ pub struct MessageView {
     pub references: Option<String>,
     pub thread_id: Option<String>,
     pub tags: Vec<String>,
+    pub snoozed_until: Option<String>,
     pub preview: String,
 }
 
@@ -119,10 +120,16 @@ impl ClientRuntime {
         limit: usize,
         offset: usize,
     ) -> ClientResult<Vec<MessageView>> {
-        let mut rows = self
-            .db()
-            .list_cached_message_meta(folder)
-            .map_err(ClientError::Storage)?;
+        let rows = if folder == "snoozed" {
+            self.db()
+                .list_snoozed_message_meta()
+                .map_err(ClientError::Storage)?
+        } else {
+            self.db()
+                .list_visible_message_meta(folder)
+                .map_err(ClientError::Storage)?
+        };
+        let mut rows = rows;
         rows.sort_by(|a, b| b.date.cmp(&a.date));
         let mut out: Vec<MessageView> = rows
             .into_iter()
@@ -131,7 +138,23 @@ impl ClientRuntime {
             .map(|msg| view_of(&msg))
             .collect();
         self.attach_tags(&mut out)?;
+        self.attach_snoozes(&mut out)?;
         Ok(out)
+    }
+
+    fn attach_snoozes(&self, messages: &mut [MessageView]) -> ClientResult<()> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+        let ids: Vec<String> = messages.iter().map(|message| message.id.clone()).collect();
+        let mut snoozes = self
+            .db()
+            .snoozed_until_for_ids(&ids)
+            .map_err(ClientError::Storage)?;
+        for message in messages {
+            message.snoozed_until = snoozes.remove(&message.id);
+        }
+        Ok(())
     }
 
     fn attach_tags(&self, messages: &mut [MessageView]) -> ClientResult<()> {
@@ -299,6 +322,7 @@ impl ClientRuntime {
             attachments,
         };
         self.attach_tags(std::slice::from_mut(&mut detail.message))?;
+        self.attach_snoozes(std::slice::from_mut(&mut detail.message))?;
         Ok(detail)
     }
 
@@ -876,7 +900,13 @@ impl ClientRuntime {
         self.client()
             .snooze_mail(&token, ids, until_iso8601)
             .await
-            .map_err(ClientError::from_bridge)
+            .map_err(ClientError::from_bridge)?;
+        for id in ids {
+            self.db()
+                .set_message_snooze(id, until_iso8601)
+                .map_err(ClientError::Storage)?;
+        }
+        Ok(())
     }
 
     pub async fn unsnooze_message(&self, id: &str) -> ClientResult<()> {
@@ -884,7 +914,10 @@ impl ClientRuntime {
         self.client()
             .unsnooze_mail(&token, id)
             .await
-            .map_err(ClientError::from_bridge)
+            .map_err(ClientError::from_bridge)?;
+        self.db()
+            .clear_message_snooze(id)
+            .map_err(ClientError::Storage)
     }
 
     pub async fn ensure_attachments(&self, id: &str) -> ClientResult<()> {
@@ -1550,6 +1583,7 @@ fn view_of(msg: &CachedMessage) -> MessageView {
             .map(str::to_string),
         thread_id: msg.thread_id.clone(),
         tags: Vec::new(),
+        snoozed_until: None,
         preview: preview_of(msg.body_text.as_deref()),
     }
 }
