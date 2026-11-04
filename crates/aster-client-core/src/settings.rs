@@ -19,7 +19,8 @@ pub fn defaults() -> Value {
             "reader_open": true,
             "poll_interval_secs": 30,
             "full_history": true,
-            "preview_lines": 1
+            "preview_lines": 1,
+            "saved_searches": []
         },
         "security": {
             "require_post_quantum": false,

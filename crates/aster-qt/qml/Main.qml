@@ -146,6 +146,7 @@ ApplicationWindow {
     property var composeAttachments: []
     property bool toastVisible: false
     property bool deleteConfirmOpen: false
+    property bool emptyConfirmOpen: false
     property string pendingDeleteToken: ""
     property string pendingDeleteIds: "[]"
     property string deleteConfirmWord: ""
@@ -383,6 +384,37 @@ ApplicationWindow {
         root.activeIdentity = address;
         root.composeFrom = address;
         identityPopup.close();
+    }
+
+    function applySavedSearch(search) {
+        root.query = search.query || "";
+        root.filterFrom = search.from || "";
+        root.filterSubject = search.subject || "";
+        root.filterBody = search.body || "";
+        root.filterSince = search.since || "";
+        root.filterUntil = search.until || "";
+        root.filterStarred = search.starred === true;
+        root.filterAttachmentsOnly = search.attachments === true;
+        if (search.list_id) root.listFilter = search.list_id;
+    }
+
+    function saveCurrentSearch(name) {
+        if (!name || name.trim().length === 0) return;
+        var existing = root.settings.mail && root.settings.mail.saved_searches
+            ? root.settings.mail.saved_searches.slice() : [];
+        existing.push({
+            name: name.trim(),
+            query: root.query,
+            from: root.filterFrom,
+            subject: root.filterSubject,
+            body: root.filterBody,
+            since: root.filterSince,
+            until: root.filterUntil,
+            starred: root.filterStarred,
+            attachments: root.filterAttachmentsOnly,
+            list_id: root.listFilter
+        });
+        app.applySettings(JSON.stringify({ mail: { saved_searches: existing } }));
     }
 
     function clearSearchFilters() {
@@ -1461,6 +1493,49 @@ ApplicationWindow {
                         Layout.leftMargin: n("space-2", 8)
                     }
 
+                    Text {
+                        text: "SAVED SEARCHES"
+                        color: c("muted", "#a8ece7de")
+                        font.family: c("font-family", "Inter")
+                        font.pixelSize: n("font-size-micro", 9)
+                        font.letterSpacing: 1
+                        Layout.topMargin: n("space-3", 12)
+                        Layout.leftMargin: n("space-2", 8)
+                    }
+                    Repeater {
+                        model: root.settings.mail && root.settings.mail.saved_searches ? root.settings.mail.saved_searches : []
+                        delegate: Rectangle {
+                            Layout.fillWidth: true
+                            implicitHeight: 28
+                            radius: n("radius-control", 8)
+                            color: savedHover.hovered ? c("hover", "#2e2e323a") : "transparent"
+                            HoverHandler { id: savedHover }
+                            Text {
+                                anchors.verticalCenter: parent.verticalCenter
+                                anchors.left: parent.left
+                                anchors.leftMargin: n("space-3", 12)
+                                anchors.right: parent.right
+                                anchors.rightMargin: n("space-3", 12)
+                                text: modelData.name
+                                color: c("text-2", "#dbebe7de")
+                                font.family: c("font-family", "Inter")
+                                font.pixelSize: n("font-size-small", 12)
+                                elide: Text.ElideRight
+                            }
+                            MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.applySavedSearch(modelData) }
+                        }
+                    }
+                    Text {
+                        visible: !(root.settings.mail && root.settings.mail.saved_searches && root.settings.mail.saved_searches.length > 0)
+                        text: "Save a search from the filter dialog."
+                        color: c("muted", "#a8ece7de")
+                        font.family: c("font-family", "Inter")
+                        font.pixelSize: n("font-size-micro", 9)
+                        wrapMode: Text.WordWrap
+                        Layout.fillWidth: true
+                        Layout.leftMargin: n("space-2", 8)
+                    }
+
                     Item { Layout.fillHeight: true }
 
                     Rectangle {
@@ -1533,6 +1608,11 @@ ApplicationWindow {
                                 visible: root.listFilter.length > 0
                                 text: "All mail"
                                 action: function() { root.listFilter = "" }
+                            }
+                            LinkText {
+                                visible: app.folderId === "trash" || app.folderId === "spam"
+                                text: "Empty"
+                                action: function() { root.emptyConfirmOpen = true }
                             }
                             Rectangle {
                                 implicitWidth: 28; implicitHeight: 28
@@ -2768,6 +2848,35 @@ ApplicationWindow {
     Rectangle {
         anchors.fill: parent
         color: c("overlay", "#8c000000")
+        visible: root.emptyConfirmOpen
+        MouseArea { anchors.fill: parent }
+        Rectangle {
+            width: 420; height: 190
+            anchors.centerIn: parent
+            radius: n("radius-panel", 18)
+            color: c("surface", "#1b1e23")
+            border.width: n("border-width", 1)
+            border.color: c("border-strong", "#292e323a")
+            ColumnLayout {
+                anchors.fill: parent
+                anchors.margins: n("space-5", 24)
+                spacing: n("space-3", 12)
+                Text { text: "Empty " + root.folderLabel(app.folderId) + "?"; color: c("text", "#ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-title", 16); font.weight: n("font-weight-semibold", 600) }
+                Text { text: "Every message in this folder will be permanently deleted. This cannot be undone."; color: c("text-2", "#dbebe7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-small", 12); wrapMode: Text.WordWrap; Layout.fillWidth: true }
+                Item { Layout.fillHeight: true }
+                RowLayout {
+                    Layout.fillWidth: true
+                    Item { Layout.fillWidth: true }
+                    LinkText { text: "Cancel"; action: function() { root.emptyConfirmOpen = false } }
+                    LinkText { text: "Empty folder"; action: function() { app.emptyFolder(app.folderId); root.emptyConfirmOpen = false } }
+                }
+            }
+        }
+    }
+
+    Rectangle {
+        anchors.fill: parent
+        color: c("overlay", "#8c000000")
         visible: root.deleteConfirmOpen
         MouseArea { anchors.fill: parent }
         Rectangle {
@@ -3220,6 +3329,12 @@ ApplicationWindow {
                     Layout.fillWidth: true
                 }
                 Toggle { checked: root.filterAttachmentsOnly; onToggled: root.filterAttachmentsOnly = !root.filterAttachmentsOnly }
+            }
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: n("space-2", 8)
+                SettingsField { id: savedSearchName; Layout.fillWidth: true; placeholder: "Saved search name" }
+                LinkText { text: "Save search"; action: function() { root.saveCurrentSearch(savedSearchName.text) } }
             }
             Item { Layout.fillHeight: true }
             Text {

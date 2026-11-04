@@ -40,4 +40,5 @@ check pgp_status
 check tags_list
 check mailing_lists_list
 check gpg_status
+check mail_from_sender_list '{"sender":"a","limit":1}'
 exit "$fail"

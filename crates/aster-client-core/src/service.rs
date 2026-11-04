@@ -552,8 +552,57 @@ impl ClientRuntime {
         Ok(())
     }
 
+    pub fn messages_from_sender(&self, sender: &str, limit: usize) -> ClientResult<Vec<MessageView>> {
+        let ids = self
+            .db()
+            .with_conn(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT aster_id FROM message_cache WHERE lower(sender) LIKE lower(?1) ORDER BY julianday(date) DESC LIMIT ?2",
+                )?;
+                let pattern = format!("%{}%", sender);
+                let rows = stmt.query_map(rusqlite::params![pattern, limit as i64], |row| {
+                    row.get::<_, String>(0)
+                })?;
+                rows.collect::<std::result::Result<Vec<_>, _>>()
+            })
+            .map_err(ClientError::Storage)?;
+        let mut map = self
+            .db()
+            .get_cached_messages(&ids, false)
+            .map_err(ClientError::Storage)?;
+        Ok(ids
+            .iter()
+            .filter_map(|id| map.remove(id))
+            .map(|msg| view_of(&msg))
+            .collect())
+    }
+
+    pub async fn set_pinned(&self, ids: &[String], pinned: bool) -> ClientResult<()> {
+        let token = self.access_token().await;
+        for id in ids {
+            self.client()
+                .set_mailbox_flags(&token, id, serde_json::json!({ "is_pinned": pinned }))
+                .await
+                .map_err(ClientError::from_bridge)?;
+        }
+        Ok(())
+    }
+
     pub async fn trash_messages(&self, ids: &[String]) -> ClientResult<()> {
         self.move_messages(ids, "trash").await
+    }
+
+    pub async fn empty_folder(&self, folder: &str) -> ClientResult<usize> {
+        let rows = self
+            .db()
+            .list_cached_message_meta(folder)
+            .map_err(ClientError::Storage)?;
+        let ids: Vec<String> = rows.into_iter().map(|row| row.aster_id).collect();
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        self.delete_messages_permanent(&ids).await?;
+        Ok(ids.len())
     }
 
     pub async fn delete_messages_permanent(&self, ids: &[String]) -> ClientResult<()> {

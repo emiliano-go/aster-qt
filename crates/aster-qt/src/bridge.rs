@@ -81,6 +81,10 @@ pub mod qobject {
         fn delete_folder(self: &Self, token: &QString);
 
         #[qinvokable]
+        #[cxx_name = "emptyFolder"]
+        fn empty_folder(self: &Self, folder: &QString);
+
+        #[qinvokable]
         #[cxx_name = "batchAction"]
         fn batch_action(self: &Self, action: &QString, ids: &QString);
 
@@ -256,6 +260,7 @@ pub(crate) enum Command {
     DeleteContact(String),
     ImportGpgKey,
     BatchAction { action: String, ids: Vec<String> },
+    EmptyFolder(String),
     CreateTag(String),
     DeleteTag(String),
     RenameFolder { token: String, name: String },
@@ -621,6 +626,14 @@ impl qobject::AppController {
                         notify_result(&qt, result, "Folder deleted");
                         snapshot_needed = true;
                     }
+                    Command::EmptyFolder(folder_label) => {
+                        let result = rt.block_on(async {
+                            runtime.empty_folder(&folder_label).await.map(|_| ()).map_err(|e| e.to_string())
+                        });
+                        notify_result(&qt, result, "Folder emptied");
+                        rt.block_on(snapshot(&runtime, &folder, selected.as_deref(), &qt));
+                        snapshot_needed = false;
+                    }
                     Command::BatchAction { action, ids } => {
                         let result = rt.block_on(async {
                             match action.as_str() {
@@ -845,6 +858,10 @@ impl qobject::AppController {
 
     pub fn delete_folder(self: &Self, token: &QString) {
         if let Some(tx) = &self.tx { let _ = tx.send(Command::DeleteFolder(token.to_string())); }
+    }
+
+    pub fn empty_folder(self: &Self, folder: &QString) {
+        if let Some(tx) = &self.tx { let _ = tx.send(Command::EmptyFolder(folder.to_string())); }
     }
 
     pub fn batch_action(self: &Self, action: &QString, ids: &QString) {
@@ -1280,6 +1297,50 @@ async fn handle_rpc(
                 .await
                 .map_err(|e| e.to_string())?;
             Ok(serde_json::json!({ "ok": true }))
+        }
+        "mail_pin" => {
+            let pinned = args
+                .get("pinned")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(true);
+            runtime.set_pinned(&ids(), pinned).await.map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({ "ok": true }))
+        }
+        "mail_from_sender_list" => {
+            let sender = args.get("sender").and_then(|v| v.as_str()).ok_or("sender is required")?;
+            let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
+            Ok(serde_json::to_value(runtime.messages_from_sender(sender, limit).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?)
+        }
+        "mail_from_sender_archive" => {
+            let sender = args.get("sender").and_then(|v| v.as_str()).ok_or("sender is required")?;
+            let rows = runtime.messages_from_sender(sender, 1000).map_err(|e| e.to_string())?;
+            let ids: Vec<String> = rows.into_iter().map(|m| m.id).collect();
+            runtime.move_messages(&ids, "archive").await.map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({ "count": ids.len() }))
+        }
+        "mail_from_sender_trash" => {
+            let sender = args.get("sender").and_then(|v| v.as_str()).ok_or("sender is required")?;
+            let rows = runtime.messages_from_sender(sender, 1000).map_err(|e| e.to_string())?;
+            let ids: Vec<String> = rows.into_iter().map(|m| m.id).collect();
+            runtime.trash_messages(&ids).await.map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({ "count": ids.len() }))
+        }
+        "mail_from_sender_move" => {
+            let sender = args.get("sender").and_then(|v| v.as_str()).ok_or("sender is required")?;
+            let folder = args.get("folder_token").and_then(|v| v.as_str()).ok_or("folder_token is required")?;
+            let rows = runtime.messages_from_sender(sender, 1000).map_err(|e| e.to_string())?;
+            let ids: Vec<String> = rows.into_iter().map(|m| m.id).collect();
+            runtime.move_messages(&ids, folder).await.map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({ "count": ids.len() }))
+        }
+        "mail_empty_folder" => {
+            let folder = args
+                .get("folder")
+                .and_then(|value| value.as_str())
+                .ok_or("folder is required")?;
+            Ok(serde_json::json!({
+                "deleted": runtime.empty_folder(folder).await.map_err(|e| e.to_string())?
+            }))
         }
         "mail_trash" => {
             runtime
