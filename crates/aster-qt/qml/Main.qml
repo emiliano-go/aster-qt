@@ -255,6 +255,10 @@ ApplicationWindow {
     property var recipientSuggestions: []
     property string replyInReplyTo: ""
     property string replyReferences: ""
+    property string composeExpiresAt: ""
+    property bool composeObscure: false
+    property string contextMessageId: ""
+    property string commandQuery: ""
 
     ListModel {
         id: conditionModel
@@ -740,6 +744,22 @@ ApplicationWindow {
         root.categoryFilter = "";
     }
 
+    function toggleRichFont(property) {
+        var selection = composeBody.cursorSelection;
+        selection["font"][property] = !selection["font"][property];
+        composeBody.forceActiveFocus();
+    }
+
+    function insertRichLink(url, label) {
+        var text = label && label.length > 0 ? label : url;
+        var start = composeBody.cursorPosition;
+        composeBody.insert(start, text);
+        composeBody.select(start, start + text.length);
+        composeBody.cursorSelection.linkTo(url);
+        composeBody.cursorPosition = start + text.length;
+        composeBody.forceActiveFocus();
+    }
+
     function wrapComposeSelection(before, after) {
         var start = composeBody.selectionStart;
         var end = composeBody.selectionEnd;
@@ -799,10 +819,43 @@ ApplicationWindow {
         root.composeAttachments = [];
         root.replyInReplyTo = "";
         root.replyReferences = "";
+        root.composeExpiresAt = "";
+        root.composeObscure = false;
         root.composeFrom = root.defaultIdentityAddress();
         root.draftId = "";
         root.editingDraftId = "";
         root.draftDirty = false;
+    }
+
+    readonly property var commandItems: {
+        var items = [
+            { label: "Go to Inbox", action: "inbox" },
+            { label: "Go to Starred", action: "starred" },
+            { label: "Go to All mail", action: "all" },
+            { label: "Go to Scheduled", action: "scheduled" },
+            { label: "Go to Snoozed", action: "snoozed" },
+            { label: "Go to Sent", action: "sent" },
+            { label: "Go to Drafts", action: "drafts" },
+            { label: "Go to Archive", action: "archive" },
+            { label: "Go to Junk", action: "spam" },
+            { label: "Go to Trash", action: "trash" },
+            { label: "Compose", action: "compose" },
+            { label: "Settings", action: "settings" },
+            { label: "Refresh mail", action: "refresh" }
+        ];
+        var query = commandQuery.trim().toLowerCase();
+        if (query.length === 0) return items;
+        return items.filter(function(item) { return item.label.toLowerCase().indexOf(query) !== -1; });
+    }
+
+    function runCommand(action) {
+        commandPalette.close();
+        if (action === "compose") return root.openCompose();
+        if (action === "settings") return root.openSettings("appearance");
+        if (action === "refresh") return app.refreshMail();
+        root.listFilter = "";
+        root.tagFilter = "";
+        app.openMailbox(action);
     }
 
     function openCompose() {
@@ -891,10 +944,14 @@ ApplicationWindow {
             cc: composeCc.text,
             bcc: composeBcc.text,
             subject: composeSubject.text,
-            body: composeBody.text,
+            body: composeBody.getText(0, composeBody.length),
+            html: composeBody.getFormattedText(0, composeBody.length),
+            plain: composeBody.getText(0, composeBody.length),
             attachments: root.composeAttachments.slice(),
             in_reply_to: root.replyInReplyTo,
-            references: root.replyReferences
+            references: root.replyReferences,
+            expires_at: root.composeExpiresAt,
+            obscure_subject: root.composeObscure
         };
     }
 
@@ -913,11 +970,7 @@ ApplicationWindow {
             app.deleteDraft(root.editingDraftId);
             root.editingDraftId = "";
         }
-        if (payload.in_reply_to || payload.references) {
-            app.sendThreadedMessage(payload.from, payload.to, payload.cc, payload.bcc, payload.subject, payload.body, JSON.stringify(payload.attachments), payload.in_reply_to || "", payload.references || "");
-        } else {
-            app.sendMessage(payload.from, payload.to, payload.cc, payload.bcc, payload.subject, payload.body, JSON.stringify(payload.attachments));
-        }
+        app.sendRichMessage(payload.from, payload.to, payload.cc, payload.bcc, payload.subject, payload.html || "", payload.plain || payload.body || "", JSON.stringify(payload.attachments), payload.in_reply_to || "", payload.references || "", payload.expires_at || "", payload.obscure_subject === true);
         root.composeOpen = false;
     }
 
@@ -1042,7 +1095,7 @@ ApplicationWindow {
             }
         }
     }
-    Shortcut { sequence: "/"; onActivated: searchInput.forceActiveFocus() }
+    Shortcut { sequences: ["Ctrl+K", "/"]; onActivated: { commandQuery = ""; commandPalette.open(); commandInput.forceActiveFocus(); } }
     Shortcut { sequence: "Ctrl+,"; onActivated: root.openSettings("appearance") }
 
     Timer {
@@ -1622,7 +1675,15 @@ ApplicationWindow {
         MouseArea {
             anchors.fill: parent
             cursorShape: Qt.PointingHandCursor
-            onClicked: row.activate()
+            acceptedButtons: Qt.LeftButton | Qt.RightButton
+            onClicked: function(mouse) {
+                if (mouse.button === Qt.RightButton) {
+                    root.contextMessageId = row.item ? row.item.id : "";
+                    if (root.contextMessageId.length > 0) messageContextMenu.popup();
+                } else {
+                    row.activate();
+                }
+            }
         }
     }
 
@@ -2484,6 +2545,26 @@ ApplicationWindow {
                     }
                     Rectangle {
                         Layout.fillWidth: true
+                        Layout.preferredHeight: 30
+                        color: "transparent"
+                        RowLayout {
+                            anchors.fill: parent
+                            anchors.leftMargin: n("space-4", 16)
+                            anchors.rightMargin: n("space-4", 16)
+                            spacing: n("space-2", 8)
+                            ModeChip { label: "Unread"; active: root.unreadOnly; onClicked: root.unreadOnly = !root.unreadOnly }
+                            ModeChip { label: "Starred"; active: root.filterStarred; onClicked: root.filterStarred = !root.filterStarred }
+                            ModeChip { label: "Attachments"; active: root.filterAttachmentsOnly; onClicked: root.filterAttachmentsOnly = !root.filterAttachmentsOnly }
+                            Item { Layout.fillWidth: true }
+                            LinkText {
+                                visible: root.unreadOnly || root.filterStarred || root.filterAttachmentsOnly
+                                text: "Clear chips"
+                                action: function() { root.unreadOnly = false; root.filterStarred = false; root.filterAttachmentsOnly = false }
+                            }
+                        }
+                    }
+                    Rectangle {
+                        Layout.fillWidth: true
                         Layout.preferredHeight: root.selectionMode ? 36 : 0
                         visible: root.selectionMode
                         color: c("surface", "#1b1e23")
@@ -2637,6 +2718,11 @@ ApplicationWindow {
                             icon: "check"
                             label: root.detail.is_read ? "Mark unread" : "Mark read"
                             onClicked: app.setRead(root.detail.id, !root.detail.is_read)
+                        }
+                        IconButton {
+                            icon: "printer"
+                            label: "Print"
+                            onClicked: app.printMessage(root.detail.id)
                         }
                         IconButton {
                             icon: "archive"
@@ -2943,6 +3029,14 @@ ApplicationWindow {
                                         font.pixelSize: n("font-size-small", 12)
                                         Layout.fillWidth: true
                                     }
+                                    LinkText {
+                                        text: "Details"
+                                        action: function() { externalDetailsPopup.open() }
+                                    }
+                                    LinkText {
+                                        text: "Load images"
+                                        action: function() { app.loadRemoteContent(root.detail.id) }
+                                    }
                                 }
                             }
 
@@ -3027,13 +3121,21 @@ ApplicationWindow {
                                 }
                             }
 
-                            Text {
+                            RowLayout {
+                                Layout.fillWidth: true
                                 visible: root.detail.attachments && root.detail.attachments.length > 0
-                                text: "Attachments"
-                                color: c("muted", "#a8ece7de")
-                                font.family: c("font-family", "Inter")
-                                font.pixelSize: n("font-size-micro", 11)
-                                font.weight: n("font-weight-medium", 500)
+                                Text {
+                                    text: "Attachments"
+                                    color: c("muted", "#a8ece7de")
+                                    font.family: c("font-family", "Inter")
+                                    font.pixelSize: n("font-size-micro", 11)
+                                    font.weight: n("font-weight-medium", 500)
+                                    Layout.fillWidth: true
+                                }
+                                LinkText {
+                                    text: "Save all"
+                                    action: function() { app.saveAllAttachments(root.detail.id) }
+                                }
                             }
                             Flow {
                                 Layout.fillWidth: true
@@ -4375,10 +4477,10 @@ ApplicationWindow {
                             if (template.length > 0) composeBody.text = template + "\n\n" + composeBody.text;
                         }
                     }
-                    LinkText { text: "Bold"; action: function() { root.wrapComposeSelection("**", "**") } }
-                    LinkText { text: "Italic"; action: function() { root.wrapComposeSelection("_", "_") } }
-                    LinkText { text: "Code"; action: function() { root.wrapComposeSelection("`", "`") } }
-                    LinkText { text: "Quote"; action: function() { root.insertComposeText("\n> ") } }
+                    LinkText { text: "Bold"; action: function() { root.toggleRichFont("bold") } }
+                    LinkText { text: "Italic"; action: function() { root.toggleRichFont("italic") } }
+                    LinkText { text: "Underline"; action: function() { root.toggleRichFont("underline") } }
+                    LinkText { text: "Strike"; action: function() { root.toggleRichFont("strikeout") } }
                     LinkText { text: "Link"; action: function() { composeLinkPopup.open() } }
                     LinkText { text: "Emoji"; action: function() { emojiPopup.open() } }
                     Item { Layout.fillWidth: true }
@@ -4407,15 +4509,16 @@ ApplicationWindow {
                         Accessible.editable: true
                         Accessible.multiLine: true
                         Accessible.focusable: true
+                        textFormat: TextEdit.RichText
                         color: c("text", "#ece7de")
-                        placeholderText: "# Hello\n\nWrite in Markdown. Bold, lists, links, quotes and code blocks are converted to email HTML and plain text."
+                        placeholderText: "Write your message…"
                         onTextChanged: { root.draftDirty = true; draftTimer.restart(); }
                         placeholderTextColor: c("muted", "#a8ece7de")
                         selectionColor: c("accent", "#d98e5c")
                         selectedTextColor: c("accent-ink", "#171717")
                         wrapMode: TextArea.Wrap
                         background: null
-                        font.family: c("font-mono", "JetBrains Mono")
+                        font.family: c("font-mail", "Inter")
                         font.pixelSize: n("font-size-small", 12)
                     }
                 }
@@ -4461,6 +4564,27 @@ ApplicationWindow {
                     }
                 }
 
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: n("space-2", 8)
+                    SettingsField {
+                        Layout.fillWidth: true
+                        placeholder: "Expires at YYYY-MM-DD HH:MM"
+                        testId: "compose-expires-at"
+                        onEdited: root.composeExpiresAt = value.trim().replace(" ", "T")
+                    }
+                    Text {
+                        text: "Obscure subject"
+                        color: c("text-2", "#dbebe7de")
+                        font.family: c("font-family", "Inter")
+                        font.pixelSize: n("font-size-small", 12)
+                    }
+                    Toggle {
+                        testId: "compose-obscure-subject"
+                        checked: root.composeObscure
+                        onToggled: root.composeObscure = !checked
+                    }
+                }
                 RowLayout {
                     Layout.fillWidth: true
                     spacing: n("space-2", 8)
@@ -4680,7 +4804,7 @@ ApplicationWindow {
                     text: "Insert"
                     action: function() {
                         var label = composeLinkText.text || composeLinkUrl.text;
-                        root.insertComposeText("[" + label + "](" + composeLinkUrl.text + ")");
+                        root.insertRichLink(composeLinkUrl.text, label);
                         composeLinkPopup.close();
                     }
                 }
@@ -4798,6 +4922,162 @@ ApplicationWindow {
                 color: c("muted", "#a8ece7de")
                 font.family: c("font-family", "Inter")
                 font.pixelSize: n("font-size-small", 12)
+            }
+        }
+    }
+
+    Menu {
+        id: messageContextMenu
+        MenuItem { text: "Open"; onTriggered: { if (root.contextMessageId) { root.readerOpen = true; app.selectMessage(root.contextMessageId) } } }
+        MenuSeparator {}
+        MenuItem { text: "Mark read"; onTriggered: app.setRead(root.contextMessageId, true) }
+        MenuItem { text: "Mark unread"; onTriggered: app.setRead(root.contextMessageId, false) }
+        MenuItem { text: "Star"; onTriggered: app.setStarred(root.contextMessageId, true) }
+        MenuItem { text: "Unstar"; onTriggered: app.setStarred(root.contextMessageId, false) }
+        MenuItem { text: "Pin"; onTriggered: app.setPinned(root.contextMessageId, true) }
+        MenuItem { text: "Unpin"; onTriggered: app.setPinned(root.contextMessageId, false) }
+        MenuSeparator {}
+        MenuItem { text: "Archive"; onTriggered: app.archiveMessage(root.contextMessageId) }
+        MenuItem { text: "Spam"; onTriggered: app.setSpam(root.contextMessageId, true) }
+        MenuItem { text: "Restore"; onTriggered: app.restoreMessage(root.contextMessageId) }
+        MenuItem { text: "Trash"; onTriggered: app.trashMessage(root.contextMessageId) }
+    }
+
+    Popup {
+        id: externalDetailsPopup
+        width: 520
+        height: 360
+        modal: true
+        focus: true
+        anchors.centerIn: Overlay.overlay
+        background: Rectangle {
+            color: c("menu", "#23262c")
+            border.width: n("border-width", 1)
+            border.color: c("border-strong", "#292e323a")
+            radius: n("radius-panel", 8)
+        }
+        ColumnLayout {
+            anchors.fill: parent
+            anchors.margins: n("space-4", 16)
+            spacing: n("space-2", 8)
+            RowLayout {
+                Layout.fillWidth: true
+                Text {
+                    text: "Blocked remote content"
+                    color: c("text", "#ece7de")
+                    font.family: c("font-family", "Inter")
+                    font.pixelSize: n("font-size-title", 16)
+                    font.weight: n("font-weight-semibold", 600)
+                    Layout.fillWidth: true
+                }
+                IconButton { icon: "close"; label: "Close details"; onClicked: externalDetailsPopup.close() }
+            }
+            ListView {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                clip: true
+                model: root.detail.external_content ? root.detail.external_content.blocked_items : []
+                spacing: 4
+                ScrollBar.vertical: MailScrollBar {}
+                delegate: Rectangle {
+                    width: ListView.view.width
+                    height: 48
+                    radius: n("radius-control", 2)
+                    color: c("card", "#23262c")
+                    ColumnLayout {
+                        anchors.fill: parent
+                        anchors.margins: n("space-2", 8)
+                        spacing: 1
+                        Text {
+                            text: modelData.kind
+                            color: c("text", "#ece7de")
+                            font.family: c("font-family", "Inter")
+                            font.pixelSize: n("font-size-small", 12)
+                            font.weight: n("font-weight-semibold", 600)
+                        }
+                        Text {
+                            text: modelData.detail || "Blocked for privacy"
+                            color: c("muted", "#a8ece7de")
+                            font.family: c("font-family", "Inter")
+                            font.pixelSize: n("font-size-micro", 11)
+                            elide: Text.ElideMiddle
+                            Layout.fillWidth: true
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Popup {
+        id: commandPalette
+        width: 520
+        height: 420
+        modal: true
+        focus: true
+        anchors.centerIn: Overlay.overlay
+        background: Rectangle {
+            color: c("menu", "#23262c")
+            border.width: n("border-width", 1)
+            border.color: c("border-strong", "#292e323a")
+            radius: n("radius-panel", 8)
+        }
+        ColumnLayout {
+            anchors.fill: parent
+            anchors.margins: n("space-4", 16)
+            spacing: n("space-2", 8)
+            TextInput {
+                id: commandInput
+                Layout.fillWidth: true
+                Layout.preferredHeight: n("control-height", 36)
+                color: c("text", "#ece7de")
+                selectionColor: c("accent", "#d98e5c")
+                selectedTextColor: c("accent-ink", "#171717")
+                font.family: c("font-family", "Inter")
+                font.pixelSize: n("font-size-body", 14)
+                onTextChanged: root.commandQuery = text
+                Keys.onEscapePressed: commandPalette.close()
+                Keys.onDownPressed: commandList.incrementCurrentIndex()
+                Keys.onUpPressed: commandList.decrementCurrentIndex()
+                Keys.onReturnPressed: if (commandList.currentIndex >= 0 && commandList.currentIndex < root.commandItems.length) root.runCommand(root.commandItems[commandList.currentIndex].action)
+                Text {
+                    anchors.fill: parent
+                    verticalAlignment: Text.AlignVCenter
+                    text: "Type a command…"
+                    color: c("muted", "#a8ece7de")
+                    visible: commandInput.text.length === 0
+                    font.family: c("font-family", "Inter")
+                    font.pixelSize: n("font-size-body", 14)
+                }
+            }
+            ListView {
+                id: commandList
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                clip: true
+                model: root.commandItems
+                currentIndex: 0
+                delegate: Rectangle {
+                    width: ListView.view.width
+                    height: 34
+                    radius: n("radius-control", 2)
+                    color: ListView.isCurrentItem ? c("selected", "#3d2e323a") : (cmdHover.hovered ? c("hover", "#2e2e323a") : "transparent")
+                    HoverHandler { id: cmdHover }
+                    Text {
+                        anchors.verticalCenter: parent.verticalCenter
+                        anchors.left: parent.left
+                        anchors.leftMargin: n("space-3", 12)
+                        text: modelData.label
+                        color: c("text", "#ece7de")
+                        font.family: c("font-family", "Inter")
+                        font.pixelSize: n("font-size-small", 12)
+                    }
+                    MouseArea {
+                        anchors.fill: parent
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: root.runCommand(modelData.action)
+                    }
+                }
             }
         }
     }
