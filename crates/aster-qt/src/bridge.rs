@@ -87,6 +87,10 @@ pub mod qobject {
         fn delete_draft(self: &Self, id: &QString);
 
         #[qinvokable]
+        #[cxx_name = "archiveMailingList"]
+        fn archive_mailing_list(self: &Self, list_id: &QString);
+
+        #[qinvokable]
         #[cxx_name = "emptyFolder"]
         fn empty_folder(self: &Self, folder: &QString);
 
@@ -268,6 +272,7 @@ pub(crate) enum Command {
     BatchAction { action: String, ids: Vec<String> },
     EmptyFolder(String),
     DeleteDraft(String),
+    ArchiveMailingList(String),
     CreateTag(String),
     DeleteTag(String),
     RenameFolder { token: String, name: String },
@@ -637,6 +642,14 @@ impl qobject::AppController {
                         notify_result(&qt, result, "Folder deleted");
                         snapshot_needed = true;
                     }
+                    Command::ArchiveMailingList(list_id) => {
+                        let result = rt.block_on(async {
+                            runtime.archive_mailing_list(&list_id).await.map(|_| ()).map_err(|e| e.to_string())
+                        });
+                        notify_result(&qt, result, "Mailing list archived");
+                        rt.block_on(snapshot(&runtime, &folder, selected.as_deref(), &qt));
+                        snapshot_needed = false;
+                    }
                     Command::DeleteDraft(id) => {
                         let result = rt.block_on(async {
                             runtime.delete_draft(&id).await.map_err(|e| e.to_string())
@@ -876,6 +889,10 @@ impl qobject::AppController {
 
     pub fn delete_folder(self: &Self, token: &QString) {
         if let Some(tx) = &self.tx { let _ = tx.send(Command::DeleteFolder(token.to_string())); }
+    }
+
+    pub fn archive_mailing_list(self: &Self, list_id: &QString) {
+        if let Some(tx) = &self.tx { let _ = tx.send(Command::ArchiveMailingList(list_id.to_string())); }
     }
 
     pub fn delete_draft(self: &Self, id: &QString) {
@@ -1331,6 +1348,10 @@ async fn handle_rpc(
                 .await
                 .map_err(|e| e.to_string())?;
             Ok(serde_json::json!({ "ok": true }))
+        }
+        "mailing_list_archive" => {
+            let list_id = args.get("list_id").and_then(|v| v.as_str()).ok_or("list_id is required")?;
+            Ok(serde_json::json!({"archived": runtime.archive_mailing_list(list_id).await.map_err(|e| e.to_string())?}))
         }
         "mail_pin" => {
             let pinned = args

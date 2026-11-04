@@ -723,6 +723,30 @@ impl ClientRuntime {
             .collect())
     }
 
+    pub async fn archive_mailing_list(&self, list_id: &str) -> ClientResult<usize> {
+        let rows = self
+            .db()
+            .list_cached_message_meta("inbox")
+            .map_err(ClientError::Storage)?;
+        let ids: Vec<String> = rows
+            .into_iter()
+            .filter(|row| {
+                row.raw_headers
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                    .and_then(|meta| meta.get("list_id").and_then(|v| v.as_str()).map(str::to_string))
+                    .as_deref()
+                    == Some(list_id)
+            })
+            .map(|row| row.aster_id)
+            .collect();
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        self.move_messages(&ids, "archive").await?;
+        Ok(ids.len())
+    }
+
     pub async fn set_pinned(&self, ids: &[String], pinned: bool) -> ClientResult<()> {
         let token = self.access_token().await;
         for id in ids {

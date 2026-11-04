@@ -45,5 +45,8 @@
 - Server-synced template create/list/delete.
 - Server-synced signature create/list/delete.
 - Draft edit path compiles and reuses the composer.
+- Local undo send window and scheduled send timer are wired in the composer.
+- Mailing list Archive all action is wired.
+- Server templates and signatures list in Settings and are preferred by the composer.
 - Aster key imported into the real system gpg-agent and listed with `gpg --list-secret-keys`.
 - Light, dark, and custom themes across all dialogs.

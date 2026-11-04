@@ -143,6 +143,9 @@ ApplicationWindow {
     property var aliasSelection: []
     property string composeFrom: ""
     property string editingDraftId: ""
+    property bool sendUndoVisible: false
+    property var pendingSend: null
+    readonly property var scheduledSends: root.settings.compose && root.settings.compose.scheduled ? root.settings.compose.scheduled : []
     property string activeIdentity: ""
     property var composeAttachments: []
     property bool toastVisible: false
@@ -461,6 +464,73 @@ ApplicationWindow {
                 + ", " + (root.detail.sender || "the sender") + " wrote:\n" + lines;
         }
         root.composeOpen = true;
+    }
+
+    function buildSendPayload() {
+        return {
+            from: root.composeFrom,
+            to: composeTo.text,
+            cc: composeCc.text,
+            bcc: composeBcc.text,
+            subject: composeSubject.text,
+            body: composeBody.text,
+            attachments: root.composeAttachments.slice()
+        };
+    }
+
+    function sendWithUndo() {
+        root.pendingSend = root.buildSendPayload();
+        root.sendUndoVisible = true;
+        sendUndoTimer.restart();
+    }
+
+    function performPendingSend() {
+        if (!root.pendingSend) return;
+        var payload = root.pendingSend;
+        root.pendingSend = null;
+        root.sendUndoVisible = false;
+        if (root.editingDraftId.length > 0) {
+            app.deleteDraft(root.editingDraftId);
+            root.editingDraftId = "";
+        }
+        app.sendMessage(payload.from, payload.to, payload.cc, payload.bcc, payload.subject, payload.body, JSON.stringify(payload.attachments));
+        root.composeOpen = false;
+    }
+
+    function cancelPendingSend() {
+        root.pendingSend = null;
+        root.sendUndoVisible = false;
+    }
+
+    function scheduleCurrentSend() {
+        var when = new Date(scheduleAtField.text);
+        if (isNaN(when.getTime())) return;
+        var payload = root.buildSendPayload();
+        payload.at = when.toISOString();
+        var list = root.scheduledSends.slice();
+        list.push(payload);
+        app.applySettings(JSON.stringify({ compose: { scheduled: list } }));
+        root.composeOpen = false;
+    }
+
+    function checkScheduledSends() {
+        if (!root.scheduledSends || root.scheduledSends.length === 0) return;
+        var now = Date.now();
+        var keep = [];
+        var due = [];
+        for (var i = 0; i < root.scheduledSends.length; i++) {
+            var item = root.scheduledSends[i];
+            var at = new Date(item.at).getTime();
+            if (!isNaN(at) && at <= now) due.push(item);
+            else keep.push(item);
+        }
+        if (due.length === 0) return;
+        app.applySettings(JSON.stringify({ compose: { scheduled: keep } }));
+        for (var j = 0; j < due.length; j++) {
+            var payload = due[j];
+            app.sendMessage(payload.from, payload.to, payload.cc, payload.bcc, payload.subject, payload.body, JSON.stringify(payload.attachments || []));
+        }
+        app.notify("Scheduled mail sent", due.length + " message(s) sent");
     }
 
     function openDraft() {
@@ -1622,6 +1692,11 @@ ApplicationWindow {
                             Item { Layout.fillWidth: true }
                             LinkText {
                                 visible: root.listFilter.length > 0
+                                text: "Archive all"
+                                action: function() { app.archiveMailingList(root.listFilter) }
+                            }
+                            LinkText {
+                                visible: root.listFilter.length > 0
                                 text: "All mail"
                                 action: function() { root.listFilter = "" }
                             }
@@ -2151,6 +2226,19 @@ ApplicationWindow {
         id: toastTimer
         interval: 4000
         onTriggered: root.toastVisible = false
+    }
+
+    Timer {
+        id: sendUndoTimer
+        interval: 5000
+        onTriggered: root.performPendingSend()
+    }
+
+    Timer {
+        interval: 15000
+        running: true
+        repeat: true
+        onTriggered: root.checkScheduledSends()
     }
 
     Rectangle {
@@ -2873,6 +2961,26 @@ ApplicationWindow {
     }
 
     Rectangle {
+        anchors.horizontalCenter: parent.horizontalCenter
+        anchors.bottom: parent.bottom
+        anchors.bottomMargin: n("statusbar-height", 30) + n("space-4", 16) + 40
+        width: undoSendRow.implicitWidth + n("space-4", 16) * 2
+        height: 34
+        radius: n("radius-control", 8)
+        color: c("surface-strong", "#2e323a")
+        border.width: n("border-width", 1)
+        border.color: c("border-strong", "#292e323a")
+        visible: root.sendUndoVisible
+        Row {
+            id: undoSendRow
+            anchors.centerIn: parent
+            spacing: n("space-3", 12)
+            Text { text: "Sending in 5 seconds"; color: c("text", "#ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-small", 12) }
+            LinkText { text: "Undo"; action: function() { root.cancelPendingSend() } }
+        }
+    }
+
+    Rectangle {
         anchors.fill: parent
         color: c("overlay", "#8c000000")
         visible: root.emptyConfirmOpen
@@ -3163,6 +3271,12 @@ ApplicationWindow {
                 RowLayout {
                     Layout.fillWidth: true
                     spacing: n("space-2", 8)
+                    SettingsField { id: scheduleAtField; Layout.fillWidth: true; placeholder: "Send at YYYY-MM-DD HH:MM" }
+                    LinkText { text: "Schedule"; action: function() { root.scheduleCurrentSend() } }
+                }
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: n("space-2", 8)
                     IconButton { icon: "attach"; label: "Attach"; onClicked: attachDialog.open() }
                     Item { Layout.fillWidth: true }
                     Text {
@@ -3188,14 +3302,7 @@ ApplicationWindow {
                         MouseArea {
                             anchors.fill: parent
                             cursorShape: Qt.PointingHandCursor
-                            onClicked: {
-                                if (root.editingDraftId.length > 0) {
-                                    app.deleteDraft(root.editingDraftId);
-                                    root.editingDraftId = "";
-                                }
-                                app.sendMessage(root.composeFrom, composeTo.text, composeCc.text, composeBcc.text, composeSubject.text, composeBody.text, JSON.stringify(root.composeAttachments));
-                                root.composeOpen = false;
-                            }
+                            onClicked: root.sendWithUndo()
                         }
                     }
                 }
