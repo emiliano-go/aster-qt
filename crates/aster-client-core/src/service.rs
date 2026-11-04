@@ -48,6 +48,22 @@ pub struct MessageView {
     pub thread_id: Option<String>,
     pub tags: Vec<String>,
     pub snoozed_until: Option<String>,
+    pub cc: Option<String>,
+    pub bcc: Option<String>,
+    pub reply_to: Option<String>,
+    pub routing_token: Option<String>,
+    pub spf_result: Option<String>,
+    pub dkim_result: Option<String>,
+    pub dmarc_result: Option<String>,
+    pub sender_verified: bool,
+    pub sender_verified_domain: Option<String>,
+    pub sender_aligned: bool,
+    pub phishing_level: Option<String>,
+    pub system_origin: bool,
+    pub scheduled_at: Option<String>,
+    pub send_status: Option<String>,
+    pub expires_at: Option<String>,
+    pub expiry_type: Option<String>,
     pub preview: String,
 }
 
@@ -62,6 +78,15 @@ pub struct CachedAttachmentView {
     pub is_cached: bool,
 }
 
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ExternalContentReport {
+    pub blocked_count: u32,
+    pub has_remote_images: bool,
+    pub has_tracking_pixels: bool,
+    pub has_remote_fonts: bool,
+    pub has_remote_css: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct MessageDetail {
     #[serde(flatten)]
@@ -69,6 +94,7 @@ pub struct MessageDetail {
     pub body: String,
     pub is_html: bool,
     pub body_html: String,
+    pub external_content: ExternalContentReport,
     pub sender_unverified: bool,
     pub not_end_to_end_encrypted: bool,
     pub attachments_unverified: bool,
@@ -113,23 +139,38 @@ impl ClientRuntime {
         Ok(out)
     }
 
-    /// Cached message metadata for a folder, newest first.
+    /// Cached message metadata for a folder or virtual view, newest first.
     pub fn messages(
         &self,
         folder: &str,
         limit: usize,
         offset: usize,
     ) -> ClientResult<Vec<MessageView>> {
-        let rows = if folder == "snoozed" {
+        let mut rows = if let Some(tag) = folder.strip_prefix("tag:") {
             self.db()
-                .list_snoozed_message_meta()
+                .list_tag_message_meta(tag)
                 .map_err(ClientError::Storage)?
+        } else if let Some(alias) = folder.strip_prefix("alias:") {
+            let alias = alias.to_lowercase();
+            self.db()
+                .list_message_meta_for_view("all")
+                .map_err(ClientError::Storage)?
+                .into_iter()
+                .filter(|row| {
+                    row.sender
+                        .as_deref()
+                        .is_some_and(|value| value.to_lowercase().contains(&alias))
+                        || row
+                            .recipients
+                            .as_deref()
+                            .is_some_and(|value| value.to_lowercase().contains(&alias))
+                })
+                .collect()
         } else {
             self.db()
-                .list_visible_message_meta(folder)
+                .list_message_meta_for_view(folder)
                 .map_err(ClientError::Storage)?
         };
-        let mut rows = rows;
         rows.sort_by(|a, b| b.date.cmp(&a.date));
         let mut out: Vec<MessageView> = rows
             .into_iter()
@@ -140,6 +181,19 @@ impl ClientRuntime {
         self.attach_tags(&mut out)?;
         self.attach_snoozes(&mut out)?;
         Ok(out)
+    }
+
+    pub fn view_counts(&self) -> ClientResult<serde_json::Value> {
+        let mut out = serde_json::Map::new();
+        for view in ["inbox", "starred", "all", "scheduled", "snoozed", "sent", "drafts", "archive", "spam", "trash"] {
+            if let Ok((total, unread)) = self.db().count_messages_for_view(view) {
+                out.insert(
+                    view.to_string(),
+                    serde_json::json!({ "total": total, "unread": unread }),
+                );
+            }
+        }
+        Ok(serde_json::Value::Object(out))
     }
 
     fn attach_snoozes(&self, messages: &mut [MessageView]) -> ClientResult<()> {
@@ -311,11 +365,13 @@ impl ClientRuntime {
             .as_deref()
             .and_then(|raw| serde_json::from_str(raw).ok())
             .unwrap_or(serde_json::Value::Null);
+        let external_content = external_content_report(&body, is_html);
         let mut detail = MessageDetail {
             message: view_of(&msg),
             body,
             is_html,
             body_html,
+            external_content,
             sender_unverified: aster_bridge_core::message_render::sender_unverified(&meta),
             not_end_to_end_encrypted: aster_bridge_core::message_render::not_end_to_end_encrypted(&meta),
             attachments_unverified: aster_bridge_core::message_render::attachments_unverified(&meta),
@@ -334,6 +390,33 @@ impl ClientRuntime {
             .find(|a| a.seq == seq)
             .map(|a| a.data)
             .ok_or_else(|| ClientError::Protocol(format!("attachment {}:{} not found", id, seq)))
+    }
+
+    pub fn attachment_preview(&self, id: &str, seq: i64) -> ClientResult<serde_json::Value> {
+        let attachment = self
+            .db()
+            .get_message_attachments(id)
+            .map_err(ClientError::Storage)?
+            .into_iter()
+            .find(|a| a.seq == seq)
+            .ok_or_else(|| ClientError::Protocol(format!("attachment {}:{} not found", id, seq)))?;
+        let mut value = serde_json::json!({
+            "name": attachment.name,
+            "content_type": attachment.content_type,
+            "size": attachment.size,
+        });
+        if attachment.content_type.starts_with("image/") {
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&attachment.data);
+            value["data_url"] = serde_json::json!(format!(
+                "data:{};base64,{}",
+                attachment.content_type, encoded
+            ));
+        } else if attachment.content_type.starts_with("text/")
+            || attachment.content_type == "application/json"
+        {
+            value["text"] = serde_json::json!(String::from_utf8_lossy(&attachment.data).to_string());
+        }
+        Ok(value)
     }
 
     pub async fn send_markdown(
@@ -428,6 +511,56 @@ impl ClientRuntime {
                     .map_err(|err| ClientError::Protocol(format!("gpg signing failed: {err}")))?;
             }
         }
+        let envelope_to = to
+            .iter()
+            .chain(cc.iter())
+            .chain(bcc.iter())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(",");
+        let id = self
+            .db()
+            .outbox_insert(&raw, &from, &envelope_to)
+            .map_err(ClientError::Storage)?;
+        self.outbox_tx
+            .send(id)
+            .await
+            .map_err(|_| ClientError::Session("outbox worker is not running".into()))?;
+        Ok(id)
+    }
+
+    pub async fn send_markdown_with_headers(
+        &self,
+        from: Option<&str>,
+        to: &[String],
+        cc: &[String],
+        bcc: &[String],
+        subject: &str,
+        markdown: &str,
+        attachments: &[PathBuf],
+        in_reply_to: Option<&str>,
+        references: Option<&str>,
+    ) -> ClientResult<i64> {
+        if to.is_empty() && cc.is_empty() && bcc.is_empty() {
+            return Err(ClientError::Protocol("add at least one recipient".into()));
+        }
+        let from = match from {
+            Some(value) if !value.trim().is_empty() => value.to_string(),
+            _ => self.session().read().await.default_sender_address(),
+        };
+        let message_id = in_reply_to;
+        let reference_chain = references;
+        let raw = build_markdown_mime(
+            &from,
+            to,
+            cc,
+            bcc,
+            subject,
+            markdown,
+            attachments,
+            message_id,
+            reference_chain,
+        )?;
         let envelope_to = to
             .iter()
             .chain(cc.iter())
@@ -542,6 +675,300 @@ impl ClientRuntime {
             .cancel_queued_send(&token, queue_id)
             .await
             .map_err(ClientError::from_bridge)
+    }
+
+    pub async fn schedule_markdown_with_attachments(
+        &self,
+        from: Option<&str>,
+        to: &[String],
+        cc: &[String],
+        bcc: &[String],
+        subject: &str,
+        markdown: &str,
+        attachments: &[PathBuf],
+        scheduled_at: &str,
+    ) -> ClientResult<String> {
+        if to.is_empty() && cc.is_empty() && bcc.is_empty() {
+            return Err(ClientError::Protocol("add at least one recipient".into()));
+        }
+        let (token, identity_key, default_from, identities) = {
+            let session = self.session().read().await;
+            (
+                session.access_token.to_string(),
+                session.identity_key.clone().ok_or_else(|| {
+                    ClientError::Session("scheduled keys are not unlocked".into())
+                })?,
+                session.default_sender_address(),
+                session.send_identities.clone(),
+            )
+        };
+        let from = from
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or(default_from);
+        let sender_identity = identities
+            .iter()
+            .find(|identity| identity.address.eq_ignore_ascii_case(&from));
+        let (_plain, html) = crate::compose::markdown_to_email(markdown);
+        let all_recipients: Vec<String> = to.iter().chain(cc.iter()).chain(bcc.iter()).cloned().collect();
+        let has_external = all_recipients
+            .iter()
+            .any(|address| !aster_bridge_core::crypto::internal_send::is_internal_address(address));
+        let has_internal = all_recipients
+            .iter()
+            .any(|address| aster_bridge_core::crypto::internal_send::is_internal_address(address));
+        let content = serde_json::json!({
+            "to_recipients": to,
+            "cc_recipients": cc,
+            "bcc_recipients": bcc,
+            "subject": subject,
+            "body": html,
+            "plain_body": markdown,
+            "scheduled_at": scheduled_at,
+            "from": {
+                "email": from,
+                "name": sender_identity.and_then(|identity| identity.display_name.clone()),
+            },
+        });
+        let recipients = serde_json::to_vec(&all_recipients)
+            .map_err(|e| ClientError::Protocol(format!("scheduled recipients: {e}")))?;
+        let envelope = serde_json::to_vec(&content)
+            .map_err(|e| ClientError::Protocol(format!("scheduled content: {e}")))?;
+        let (encrypted_envelope, envelope_nonce, ephemeral_key, base_nonce, recipients_enc) =
+            if has_external {
+                let (env, env_nonce, key, base) =
+                    aster_bridge_core::crypto::scheduled::encrypt_ephemeral(&envelope)
+                        .map_err(|e| ClientError::Protocol(format!("scheduled envelope: {e}")))?;
+                let (rec, rec_nonce, _, _) =
+                    aster_bridge_core::crypto::scheduled::encrypt_ephemeral(&recipients)
+                        .map_err(|e| ClientError::Protocol(format!("scheduled recipients: {e}")))?;
+                (env, env_nonce, Some(key), Some(base), (rec, rec_nonce))
+            } else {
+                let (env, env_nonce) =
+                    aster_bridge_core::crypto::scheduled::encrypt_local(&identity_key, &envelope)
+                        .map_err(|e| ClientError::Protocol(format!("scheduled envelope: {e}")))?;
+                let (rec, rec_nonce) =
+                    aster_bridge_core::crypto::scheduled::encrypt_local(&identity_key, &recipients)
+                        .map_err(|e| ClientError::Protocol(format!("scheduled recipients: {e}")))?;
+                (env, env_nonce, None, None, (rec, rec_nonce))
+            };
+        let mut body = serde_json::json!({
+            "encrypted_envelope": encrypted_envelope,
+            "envelope_nonce": envelope_nonce,
+            "encrypted_recipients": recipients_enc.0,
+            "recipients_nonce": recipients_enc.1,
+            "recipient_count": all_recipients.len(),
+            "scheduled_at": scheduled_at,
+            "is_external": has_external,
+        });
+        body["sender_email"] = serde_json::json!(from);
+        if let Some(identity) = sender_identity {
+            if let Some(hash) = identity.auth_hash_b64.as_ref() {
+                body["sender_alias_hash"] = serde_json::json!(hash);
+            }
+            if let Some(name) = identity.display_name.as_ref() {
+                body["sender_display_name"] = serde_json::json!(name);
+            }
+        }
+        if let Some(key) = ephemeral_key {
+            body["ephemeral_key"] = serde_json::json!(key);
+        }
+        if let Some(base) = base_nonce {
+            body["base_nonce"] = serde_json::json!(base);
+        }
+        if has_internal {
+            let raw = build_markdown_mime(&from, to, cc, bcc, subject, markdown, attachments, None, None)?;
+            let (payload, _) = aster_bridge_core::smtp::server::build_threaded_send_payload(
+                &raw,
+                Some(from.clone()),
+                all_recipients.clone(),
+                self.session(),
+                self.client(),
+                self.db(),
+            )
+            .await
+            .map_err(ClientError::from_bridge)?;
+            let internal_body = payload
+                .get("internal_encrypted_body")
+                .or_else(|| payload.get("body"))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            body["delivery"] = serde_json::json!({
+                "to": to,
+                "cc": cc,
+                "bcc": bcc,
+                "sender_email": payload.get("sender_email").cloned().unwrap_or(serde_json::Value::Null),
+                "sender_display_name": payload.get("sender_display_name").cloned().unwrap_or(serde_json::Value::Null),
+                "internal_encrypted_body": internal_body,
+                "recipient_bodies": payload.get("recipient_bodies").cloned().unwrap_or_else(|| serde_json::json!({})),
+                "hosted_recipients": payload.get("hosted_recipients").cloned().unwrap_or_else(|| serde_json::json!([])),
+            });
+            if let Some(hash) = payload.get("sender_alias_hash") {
+                body["sender_alias_hash"] = hash.clone();
+            }
+        }
+        let response = self
+            .client()
+            .create_scheduled(&token, &body)
+            .await
+            .map_err(ClientError::from_bridge)?;
+        let value = response.get("data").unwrap_or(&response);
+        value
+            .get("id")
+            .or_else(|| value.get("scheduled_email_id"))
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| ClientError::Protocol("scheduled response had no id".into()))
+    }
+
+    pub async fn refresh_scheduled(&self) -> ClientResult<()> {
+        let (token, identity_key, previous_keys) = {
+            let session = self.session().read().await;
+            (
+                session.access_token.to_string(),
+                session.identity_key.clone().ok_or_else(|| {
+                    ClientError::Session("scheduled keys are not unlocked".into())
+                })?,
+                session.previous_keys.to_vec(),
+            )
+        };
+        let listing = self
+            .client()
+            .list_scheduled(&token, 100, 0)
+            .await
+            .map_err(ClientError::from_bridge)?;
+        let value = listing.get("data").unwrap_or(&listing);
+        let items = value
+            .get("items")
+            .and_then(|value| value.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let mut current_ids = std::collections::HashSet::new();
+        for item in items {
+            let Some(id) = item.get("id").and_then(|value| value.as_str()) else {
+                continue;
+            };
+            if !matches!(
+                item.get("status").and_then(|value| value.as_str()).unwrap_or("pending"),
+                "pending" | "failed" | "sending"
+            ) {
+                continue;
+            }
+            let Ok(full) = self.client().get_scheduled(&token, id).await else {
+                continue;
+            };
+            let full = full.get("data").unwrap_or(&full);
+            let Some(encrypted) = full.get("encrypted_envelope").and_then(|value| value.as_str()) else {
+                continue;
+            };
+            let Some(nonce) = full.get("envelope_nonce").and_then(|value| value.as_str()) else {
+                continue;
+            };
+            let plaintext = if full.get("is_external").and_then(|value| value.as_bool()) == Some(true) {
+                full.get("ephemeral_key")
+                    .and_then(|value| value.as_str())
+                    .and_then(|key| {
+                        aster_bridge_core::crypto::scheduled::decrypt_ephemeral(
+                            encrypted, nonce, key,
+                        )
+                        .ok()
+                    })
+            } else {
+                aster_bridge_core::crypto::scheduled::decrypt_local(
+                    &identity_key,
+                    &previous_keys,
+                    encrypted,
+                    nonce,
+                )
+                .ok()
+            };
+            let Some(plaintext) = plaintext else {
+                continue;
+            };
+            let Ok(content) = serde_json::from_slice::<serde_json::Value>(&plaintext) else {
+                continue;
+            };
+            let subject = content
+                .get("subject")
+                .and_then(|value| value.as_str())
+                .unwrap_or("(no subject)");
+            let recipients = content
+                .get("to_recipients")
+                .and_then(|value| value.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|value| value.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            let body = content
+                .get("body")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            let scheduled_at = full
+                .get("scheduled_at")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            let meta = serde_json::json!({
+                "is_html": true,
+                "scheduled_at": scheduled_at,
+                "send_status": item.get("status").and_then(|value| value.as_str()).unwrap_or("pending"),
+                "cc": content.get("cc_recipients").cloned().unwrap_or_else(|| serde_json::json!([])),
+                "bcc": content.get("bcc_recipients").cloned().unwrap_or_else(|| serde_json::json!([])),
+            })
+            .to_string();
+            let _ = self.db().upsert_cached_message(
+                id,
+                "scheduled",
+                Some(subject),
+                None,
+                Some(&recipients),
+                Some(scheduled_at),
+                body.len() as i64,
+                Some(body),
+                Some(&meta),
+            );
+            current_ids.insert(id.to_string());
+        }
+        if let Ok(rows) = self.db().list_cached_message_meta("scheduled") {
+            for row in rows {
+                if !current_ids.contains(&row.aster_id) {
+                    let _ = self.db().delete_message_by_aster_id(&row.aster_id);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn cancel_scheduled(&self, id: &str) -> ClientResult<()> {
+        let token = self.access_token().await;
+        self.client()
+            .cancel_scheduled(&token, id)
+            .await
+            .map_err(ClientError::from_bridge)?;
+        let _ = self.db().delete_message_by_aster_id(id);
+        Ok(())
+    }
+
+    pub async fn send_scheduled_now(&self, id: &str) -> ClientResult<()> {
+        let token = self.access_token().await;
+        self.client()
+            .send_scheduled_now(&token, id)
+            .await
+            .map_err(ClientError::from_bridge)?;
+        let _ = self.db().delete_message_by_aster_id(id);
+        Ok(())
+    }
+
+    pub async fn reschedule(&self, id: &str, scheduled_at: &str) -> ClientResult<()> {
+        let token = self.access_token().await;
+        self.client()
+            .update_scheduled(&token, id, scheduled_at)
+            .await
+            .map_err(ClientError::from_bridge)?;
+        Ok(())
     }
 
     pub async fn server_templates(&self) -> ClientResult<Vec<TemplateView>> {
@@ -1108,6 +1535,37 @@ impl ClientRuntime {
         self.move_messages(ids, "trash").await
     }
 
+    pub async fn set_spam(&self, ids: &[String], spam: bool) -> ClientResult<()> {
+        let token = self.access_token().await;
+        let flags = if spam {
+            serde_json::json!({ "is_spam": true })
+        } else {
+            serde_json::json!({ "is_spam": false, "is_trashed": false })
+        };
+        for id in ids {
+            self.client()
+                .set_mailbox_flags(&token, id, flags.clone())
+                .await
+                .map_err(ClientError::from_bridge)?;
+        }
+        Ok(())
+    }
+
+    pub async fn restore_messages(&self, ids: &[String]) -> ClientResult<()> {
+        let token = self.access_token().await;
+        for id in ids {
+            self.client()
+                .set_mailbox_flags(
+                    &token,
+                    id,
+                    serde_json::json!({ "is_trashed": false, "is_spam": false }),
+                )
+                .await
+                .map_err(ClientError::from_bridge)?;
+        }
+        Ok(())
+    }
+
     pub async fn save_draft(
         &self,
         draft_id: Option<&str>,
@@ -1584,6 +2042,64 @@ fn view_of(msg: &CachedMessage) -> MessageView {
         thread_id: msg.thread_id.clone(),
         tags: Vec::new(),
         snoozed_until: None,
+        cc: meta.get("cc").and_then(|value| value.as_str()).map(str::to_string),
+        bcc: meta.get("bcc").and_then(|value| value.as_str()).map(str::to_string),
+        reply_to: meta
+            .get("reply_to")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        routing_token: meta
+            .get("routing_token")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        spf_result: meta
+            .get("spf_result")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        dkim_result: meta
+            .get("dkim_result")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        dmarc_result: meta
+            .get("dmarc_result")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        sender_verified: meta
+            .get("sender_verified")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
+        sender_verified_domain: meta
+            .get("sender_verified_domain")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        sender_aligned: meta
+            .get("sender_aligned")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
+        phishing_level: meta
+            .get("phishing_level")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        system_origin: meta
+            .get("system_origin")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
+        scheduled_at: meta
+            .get("scheduled_at")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        send_status: meta
+            .get("send_status")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        expires_at: meta
+            .get("expires_at")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        expiry_type: meta
+            .get("expiry_type")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
         preview: preview_of(msg.body_text.as_deref()),
     }
 }
@@ -1678,6 +2194,73 @@ impl ClientRuntime {
     }
 }
 
+fn build_markdown_mime(
+    from: &str,
+    to: &[String],
+    cc: &[String],
+    bcc: &[String],
+    subject: &str,
+    markdown: &str,
+    attachments: &[PathBuf],
+    in_reply_to: Option<&str>,
+    references: Option<&str>,
+) -> ClientResult<Vec<u8>> {
+    let (plain, mut html) = crate::compose::markdown_to_email(markdown);
+    let mut builder = MessageBuilder::new();
+    builder = builder.from(Address::new_address(None::<String>, from.to_string()));
+    builder = builder.subject(subject.to_string());
+    if let Some(value) = in_reply_to.filter(|value| !value.is_empty()) {
+        builder = builder.in_reply_to(value.to_string());
+    }
+    if let Some(value) = references.filter(|value| !value.is_empty()) {
+        builder = builder.references(value.to_string());
+    }
+    if !to.is_empty() {
+        builder = builder.to(Address::new_list(
+            to.iter()
+                .map(|email| Address::new_address(None::<String>, email.clone()))
+                .collect(),
+        ));
+    }
+    if !cc.is_empty() {
+        builder = builder.cc(Address::new_list(
+            cc.iter()
+                .map(|email| Address::new_address(None::<String>, email.clone()))
+                .collect(),
+        ));
+    }
+    if !bcc.is_empty() {
+        builder = builder.bcc(Address::new_list(
+            bcc.iter()
+                .map(|email| Address::new_address(None::<String>, email.clone()))
+                .collect(),
+        ));
+    }
+    for path in attachments {
+        let name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| ClientError::Protocol(format!("invalid attachment path: {}", path.display())))?;
+        let data = std::fs::read(path)
+            .map_err(|err| ClientError::Protocol(format!("read {}: {}", path.display(), err)))?;
+        let content_type = attachment_content_type(name);
+        let quoted = format!("src=\"{}\"", name);
+        let dotted = format!("src=\"./{}\"", name);
+        if content_type.starts_with("image/") && (html.contains(&quoted) || html.contains(&dotted)) {
+            let cid = format!("{}@aster", uuid::Uuid::new_v4().simple());
+            let cid_url = format!("src=\"cid:{}\"", cid);
+            html = html.replace(&quoted, &cid_url).replace(&dotted, &cid_url);
+            builder = builder.inline(content_type, cid, data);
+        } else {
+            builder = builder.attachment(content_type, name, data);
+        }
+    }
+    builder = builder.text_body(plain).html_body(html);
+    builder
+        .write_to_vec()
+        .map_err(|e| ClientError::Protocol(format!("build message: {e}")))
+}
+
 fn attachment_content_type(name: &str) -> &'static str {
     let lower = name.to_ascii_lowercase();
     let ext = lower.rsplit('.').next().unwrap_or("");
@@ -1703,6 +2286,43 @@ fn attachment_content_type(name: &str) -> &'static str {
         "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         _ => "application/octet-stream",
     }
+}
+
+fn external_content_report(body: &str, is_html: bool) -> ExternalContentReport {
+    if !is_html {
+        return ExternalContentReport::default();
+    }
+    let lower = body.to_ascii_lowercase();
+    let mut report = ExternalContentReport::default();
+    for img in lower.split("<img").skip(1) {
+        let tag = img.split('>').next().unwrap_or_default();
+        let remote = tag.contains("src=\"http") || tag.contains("src='http") || tag.contains("src=http");
+        if !remote {
+            continue;
+        }
+        report.has_remote_images = true;
+        report.blocked_count += 1;
+        let tiny = tag.contains("width=\"1\"")
+            || tag.contains("height=\"1\"")
+            || tag.contains("width='1'")
+            || tag.contains("height='1'")
+            || tag.contains("width:1px")
+            || tag.contains("height:1px")
+            || tag.contains("width: 1px")
+            || tag.contains("height: 1px");
+        if tiny {
+            report.has_tracking_pixels = true;
+        }
+    }
+    if lower.contains("@font-face") || lower.contains(".woff") || lower.contains(".ttf") {
+        report.has_remote_fonts = true;
+        report.blocked_count += 1;
+    }
+    if lower.contains("@import") || lower.contains("<link") {
+        report.has_remote_css = true;
+        report.blocked_count += 1;
+    }
+    report
 }
 
 fn safe_body_html(body: &str, is_html: bool) -> String {
