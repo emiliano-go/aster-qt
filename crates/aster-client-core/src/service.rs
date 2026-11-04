@@ -315,7 +315,7 @@ impl ClientRuntime {
             Some(value) if !value.trim().is_empty() => value.to_string(),
             _ => self.session().read().await.default_sender_address(),
         };
-        let (plain, html) = crate::compose::markdown_to_email(markdown);
+        let (plain, mut html) = crate::compose::markdown_to_email(markdown);
         let mut builder = MessageBuilder::new();
         builder = builder.from(Address::new_address(None::<String>, from.clone()));
         builder = builder.subject(subject.to_string());
@@ -340,7 +340,6 @@ impl ClientRuntime {
                     .collect(),
             ));
         }
-        builder = builder.text_body(plain).html_body(html);
         for path in attachments {
             let name = path
                 .file_name()
@@ -348,8 +347,21 @@ impl ClientRuntime {
                 .ok_or_else(|| ClientError::Protocol(format!("invalid attachment path: {}", path.display())))?;
             let data = std::fs::read(path)
                 .map_err(|err| ClientError::Protocol(format!("read {}: {}", path.display(), err)))?;
-            builder = builder.attachment(attachment_content_type(name), name, data);
+            let content_type = attachment_content_type(name);
+            let quoted = format!("src=\"{}\"", name);
+            let dotted = format!("src=\"./{}\"", name);
+            if content_type.starts_with("image/")
+                && (html.contains(&quoted) || html.contains(&dotted))
+            {
+                let cid = format!("{}@aster", uuid::Uuid::new_v4().simple());
+                let cid_url = format!("src=\"cid:{}\"", cid);
+                html = html.replace(&quoted, &cid_url).replace(&dotted, &cid_url);
+                builder = builder.inline(content_type, cid, data);
+            } else {
+                builder = builder.attachment(content_type, name, data);
+            }
         }
+        builder = builder.text_body(plain).html_body(html);
         let mut raw = builder
             .write_to_vec()
             .map_err(|e| ClientError::Protocol(format!("build message: {e}")))?;

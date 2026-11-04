@@ -3280,7 +3280,7 @@ ApplicationWindow {
                     IconButton { icon: "attach"; label: "Attach"; onClicked: attachDialog.open() }
                     Item { Layout.fillWidth: true }
                     Text {
-                        text: "Markdown is converted to HTML and plain text before sending."
+                        text: "Markdown is converted to HTML and plain text. Reference an attached image by filename to embed it inline."
                         color: c("muted", "#a8ece7de")
                         font.family: c("font-family", "Inter")
                         font.pixelSize: n("font-size-micro", 11)
