@@ -50,6 +50,8 @@ pub mod qobject {
         #[qproperty(QString, templates_json, cxx_name = "templatesJson")]
         #[qproperty(QString, signatures_json, cxx_name = "signaturesJson")]
         #[qproperty(QString, outbox_json, cxx_name = "outboxJson")]
+        #[qproperty(QString, recipient_key_json, cxx_name = "recipientKeyJson")]
+        #[qproperty(QString, diagnostics_json, cxx_name = "diagnosticsJson")]
         #[qproperty(QString, folder_id, cxx_name = "folderId")]
         #[qproperty(bool, loading, cxx_name = "loading")]
         #[qproperty(bool, ready, cxx_name = "ready")]
@@ -103,6 +105,10 @@ pub mod qobject {
         #[cxx_name = "confirmDelete"]
         fn confirm_delete(self: Pin<&mut Self>, token: QString, ids: QString);
 
+        #[qsignal]
+        #[cxx_name = "draftSaved"]
+        fn draft_saved(self: Pin<&mut Self>, id: QString);
+
         #[qinvokable]
         #[cxx_name = "resolveDelete"]
         fn resolve_delete(self: &Self, token: &QString, approved: bool);
@@ -116,8 +122,44 @@ pub mod qobject {
         fn delete_tag(self: &Self, token: &QString);
 
         #[qinvokable]
+        #[cxx_name = "createServerTemplate"]
+        fn create_server_template(self: &Self, name: &QString, category: &QString, content: &QString);
+
+        #[qinvokable]
+        #[cxx_name = "deleteServerTemplate"]
+        fn delete_server_template(self: &Self, id: &QString);
+
+        #[qinvokable]
+        #[cxx_name = "createServerSignature"]
+        fn create_server_signature(self: &Self, name: &QString, content: &QString);
+
+        #[qinvokable]
+        #[cxx_name = "deleteServerSignature"]
+        fn delete_server_signature(self: &Self, id: &QString);
+
+        #[qinvokable]
+        #[cxx_name = "setDefaultSignature"]
+        fn set_default_signature(self: &Self, id: &QString);
+
+        #[qinvokable]
+        #[cxx_name = "assignTag"]
+        fn assign_tag(self: &Self, ids: &QString, token: &QString);
+
+        #[qinvokable]
+        #[cxx_name = "removeTag"]
+        fn remove_tag(self: &Self, ids: &QString, token: &QString);
+
+        #[qinvokable]
+        #[cxx_name = "createFolder"]
+        fn create_folder(self: &Self, name: &QString, parent: &QString);
+
+        #[qinvokable]
         #[cxx_name = "renameFolder"]
         fn rename_folder(self: &Self, token: &QString, name: &QString);
+
+        #[qinvokable]
+        #[cxx_name = "moveFolder"]
+        fn move_folder(self: &Self, token: &QString, parent: &QString);
 
         #[qinvokable]
         #[cxx_name = "deleteFolder"]
@@ -126,6 +168,27 @@ pub mod qobject {
         #[qinvokable]
         #[cxx_name = "setPinned"]
         fn set_pinned(self: &Self, id: &QString, pinned: bool);
+
+        #[qinvokable]
+        #[cxx_name = "snoozeMessages"]
+        fn snooze_messages(self: &Self, ids: &QString, until: &QString);
+
+        #[qinvokable]
+        #[cxx_name = "unsnoozeMessage"]
+        fn unsnooze_message(self: &Self, id: &QString);
+
+        #[qinvokable]
+        #[cxx_name = "saveDraft"]
+        fn save_draft(
+            self: &Self,
+            id: &QString,
+            to: &QString,
+            cc: &QString,
+            bcc: &QString,
+            subject: &QString,
+            message: &QString,
+            attachments_json: &QString,
+        );
 
         #[qinvokable]
         #[cxx_name = "deleteDraft"]
@@ -200,8 +263,36 @@ pub mod qobject {
         fn retry_outbox(self: &Self, id: i64);
 
         #[qinvokable]
+        #[cxx_name = "showRecipientKey"]
+        fn show_recipient_key(self: &Self, address: &QString);
+
+        #[qinvokable]
+        #[cxx_name = "acceptRecipientKey"]
+        fn accept_recipient_key(self: &Self, address: &QString, fingerprint: &QString);
+
+        #[qinvokable]
+        #[cxx_name = "loadDiagnostics"]
+        fn load_diagnostics(self: &Self);
+
+        #[qinvokable]
+        #[cxx_name = "repairCache"]
+        fn repair_cache(self: &Self);
+
+        #[qinvokable]
+        #[cxx_name = "signOut"]
+        fn sign_out(self: &Self, keep_cache: bool);
+
+        #[qinvokable]
         #[cxx_name = "createRuleJson"]
         fn create_rule_json(self: &Self, body: &QString);
+
+        #[qinvokable]
+        #[cxx_name = "updateRuleJson"]
+        fn update_rule_json(self: &Self, id: &QString, body: &QString);
+
+        #[qinvokable]
+        #[cxx_name = "reorderRules"]
+        fn reorder_rules(self: &Self, ids: &QString);
 
         #[qinvokable]
         #[cxx_name = "deleteRule"]
@@ -299,7 +390,14 @@ pub(crate) enum Command {
     LoadSettingsData,
     LoadOutbox,
     RetryOutbox(i64),
+    ShowRecipientKey(String),
+    AcceptRecipientKey(String, String),
+    LoadDiagnostics,
+    RepairCache,
+    SignOut(bool),
     CreateRule(String),
+    UpdateRule { id: String, body: String },
+    ReorderRules(Vec<String>),
     DeleteRule(String),
     RunRule(String),
     RouteAlias(String, String),
@@ -324,9 +422,20 @@ pub(crate) enum Command {
     ImportGpgKey,
     BatchAction { action: String, ids: Vec<String> },
     EmptyFolder(String),
+    SaveDraft {
+        id: String,
+        to: String,
+        cc: String,
+        bcc: String,
+        subject: String,
+        message: String,
+        attachments: String,
+    },
     DeleteDraft(String),
     ArchiveMailingList(String),
     SetPinned { id: String, pinned: bool },
+    SnoozeMessages { ids: Vec<String>, until: String },
+    UnsnoozeMessage(String),
     BulkUnsubscribe(Vec<String>),
     ArchiveNewsletters,
     QueueMessage {
@@ -344,7 +453,16 @@ pub(crate) enum Command {
     CancelQueued(String),
     CreateTag(String),
     DeleteTag(String),
+    AssignTag { ids: Vec<String>, token: String },
+    RemoveTag { ids: Vec<String>, token: String },
+    CreateServerTemplate { name: String, category: String, content: String },
+    DeleteServerTemplate(String),
+    CreateServerSignature { name: String, content: String },
+    DeleteServerSignature(String),
+    SetDefaultSignature(String),
+    CreateFolder { name: String, parent: String },
     RenameFolder { token: String, name: String },
+    MoveFolder { token: String, parent: String },
     DeleteFolder(String),
     SaveAttachment { id: String, seq: i64 },
 }
@@ -377,6 +495,8 @@ pub struct AppControllerRust {
     templates_json: QString,
     signatures_json: QString,
     outbox_json: QString,
+    recipient_key_json: QString,
+    diagnostics_json: QString,
     folder_id: QString,
     loading: bool,
     ready: bool,
@@ -426,6 +546,8 @@ impl Default for AppControllerRust {
             templates_json: "[]".into(),
             signatures_json: "[]".into(),
             outbox_json: "[]".into(),
+            recipient_key_json: "{}".into(),
+            diagnostics_json: "{}".into(),
             folder_id: "inbox".into(),
             loading: true,
             ready: false,
@@ -547,6 +669,56 @@ impl qobject::AppController {
                         rt.block_on(push_settings_data(&runtime, &qt));
                         snapshot_needed = false;
                     }
+                    Command::ShowRecipientKey(address) => {
+                        match rt.block_on(runtime.recipient_key_show(&address)) {
+                            Ok(value) => {
+                                let json = value.to_string();
+                                let _ = qt.queue(move |mut q| q.as_mut().set_recipient_key_json(json.into()));
+                            }
+                            Err(err) => {
+                                let message = err.to_string();
+                                let _ = qt.queue(move |mut q| q.as_mut().set_toast_text(message.into()));
+                            }
+                        }
+                        snapshot_needed = false;
+                    }
+                    Command::AcceptRecipientKey(address, fingerprint) => {
+                        let result = rt.block_on(runtime.recipient_key_accept(&address, &fingerprint));
+                        notify_result(&qt, result.map(|_| ()).map_err(|e| e.to_string()), "Recipient key accepted");
+                        snapshot_needed = false;
+                    }
+                    Command::SignOut(keep_cache) => {
+                        match runtime.sign_out(keep_cache) {
+                            Ok(()) => {
+                                let _ = qt.queue(move |mut q| q.as_mut().set_toast_text("Signed out".into()));
+                                rt.block_on(runtime.stop());
+                                std::process::exit(0);
+                            }
+                            Err(err) => {
+                                let message = err.to_string();
+                                let _ = qt.queue(move |mut q| q.as_mut().set_toast_text(message.into()));
+                            }
+                        }
+                        snapshot_needed = false;
+                    }
+                    Command::RepairCache => {
+                        let result = runtime.repair_cache().map_err(|e| e.to_string());
+                        notify_result(&qt, result, "Cache repaired");
+                        snapshot_needed = false;
+                    }
+                    Command::LoadDiagnostics => {
+                        match runtime.diagnostics() {
+                            Ok(value) => {
+                                let json = value.to_string();
+                                let _ = qt.queue(move |mut q| q.as_mut().set_diagnostics_json(json.into()));
+                            }
+                            Err(err) => {
+                                let message = err.to_string();
+                                let _ = qt.queue(move |mut q| q.as_mut().set_toast_text(message.into()));
+                            }
+                        }
+                        snapshot_needed = false;
+                    }
                     Command::LoadOutbox => {
                         rt.block_on(push_outbox_data(&runtime, &qt));
                         snapshot_needed = false;
@@ -557,6 +729,24 @@ impl qobject::AppController {
                         });
                         notify_result(&qt, result, "Outbox retry queued");
                         rt.block_on(push_outbox_data(&runtime, &qt));
+                        snapshot_needed = false;
+                    }
+                    Command::UpdateRule { id, body } => {
+                        let result = rt.block_on(async {
+                            let value: serde_json::Value = serde_json::from_str(&body)
+                                .map_err(|e| format!("invalid rule JSON: {e}"))?;
+                            runtime.update_rule(&id, value).await.map(|_| ()).map_err(|e| e.to_string())
+                        });
+                        notify_result(&qt, result, "Rule updated");
+                        rt.block_on(push_settings_data(&runtime, &qt));
+                        snapshot_needed = false;
+                    }
+                    Command::ReorderRules(ids) => {
+                        let result = rt.block_on(async {
+                            runtime.reorder_rules(&ids).await.map_err(|e| e.to_string())
+                        });
+                        notify_result(&qt, result, "Rules reordered");
+                        rt.block_on(push_settings_data(&runtime, &qt));
                         snapshot_needed = false;
                     }
                     Command::CreateRule(body) => {
@@ -681,6 +871,60 @@ impl qobject::AppController {
                         let _ = qt.queue(move |mut q| q.as_mut().set_toast_text(message.into()));
                         snapshot_needed = false;
                     }
+                    Command::CreateServerTemplate { name, category, content } => {
+                        let result = rt.block_on(async {
+                            runtime.create_server_template(&name, &category, &content).await.map(|_| ())
+                                .map_err(|e| e.to_string())
+                        });
+                        notify_result(&qt, result, "Template created");
+                        rt.block_on(push_settings_data(&runtime, &qt));
+                        snapshot_needed = false;
+                    }
+                    Command::DeleteServerTemplate(id) => {
+                        let result = rt.block_on(async {
+                            runtime.delete_server_template(&id).await.map_err(|e| e.to_string())
+                        });
+                        notify_result(&qt, result, "Template deleted");
+                        rt.block_on(push_settings_data(&runtime, &qt));
+                        snapshot_needed = false;
+                    }
+                    Command::CreateServerSignature { name, content } => {
+                        let result = rt.block_on(async {
+                            runtime.create_server_signature(&name, &content).await.map(|_| ())
+                                .map_err(|e| e.to_string())
+                        });
+                        notify_result(&qt, result, "Signature created");
+                        rt.block_on(push_settings_data(&runtime, &qt));
+                        snapshot_needed = false;
+                    }
+                    Command::DeleteServerSignature(id) => {
+                        let result = rt.block_on(async {
+                            runtime.delete_server_signature(&id).await.map_err(|e| e.to_string())
+                        });
+                        notify_result(&qt, result, "Signature deleted");
+                        rt.block_on(push_settings_data(&runtime, &qt));
+                        snapshot_needed = false;
+                    }
+                    Command::SetDefaultSignature(id) => {
+                        let result = rt.block_on(async {
+                            runtime.set_default_signature(&id).await.map_err(|e| e.to_string())
+                        });
+                        notify_result(&qt, result, "Default signature updated");
+                        rt.block_on(push_settings_data(&runtime, &qt));
+                        snapshot_needed = false;
+                    }
+                    Command::AssignTag { ids, token } => {
+                        let result = rt.block_on(async {
+                            runtime.assign_tag(&ids, &token).await.map_err(|e| e.to_string())
+                        });
+                        notify_result(&qt, result, "Tag applied");
+                    }
+                    Command::RemoveTag { ids, token } => {
+                        let result = rt.block_on(async {
+                            runtime.remove_tag(&ids, &token).await.map_err(|e| e.to_string())
+                        });
+                        notify_result(&qt, result, "Tag removed");
+                    }
                     Command::CreateTag(name) => {
                         let result = rt.block_on(async {
                             runtime.create_tag(&name).await.map(|_| ()).map_err(|e| e.to_string())
@@ -696,6 +940,25 @@ impl qobject::AppController {
                         notify_result(&qt, result, "Tag deleted");
                         rt.block_on(push_settings_data(&runtime, &qt));
                         snapshot_needed = false;
+                    }
+                    Command::CreateFolder { name, parent } => {
+                        let result = rt.block_on(async {
+                            runtime
+                                .create_folder(&name, if parent.is_empty() { None } else { Some(&parent) })
+                                .await
+                                .map(|_| ())
+                                .map_err(|e| e.to_string())
+                        });
+                        notify_result(&qt, result, "Folder created");
+                    }
+                    Command::MoveFolder { token, parent } => {
+                        let result = rt.block_on(async {
+                            runtime
+                                .move_folder(&token, if parent.is_empty() { None } else { Some(&parent) })
+                                .await
+                                .map_err(|e| e.to_string())
+                        });
+                        notify_result(&qt, result, "Folder moved");
                     }
                     Command::RenameFolder { token, name } => {
                         let result = rt.block_on(async {
@@ -784,6 +1047,18 @@ impl qobject::AppController {
                         rt.block_on(snapshot(&runtime, &folder, selected.as_deref(), &qt));
                         snapshot_needed = false;
                     }
+                    Command::SnoozeMessages { ids, until } => {
+                        let result = rt.block_on(async {
+                            runtime.snooze_messages(&ids, &until).await.map_err(|e| e.to_string())
+                        });
+                        notify_result(&qt, result, "Message snoozed");
+                    }
+                    Command::UnsnoozeMessage(id) => {
+                        let result = rt.block_on(async {
+                            runtime.unsnooze_message(&id).await.map_err(|e| e.to_string())
+                        });
+                        notify_result(&qt, result, "Message unsnoozed");
+                    }
                     Command::SetPinned { id, pinned } => {
                         let result = rt.block_on(async {
                             runtime.set_pinned(&[id.clone()], pinned).await.map_err(|e| e.to_string())
@@ -798,6 +1073,40 @@ impl qobject::AppController {
                         });
                         notify_result(&qt, result, "Mailing list archived");
                         rt.block_on(snapshot(&runtime, &folder, selected.as_deref(), &qt));
+                        snapshot_needed = false;
+                    }
+                    Command::SaveDraft { id, to, cc, bcc, subject, message, attachments } => {
+                        let result = rt.block_on(async {
+                            let parse = |value: String| -> Vec<String> {
+                                value.split(',').map(str::trim).filter(|part| !part.is_empty()).map(str::to_string).collect()
+                            };
+                            let attachments: Vec<std::path::PathBuf> =
+                                serde_json::from_str::<Vec<String>>(&attachments)
+                                    .unwrap_or_default()
+                                    .into_iter()
+                                    .map(std::path::PathBuf::from)
+                                    .collect();
+                            runtime
+                                .save_draft(
+                                    if id.is_empty() { None } else { Some(&id) },
+                                    &parse(to),
+                                    &parse(cc),
+                                    &parse(bcc),
+                                    &subject,
+                                    &message,
+                                    &attachments,
+                                )
+                                .await
+                                .map_err(|e| e.to_string())
+                        });
+                        match result {
+                            Ok(id) => {
+                                let _ = qt.queue(move |mut q| q.as_mut().draft_saved(id.into()));
+                            }
+                            Err(err) => {
+                                let _ = qt.queue(move |mut q| q.as_mut().set_toast_text(err.into()));
+                            }
+                        }
                         snapshot_needed = false;
                     }
                     Command::DeleteDraft(id) => {
@@ -967,9 +1276,52 @@ impl qobject::AppController {
         }
     }
 
+    pub fn show_recipient_key(self: &Self, address: &QString) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Command::ShowRecipientKey(address.to_string()));
+        }
+    }
+
+    pub fn accept_recipient_key(self: &Self, address: &QString, fingerprint: &QString) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Command::AcceptRecipientKey(address.to_string(), fingerprint.to_string()));
+        }
+    }
+
+    pub fn load_diagnostics(self: &Self) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Command::LoadDiagnostics);
+        }
+    }
+
+    pub fn repair_cache(self: &Self) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Command::RepairCache);
+        }
+    }
+
+    pub fn sign_out(self: &Self, keep_cache: bool) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Command::SignOut(keep_cache));
+        }
+    }
+
     pub fn create_rule_json(self: &Self, body: &QString) {
         if let Some(tx) = &self.tx {
             let _ = tx.send(Command::CreateRule(body.to_string()));
+        }
+    }
+
+    pub fn update_rule_json(self: &Self, id: &QString, body: &QString) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Command::UpdateRule { id: id.to_string(), body: body.to_string() });
+        }
+    }
+
+    pub fn reorder_rules(self: &Self, ids: &QString) {
+        if let Some(tx) = &self.tx {
+            let ids: Vec<String> = serde_json::from_str(&ids.to_string()).unwrap_or_default();
+            let _ = tx.send(Command::ReorderRules(ids));
         }
     }
 
@@ -1031,9 +1383,63 @@ impl qobject::AppController {
         if let Some(tx) = &self.tx { let _ = tx.send(Command::DeleteTag(token.to_string())); }
     }
 
+    pub fn assign_tag(self: &Self, ids: &QString, token: &QString) {
+        if let Some(tx) = &self.tx {
+            let ids: Vec<String> = serde_json::from_str(&ids.to_string()).unwrap_or_default();
+            let _ = tx.send(Command::AssignTag { ids, token: token.to_string() });
+        }
+    }
+
+    pub fn remove_tag(self: &Self, ids: &QString, token: &QString) {
+        if let Some(tx) = &self.tx {
+            let ids: Vec<String> = serde_json::from_str(&ids.to_string()).unwrap_or_default();
+            let _ = tx.send(Command::RemoveTag { ids, token: token.to_string() });
+        }
+    }
+
+    pub fn create_folder(self: &Self, name: &QString, parent: &QString) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Command::CreateFolder { name: name.to_string(), parent: parent.to_string() });
+        }
+    }
+
+    pub fn create_server_template(self: &Self, name: &QString, category: &QString, content: &QString) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Command::CreateServerTemplate {
+                name: name.to_string(),
+                category: category.to_string(),
+                content: content.to_string(),
+            });
+        }
+    }
+
+    pub fn delete_server_template(self: &Self, id: &QString) {
+        if let Some(tx) = &self.tx { let _ = tx.send(Command::DeleteServerTemplate(id.to_string())); }
+    }
+
+    pub fn create_server_signature(self: &Self, name: &QString, content: &QString) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Command::CreateServerSignature { name: name.to_string(), content: content.to_string() });
+        }
+    }
+
+    pub fn delete_server_signature(self: &Self, id: &QString) {
+        if let Some(tx) = &self.tx { let _ = tx.send(Command::DeleteServerSignature(id.to_string())); }
+    }
+
+    pub fn set_default_signature(self: &Self, id: &QString) {
+        if let Some(tx) = &self.tx { let _ = tx.send(Command::SetDefaultSignature(id.to_string())); }
+    }
+
     pub fn rename_folder(self: &Self, token: &QString, name: &QString) {
         if let Some(tx) = &self.tx {
             let _ = tx.send(Command::RenameFolder { token: token.to_string(), name: name.to_string() });
+        }
+    }
+
+    pub fn move_folder(self: &Self, token: &QString, parent: &QString) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Command::MoveFolder { token: token.to_string(), parent: parent.to_string() });
         }
     }
 
@@ -1119,8 +1525,44 @@ impl qobject::AppController {
         }
     }
 
+    pub fn snooze_messages(self: &Self, ids: &QString, until: &QString) {
+        if let Some(tx) = &self.tx {
+            let ids: Vec<String> = serde_json::from_str(&ids.to_string()).unwrap_or_default();
+            let _ = tx.send(Command::SnoozeMessages { ids, until: until.to_string() });
+        }
+    }
+
+    pub fn unsnooze_message(self: &Self, id: &QString) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Command::UnsnoozeMessage(id.to_string()));
+        }
+    }
+
     pub fn archive_mailing_list(self: &Self, list_id: &QString) {
         if let Some(tx) = &self.tx { let _ = tx.send(Command::ArchiveMailingList(list_id.to_string())); }
+    }
+
+    pub fn save_draft(
+        self: &Self,
+        id: &QString,
+        to: &QString,
+        cc: &QString,
+        bcc: &QString,
+        subject: &QString,
+        message: &QString,
+        attachments_json: &QString,
+    ) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Command::SaveDraft {
+                id: id.to_string(),
+                to: to.to_string(),
+                cc: cc.to_string(),
+                bcc: bcc.to_string(),
+                subject: subject.to_string(),
+                message: message.to_string(),
+                attachments: attachments_json.to_string(),
+            });
+        }
     }
 
     pub fn delete_draft(self: &Self, id: &QString) {
@@ -1689,6 +2131,68 @@ async fn handle_rpc(
         "rules_create" => {
             let rule = args.get("rule").cloned().ok_or("rule is required")?;
             Ok(runtime.create_rule(rule).await.map_err(|e| e.to_string())?)
+        }
+        "rules_update" => {
+            let id = args.get("id").and_then(|v| v.as_str()).ok_or("id is required")?;
+            let rule = args.get("rule").cloned().ok_or("rule is required")?;
+            runtime.update_rule(id, rule).await.map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({ "ok": true }))
+        }
+        "rules_reorder" => {
+            let order: Vec<String> = args
+                .get("order")
+                .and_then(|v| v.as_array())
+                .ok_or("order is required")?
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect();
+            runtime.reorder_rules(&order).await.map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({ "ok": true }))
+        }
+        "draft_save" => {
+            let id = args.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            let parse = |name: &str| -> Vec<String> {
+                args.get(name)
+                    .and_then(|v| v.as_str())
+                    .map(|value| value.split(',').map(str::trim).filter(|p| !p.is_empty()).map(str::to_string).collect())
+                    .unwrap_or_default()
+            };
+            let attachments: Vec<std::path::PathBuf> = args
+                .get("attachments")
+                .and_then(|v| v.as_array())
+                .map(|items| items.iter().filter_map(|v| v.as_str()).map(std::path::PathBuf::from).collect())
+                .unwrap_or_default();
+            let id = runtime
+                .save_draft(
+                    if id.is_empty() { None } else { Some(id) },
+                    &parse("to"),
+                    &parse("cc"),
+                    &parse("bcc"),
+                    args.get("subject").and_then(|v| v.as_str()).unwrap_or(""),
+                    args.get("message").and_then(|v| v.as_str()).unwrap_or(""),
+                    &attachments,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({ "id": id }))
+        }
+        "recipient_key_show" => runtime
+            .recipient_key_show(args.get("address").and_then(|v| v.as_str()).ok_or("address is required")?)
+            .await
+            .map_err(|e| e.to_string()),
+        "recipient_key_accept" => {
+            let address = args.get("address").and_then(|v| v.as_str()).ok_or("address is required")?;
+            let fingerprint = args.get("fingerprint").and_then(|v| v.as_str()).ok_or("fingerprint is required")?;
+            runtime
+                .recipient_key_accept(address, fingerprint)
+                .await
+                .map_err(|e| e.to_string())
+        }
+        "folder_create" => {
+            let name = args.get("name").and_then(|v| v.as_str()).ok_or("name is required")?;
+            let parent = args.get("parent_token").and_then(|v| v.as_str());
+            let token = runtime.create_folder(name, parent).await.map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({ "folder_token": token }))
         }
         "rules_delete" => {
             let id = args

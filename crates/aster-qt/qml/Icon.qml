@@ -30,6 +30,7 @@ Item {
         check: ["M20 6 9 17l-5-5"],
         shield: ["M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"],
         filter: ["M22 3H2l8 9.46V19l4 2v-8.54z"],
+        clock: ["M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20z", "M12 6v6l4 2"],
         chevronLeft: ["m15 18-6-6 6-6"],
         chevronRight: ["m9 18 6-6-6-6"],
         chevronUp: ["m18 15-6-6-6 6"],

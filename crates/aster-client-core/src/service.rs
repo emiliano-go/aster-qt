@@ -46,6 +46,7 @@ pub struct MessageView {
     pub in_reply_to: Option<String>,
     pub references: Option<String>,
     pub thread_id: Option<String>,
+    pub tags: Vec<String>,
     pub preview: String,
 }
 
@@ -123,12 +124,29 @@ impl ClientRuntime {
             .list_cached_message_meta(folder)
             .map_err(ClientError::Storage)?;
         rows.sort_by(|a, b| b.date.cmp(&a.date));
-        Ok(rows
+        let mut out: Vec<MessageView> = rows
             .into_iter()
             .skip(offset)
             .take(limit)
             .map(|msg| view_of(&msg))
-            .collect())
+            .collect();
+        self.attach_tags(&mut out)?;
+        Ok(out)
+    }
+
+    fn attach_tags(&self, messages: &mut [MessageView]) -> ClientResult<()> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+        let ids: Vec<String> = messages.iter().map(|message| message.id.clone()).collect();
+        let mut tags = self
+            .db()
+            .message_tags(&ids)
+            .map_err(ClientError::Storage)?;
+        for message in messages {
+            message.tags = tags.remove(&message.id).unwrap_or_default();
+        }
+        Ok(())
     }
 
     pub fn search(&self, query: &str, limit: usize) -> ClientResult<Vec<MessageView>> {
@@ -146,6 +164,7 @@ impl ClientRuntime {
             .map(|msg| view_of(&msg))
             .collect();
         ordered.truncate(limit);
+        self.attach_tags(&mut ordered)?;
         Ok(ordered)
     }
 
@@ -213,11 +232,13 @@ impl ClientRuntime {
             .db()
             .get_cached_messages(&ids, false)
             .map_err(ClientError::Storage)?;
-        Ok(ids
+        let mut out: Vec<MessageView> = ids
             .iter()
             .filter_map(|id| map.remove(id))
             .map(|msg| view_of(&msg))
-            .collect())
+            .collect();
+        self.attach_tags(&mut out)?;
+        Ok(out)
     }
 
     pub fn message(&self, id: &str) -> ClientResult<MessageDetail> {
@@ -267,7 +288,7 @@ impl ClientRuntime {
             .as_deref()
             .and_then(|raw| serde_json::from_str(raw).ok())
             .unwrap_or(serde_json::Value::Null);
-        Ok(MessageDetail {
+        let mut detail = MessageDetail {
             message: view_of(&msg),
             body,
             is_html,
@@ -276,7 +297,9 @@ impl ClientRuntime {
             not_end_to_end_encrypted: aster_bridge_core::message_render::not_end_to_end_encrypted(&meta),
             attachments_unverified: aster_bridge_core::message_render::attachments_unverified(&meta),
             attachments,
-        })
+        };
+        self.attach_tags(std::slice::from_mut(&mut detail.message))?;
+        Ok(detail)
     }
 
     pub fn attachment(&self, id: &str, seq: i64) -> ClientResult<Vec<u8>> {
@@ -643,6 +666,94 @@ impl ClientRuntime {
         Ok((token, key))
     }
 
+    pub async fn recipient_key_show(&self, address: &str) -> ClientResult<serde_json::Value> {
+        let (token, username) = {
+            let session = self.session().read().await;
+            (session.access_token.to_string(), session.username.clone())
+        };
+        let key = aster_bridge_core::crypto::recipient_trust::fetch_recipient_account_key(
+            self.client(),
+            &token,
+            &username,
+            address,
+        )
+        .await
+        .map_err(ClientError::from_bridge)?;
+        let fingerprint = aster_bridge_core::crypto::recipient_trust::key_fingerprint(key.as_deref())
+            .ok_or_else(|| ClientError::Protocol(format!("{address} has no published key")))?;
+        Ok(serde_json::json!({
+            "address": address,
+            "fingerprint": aster_bridge_core::crypto::recipient_trust::format_fingerprint(&fingerprint),
+        }))
+    }
+
+    pub async fn recipient_key_accept(
+        &self,
+        address: &str,
+        fingerprint: &str,
+    ) -> ClientResult<serde_json::Value> {
+        let (token, username, account_id) = {
+            let session = self.session().read().await;
+            (session.access_token.to_string(), session.username.clone(), session.user_id.to_string())
+        };
+        let key = aster_bridge_core::crypto::recipient_trust::fetch_recipient_account_key(
+            self.client(),
+            &token,
+            &username,
+            address,
+        )
+        .await
+        .map_err(ClientError::from_bridge)?;
+        let outcome = aster_bridge_core::crypto::recipient_trust::accept_recipient_key(
+            self.db(),
+            &account_id,
+            address,
+            key.as_deref(),
+            fingerprint,
+        )
+        .map_err(ClientError::Protocol)?;
+        match outcome {
+            aster_bridge_core::crypto::recipient_trust::KeyAcceptance::Accepted { fingerprint } => {
+                Ok(serde_json::json!({
+                    "address": address,
+                    "accepted": true,
+                    "fingerprint": aster_bridge_core::crypto::recipient_trust::format_fingerprint(&fingerprint),
+                }))
+            }
+            aster_bridge_core::crypto::recipient_trust::KeyAcceptance::Mismatch { .. } => Err(
+                ClientError::Protocol(format!("the key published for {address} does not match the fingerprint")),
+            ),
+        }
+    }
+
+    pub fn sign_out(&self, keep_cache: bool) -> ClientResult<()> {
+        if !keep_cache {
+            self.db().clear_user_data().map_err(ClientError::Storage)?;
+        }
+        aster_bridge_core::auth::device_identity::clear_identity(self.data_dir());
+        aster_bridge_core::auth::device_identity::clear_passphrase(self.data_dir());
+        Ok(())
+    }
+
+    pub fn repair_cache(&self) -> ClientResult<()> {
+        self.db().repair_cache().map_err(ClientError::Storage)
+    }
+
+    pub fn diagnostics(&self) -> ClientResult<serde_json::Value> {
+        let (messages, bytes, db_path) = self.db().db_stats().map_err(ClientError::Storage)?;
+        let outbox = self.db().outbox_stats().map_err(ClientError::Storage)?;
+        Ok(serde_json::json!({
+            "messages": messages,
+            "bytes": bytes,
+            "db_path": db_path,
+            "outbox": {
+                "pending": outbox.pending,
+                "failed": outbox.failed,
+                "sent_24h": outbox.sent_24h,
+            }
+        }))
+    }
+
     pub fn tags(&self) -> ClientResult<Vec<TagView>> {
         let tags = self.db().list_custom_tags().map_err(ClientError::Storage)?;
         Ok(tags
@@ -706,6 +817,20 @@ impl ClientRuntime {
             .remove_tag(&token, ids, tag_token)
             .await
             .map_err(ClientError::from_bridge)
+    }
+
+    pub async fn create_folder(&self, name: &str, parent: Option<&str>) -> ClientResult<String> {
+        let (access, identity_key) = self.auth_material().await;
+        aster_bridge_core::folder_ops::create(
+            self.db(),
+            self.client(),
+            &access,
+            &identity_key.ok_or_else(|| ClientError::Session("folder keys are not unlocked".into()))?,
+            name,
+            parent,
+        )
+        .await
+        .map_err(|err| ClientError::Protocol(format!("{err:?}")))
     }
 
     pub async fn rename_folder(&self, token: &str, name: &str) -> ClientResult<()> {
@@ -950,6 +1075,73 @@ impl ClientRuntime {
         self.move_messages(ids, "trash").await
     }
 
+    pub async fn save_draft(
+        &self,
+        draft_id: Option<&str>,
+        to: &[String],
+        cc: &[String],
+        bcc: &[String],
+        subject: &str,
+        message: &str,
+        attachments: &[PathBuf],
+    ) -> ClientResult<String> {
+        let (token, identity_key) = self.auth_material().await;
+        let identity_key = identity_key
+            .ok_or_else(|| ClientError::Session("draft keys are not unlocked".into()))?;
+        let mut draft_attachments = Vec::new();
+        for path in attachments {
+            let name = path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .ok_or_else(|| ClientError::Protocol(format!("invalid attachment path: {}", path.display())))?;
+            let data = std::fs::read(path)
+                .map_err(|err| ClientError::Protocol(format!("read {}: {}", path.display(), err)))?;
+            draft_attachments.push(aster_bridge_core::crypto::draft::DraftAttachment {
+                id: String::new(),
+                name: name.to_string(),
+                size: format!("{}", data.len()),
+                size_bytes: data.len() as i64,
+                mime_type: attachment_content_type(name).to_string(),
+                data_base64: base64::engine::general_purpose::STANDARD.encode(&data),
+                content_id: None,
+            });
+        }
+        let content = aster_bridge_core::crypto::draft::DraftContent {
+            to_recipients: to.to_vec(),
+            cc_recipients: cc.to_vec(),
+            bcc_recipients: bcc.to_vec(),
+            subject: subject.to_string(),
+            message: message.to_string(),
+            attachments: if draft_attachments.is_empty() { None } else { Some(draft_attachments) },
+        };
+        let (encrypted, nonce) = aster_bridge_core::crypto::draft::encrypt_draft_content(
+            &content,
+            &identity_key,
+        )
+        .map_err(|err| ClientError::Protocol(format!("encrypt draft: {err}")))?;
+        let hash = aster_bridge_core::crypto::draft::draft_content_hash(&encrypted);
+        let size = serde_json::to_vec(&content).map(|v| v.len() as i64).unwrap_or(0);
+        let body = aster_bridge_core::api_client::CreateDraftBody {
+            draft_type: "draft",
+            encrypted_content: &encrypted,
+            content_nonce: &nonce,
+            content_hash: &hash,
+            size_bytes: size,
+            has_attachments: content.attachments.is_some(),
+            attachment_count: content.attachments.as_ref().map(|v| v.len() as i64).unwrap_or(0),
+            reply_to_id: None,
+        };
+        let created = self
+            .client()
+            .create_draft(&token, &body)
+            .await
+            .map_err(ClientError::from_bridge)?;
+        if let Some(old) = draft_id {
+            let _ = self.client().delete_draft(&token, old).await;
+        }
+        Ok(created.id)
+    }
+
     pub async fn delete_draft(&self, id: &str) -> ClientResult<()> {
         let token = self.access_token().await;
         self.client()
@@ -1180,6 +1372,14 @@ impl ClientRuntime {
             .map_err(ClientError::from_bridge)
     }
 
+    pub async fn reorder_rules(&self, ids: &[String]) -> ClientResult<()> {
+        let token = self.access_token().await;
+        self.client()
+            .reorder_mail_rules(&token, ids)
+            .await
+            .map_err(ClientError::from_bridge)
+    }
+
     pub async fn delete_rule(&self, id: &str) -> ClientResult<()> {
         let token = self.access_token().await;
         self.client()
@@ -1349,6 +1549,7 @@ fn view_of(msg: &CachedMessage) -> MessageView {
             .and_then(|value| value.as_str())
             .map(str::to_string),
         thread_id: msg.thread_id.clone(),
+        tags: Vec::new(),
         preview: preview_of(msg.body_text.as_deref()),
     }
 }

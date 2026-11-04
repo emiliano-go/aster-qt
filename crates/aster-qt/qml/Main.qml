@@ -15,7 +15,14 @@ ApplicationWindow {
     title: "Aster"
     color: c("bg", "#121417")
 
-    AppController { id: app }
+    AppController {
+        id: app
+        onDraftSaved: function(id) {
+            root.draftId = id;
+            root.editingDraftId = id;
+            root.draftDirty = false;
+        }
+    }
 
     readonly property var th: {
         try { return JSON.parse(app.tokensJson || "{}") } catch (e) { return {} }
@@ -128,6 +135,30 @@ ApplicationWindow {
         }
         return out;
     }
+    readonly property var folderTree: {
+        var byParent = {};
+        for (var i = 0; i < root.customFolders.length; i++) {
+            var folder = root.customFolders[i];
+            var parent = folder.parent_id || "";
+            if (!byParent[parent]) byParent[parent] = [];
+            byParent[parent].push(folder);
+        }
+        var out = [];
+        function walk(parent, depth) {
+            var list = byParent[parent] || [];
+            list.sort(function(a, b) {
+                return (a.sort_order || 0) - (b.sort_order || 0) || String(a.name).localeCompare(String(b.name));
+            });
+            for (var j = 0; j < list.length; j++) {
+                var item = list[j];
+                out.push(Object.assign({}, item, { depth: depth }));
+                walk(item.id, depth + 1);
+            }
+        }
+        walk("", 0);
+        return out;
+    }
+
     readonly property int unreadTotal: {
         var total = 0;
         for (var i = 0; i < root.mailboxes.length; i++) {
@@ -147,6 +178,8 @@ ApplicationWindow {
     property bool filterStarred: false
     property bool filterAttachmentsOnly: false
     property string categoryFilter: ""
+    property string tagFilter: ""
+    property var tagTargetIds: []
     property bool composeOpen: false
     property bool settingsOpen: false
     property bool identityOpen: false
@@ -187,6 +220,8 @@ ApplicationWindow {
     readonly property var threadMessages: parse(app.threadJson, [])
     readonly property var mailingLists: parse(app.listsJson, [])
     readonly property var outboxItems: parse(app.outboxJson, [])
+    readonly property var recipientKey: parse(app.recipientKeyJson, {})
+    readonly property var diagnostics: parse(app.diagnosticsJson, {})
     readonly property var activeList: {
         for (var i = 0; i < mailingLists.length; i++)
             if (mailingLists[i].list_id === root.listFilter) return mailingLists[i];
@@ -246,7 +281,98 @@ ApplicationWindow {
         }));
     }
 
+    function actionTarget(action) {
+        if (!action) return "";
+        if (action.type === "move_to") return action.folder_token || "";
+        if (action.type === "apply_labels") return (action.label_tokens || []).join(",");
+        if (action.type === "forward") return action.to || "";
+        if (action.type === "mark_as") return action.value || "read";
+        if (action.type === "auto_reply") return action.template_id || "";
+        if (action.type === "snooze") return action.until_iso8601 || "";
+        if (action.type === "categorize") return action.category || "";
+        if (action.type === "notify") return action.enabled === false ? "false" : "true";
+        return "";
+    }
+
+    function editRule(rule) {
+        root.editingRuleId = rule.id || "";
+        ruleName.text = rule.name || "";
+        root.ruleMatchAll = rule.match_mode !== "any";
+        conditionModel.clear();
+        var conditions = rule.conditions || [];
+        for (var i = 0; i < conditions.length; i++)
+            conditionModel.append({ field: conditions[i].field || "", op: conditions[i].op || "contains", value: conditions[i].value || "" });
+        if (conditionModel.count === 0)
+            conditionModel.append({ field: "from", op: "contains", value: "" });
+        actionModel.clear();
+        var actions = rule.actions || [];
+        for (var j = 0; j < actions.length; j++)
+            actionModel.append({ kind: actions[j].type || "move_to", target: root.actionTarget(actions[j]) });
+        if (actionModel.count === 0)
+            actionModel.append({ kind: "move_to", target: "" });
+    }
+
+    function cancelRuleEdit() {
+        root.editingRuleId = "";
+        ruleName.text = "";
+        conditionModel.clear();
+        conditionModel.append({ field: "from", op: "contains", value: "" });
+        actionModel.clear();
+        actionModel.append({ kind: "move_to", target: "" });
+    }
+
+    function saveRule() {
+        var conditions = [];
+        for (var i = 0; i < conditionModel.count; i++) {
+            var c = conditionModel.get(i);
+            if (!c.field) continue;
+            conditions.push({ field: c.field, op: c.op || "contains", value: c.value || "" });
+        }
+        var actions = [];
+        for (var j = 0; j < actionModel.count; j++) {
+            var a = actionModel.get(j);
+            var kind = (a.kind || "").trim();
+            var target = (a.target || "").trim();
+            if (kind === "move_to") actions.push({ type: "move_to", folder_token: target });
+            else if (kind === "apply_labels") actions.push({ type: "apply_labels", label_tokens: target.split(",").map(function(x) { return x.trim(); }).filter(function(x) { return x.length > 0; }) });
+            else if (kind === "forward") actions.push({ type: "forward", to: target });
+            else if (kind === "mark_as") actions.push({ type: "mark_as", value: target || "read" });
+            else if (kind === "star") actions.push({ type: "star" });
+            else if (kind === "skip_inbox") actions.push({ type: "skip_inbox" });
+            else if (kind === "delete") actions.push({ type: "delete" });
+            else if (kind === "auto_reply") actions.push({ type: "auto_reply", template_id: target });
+            else if (kind === "pin") actions.push({ type: "pin" });
+            else if (kind === "snooze") actions.push({ type: "snooze", until_iso8601: target });
+            else if (kind === "categorize") actions.push({ type: "categorize", category: target });
+            else if (kind === "notify") actions.push({ type: "notify", enabled: target !== "false" });
+        }
+        var body = JSON.stringify({
+            name: ruleName.text || "Rule",
+            color: "#d98e5c",
+            enabled: true,
+            match_mode: root.ruleMatchAll ? "all" : "any",
+            conditions: conditions,
+            actions: actions
+        });
+        if (root.editingRuleId.length > 0) app.updateRuleJson(root.editingRuleId, body);
+        else app.createRuleJson(body);
+        root.cancelRuleEdit();
+    }
+
+    function moveRule(id, delta) {
+        var ids = [];
+        for (var i = 0; i < root.rules.length; i++) ids.push(root.rules[i].id);
+        var at = ids.indexOf(id);
+        var to = at + delta;
+        if (at < 0 || to < 0 || to >= ids.length) return;
+        var value = ids[at]; ids[at] = ids[to]; ids[to] = value;
+        app.reorderRules(JSON.stringify(ids));
+    }
+
     onSystemDarkChanged: app.applySystemDark(systemDark)
+    onSettingsTabChanged: {
+        if (settingsTab === "diagnostics") app.loadDiagnostics();
+    }
     onUnreadTotalChanged: {
         if (root.lastUnread >= 0 && root.unreadTotal > root.lastUnread)
             app.notify("New mail", (root.unreadTotal - root.lastUnread) + " new message(s) in Aster");
@@ -297,6 +423,7 @@ ApplicationWindow {
             if (root.filterStarred && !m.is_starred) continue;
             if (root.filterAttachmentsOnly && !m.has_attachments) continue;
             if (root.categoryFilter.length > 0 && m.category !== root.categoryFilter) continue;
+            if (root.tagFilter.length > 0 && (m.tags || []).indexOf(root.tagFilter) === -1) continue;
             if (root.filterSince.length > 0) {
                 var since = new Date(root.filterSince);
                 if (!isNaN(since.getTime()) && m.date && new Date(m.date) < since) continue;
@@ -348,6 +475,47 @@ ApplicationWindow {
     function folderIcon(label) {
         var icons = { inbox: "inbox", sent: "send", drafts: "drafts", archive: "archive", spam: "junk", trash: "trash" };
         return icons[label] || "folder";
+    }
+
+    function tagName(token) {
+        for (var i = 0; i < root.tags.length; i++)
+            if (root.tags[i].tag_token === token) return root.tags[i].name;
+        return token;
+    }
+
+    function tagCount(token) {
+        var count = 0;
+        for (var i = 0; i < root.messages.length; i++)
+            if ((root.messages[i].tags || []).indexOf(token) !== -1) count++;
+        return count;
+    }
+
+    function targetHasTag(token) {
+        if (root.tagTargetIds.length === 0) return false;
+        for (var i = 0; i < root.tagTargetIds.length; i++) {
+            var id = root.tagTargetIds[i];
+            var found = false;
+            for (var j = 0; j < root.messages.length; j++) {
+                if (root.messages[j].id !== id) continue;
+                found = (root.messages[j].tags || []).indexOf(token) !== -1;
+                break;
+            }
+            if (!found) return false;
+        }
+        return true;
+    }
+
+    function openTagPicker() {
+        root.tagTargetIds = root.selectionMode && root.selectedIds.length > 0
+            ? root.selectedIds.slice()
+            : (root.detail.id ? [root.detail.id] : []);
+        tagPickerPopup.open();
+    }
+
+    function toggleTag(token) {
+        if (root.tagTargetIds.length === 0) return;
+        var call = root.targetHasTag(token) ? app.removeTag : app.assignTag;
+        call(JSON.stringify(root.tagTargetIds), token);
     }
 
     function formatWhen(iso) {
@@ -484,6 +652,33 @@ ApplicationWindow {
         root.categoryFilter = "";
     }
 
+    function hasComposeContent() {
+        return composeTo.text.trim().length > 0
+            || composeCc.text.trim().length > 0
+            || composeBcc.text.trim().length > 0
+            || composeSubject.text.trim().length > 0
+            || composeBody.text.trim().length > 0
+            || root.composeAttachments.length > 0;
+    }
+
+    function saveDraftNow() {
+        if (!root.composeOpen || !root.hasComposeContent()) return;
+        app.saveDraft(
+            root.editingDraftId.length > 0 ? root.editingDraftId : root.draftId,
+            composeTo.text,
+            composeCc.text,
+            composeBcc.text,
+            composeSubject.text,
+            composeBody.text,
+            JSON.stringify(root.composeAttachments)
+        );
+    }
+
+    function closeCompose() {
+        if (root.composeOpen) root.saveDraftNow();
+        root.composeOpen = false;
+    }
+
     function resetCompose() {
         composeTo.text = "";
         composeCc.text = "";
@@ -492,6 +687,9 @@ ApplicationWindow {
         composeBody.text = "";
         root.composeAttachments = [];
         root.composeFrom = root.defaultIdentityAddress();
+        root.draftId = "";
+        root.editingDraftId = "";
+        root.draftDirty = false;
     }
 
     function openCompose() {
@@ -595,6 +793,7 @@ ApplicationWindow {
     function openDraft() {
         if (!root.detail || !root.detail.id) return;
         root.editingDraftId = root.detail.id;
+        root.draftId = root.detail.id;
         root.composeFrom = root.detail.recipients && root.identities.length > 0 ? root.identities[0].address : root.composeFrom;
         composeTo.text = root.detail.recipients || "";
         composeCc.text = "";
@@ -661,7 +860,7 @@ ApplicationWindow {
                 app.resolveDelete(root.pendingDeleteToken, false);
                 root.deleteConfirmOpen = false;
             } else if (root.composeOpen) {
-                root.composeOpen = false;
+                root.closeCompose();
             } else if (root.settingsOpen) {
                 root.settingsOpen = false;
             } else if (root.identityOpen) {
@@ -677,6 +876,13 @@ ApplicationWindow {
     }
     Shortcut { sequence: "/"; onActivated: searchInput.forceActiveFocus() }
     Shortcut { sequence: "Ctrl+,"; onActivated: root.openSettings("appearance") }
+
+    Timer {
+        id: draftTimer
+        interval: 1500
+        repeat: false
+        onTriggered: root.saveDraftNow()
+    }
 
     FileDialog {
         id: attachDialog
@@ -946,6 +1152,7 @@ ApplicationWindow {
     component FolderRow: Rectangle {
         id: folderRow
         property var folder
+        property int depth: 0
         property bool active: app.folderId === folder.folder_label
         implicitHeight: 32
         radius: n("radius-control", 2)
@@ -967,7 +1174,7 @@ ApplicationWindow {
         HoverHandler { id: folderHover }
         RowLayout {
             anchors.fill: parent
-            anchors.leftMargin: n("space-2", 8) + 8
+            anchors.leftMargin: n("space-2", 8) + 8 + folderRow.depth * 16
             anchors.rightMargin: n("space-3", 12)
             spacing: n("space-2", 8)
             Icon {
@@ -1206,6 +1413,26 @@ ApplicationWindow {
                     font.pixelSize: n("font-size-small", 12)
                     elide: Text.ElideRight
                     Layout.fillWidth: true
+                }
+                RowLayout {
+                    visible: row.item && row.item.tags && row.item.tags.length > 0
+                    spacing: 2
+                    Icon { name: "tag"; size: 12; color: c("muted", "#a8ece7de") }
+                    Text {
+                        text: row.item && row.item.tags ? root.tagName(row.item.tags[0]) : ""
+                        color: c("muted", "#a8ece7de")
+                        font.family: c("font-family", "Inter")
+                        font.pixelSize: n("font-size-micro", 11)
+                        elide: Text.ElideRight
+                        Layout.maximumWidth: 70
+                    }
+                    Text {
+                        visible: row.item && row.item.tags && row.item.tags.length > 1
+                        text: row.item && row.item.tags ? "+" + (row.item.tags.length - 1) : ""
+                        color: c("muted", "#a8ece7de")
+                        font.family: c("font-family", "Inter")
+                        font.pixelSize: n("font-size-micro", 11)
+                    }
                 }
                 Text {
                     visible: row.item && (row.item.list_name || row.item.list_id)
@@ -1635,10 +1862,11 @@ ApplicationWindow {
                     }
 
                     Repeater {
-                        model: root.customFolders
+                        model: root.folderTree
                         delegate: FolderRow {
                             Layout.fillWidth: true
                             folder: modelData
+                            depth: modelData.depth || 0
                         }
                     }
 
@@ -1750,11 +1978,101 @@ ApplicationWindow {
                     }
 
                     Text {
-                        text: "SAVED SEARCHES"
+                        text: "Tags"
                         color: c("muted", "#a8ece7de")
                         font.family: c("font-family", "Inter")
-                        font.pixelSize: n("font-size-micro", 9)
-                        font.letterSpacing: 1
+                        font.pixelSize: n("font-size-micro", 11)
+                        font.weight: n("font-weight-medium", 500)
+                        Layout.topMargin: n("space-3", 12)
+                        Layout.leftMargin: n("space-2", 8)
+                    }
+                    Rectangle {
+                        Layout.fillWidth: true
+                        implicitHeight: 28
+                        radius: n("radius-control", 2)
+                        activeFocusOnTab: true
+                        Accessible.role: Accessible.Button
+                        Accessible.name: "All tags"
+                        Accessible.selected: root.tagFilter === ""
+                        Accessible.onPressAction: root.tagFilter = ""
+                        Keys.onSpacePressed: root.tagFilter = ""
+                        Keys.onReturnPressed: root.tagFilter = ""
+                        color: root.tagFilter === "" ? c("hover", "#2e2e323a") : "transparent"
+                        Text {
+                            anchors.verticalCenter: parent.verticalCenter
+                            anchors.left: parent.left
+                            anchors.leftMargin: n("space-3", 12)
+                            text: "All tags"
+                            color: c("text-2", "#dbebe7de")
+                            font.family: c("font-family", "Inter")
+                            font.pixelSize: n("font-size-small", 12)
+                        }
+                        MouseArea {
+                            anchors.fill: parent
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: root.tagFilter = ""
+                        }
+                    }
+                    Repeater {
+                        model: root.tags
+                        delegate: Rectangle {
+                            Layout.fillWidth: true
+                            implicitHeight: 28
+                            radius: n("radius-control", 2)
+                            activeFocusOnTab: true
+                            Accessible.role: Accessible.Button
+                            Accessible.name: "Tag " + modelData.name
+                            Accessible.selected: root.tagFilter === modelData.tag_token
+                            Accessible.onPressAction: root.tagFilter = modelData.tag_token
+                            Keys.onSpacePressed: root.tagFilter = modelData.tag_token
+                            Keys.onReturnPressed: root.tagFilter = modelData.tag_token
+                            color: root.tagFilter === modelData.tag_token ? c("selected", "#3d2e323a") : (tagHover.hovered ? c("hover", "#2e2e323a") : "transparent")
+                            HoverHandler { id: tagHover }
+                            RowLayout {
+                                anchors.fill: parent
+                                anchors.leftMargin: n("space-2", 8) + 4
+                                anchors.rightMargin: n("space-2", 8)
+                                spacing: n("space-2", 8)
+                                Icon { name: "tag"; size: n("icon-small", 16); color: c("muted", "#a8ece7de") }
+                                Text {
+                                    text: modelData.name
+                                    color: c("text-2", "#dbebe7de")
+                                    font.family: c("font-family", "Inter")
+                                    font.pixelSize: n("font-size-small", 12)
+                                    elide: Text.ElideRight
+                                    Layout.fillWidth: true
+                                }
+                                Text {
+                                    text: root.tagCount(modelData.tag_token) || ""
+                                    color: c("muted", "#a8ece7de")
+                                    font.family: c("font-family", "Inter")
+                                    font.pixelSize: n("font-size-micro", 11)
+                                }
+                            }
+                            MouseArea {
+                                anchors.fill: parent
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: root.tagFilter = modelData.tag_token
+                            }
+                        }
+                    }
+                    Text {
+                        visible: root.tags.length === 0
+                        text: "Create tags in Settings > Aliases & mailboxes."
+                        color: c("muted", "#a8ece7de")
+                        font.family: c("font-family", "Inter")
+                        font.pixelSize: n("font-size-micro", 11)
+                        wrapMode: Text.WordWrap
+                        Layout.fillWidth: true
+                        Layout.leftMargin: n("space-2", 8)
+                    }
+
+                    Text {
+                        text: "Saved searches"
+                        color: c("muted", "#a8ece7de")
+                        font.family: c("font-family", "Inter")
+                        font.pixelSize: n("font-size-micro", 11)
+                        font.weight: n("font-weight-medium", 500)
                         Layout.topMargin: n("space-3", 12)
                         Layout.leftMargin: n("space-2", 8)
                     }
@@ -1763,7 +2081,7 @@ ApplicationWindow {
                         delegate: Rectangle {
                             Layout.fillWidth: true
                             implicitHeight: 28
-                            radius: n("radius-control", 8)
+                            radius: n("radius-control", 2)
                             activeFocusOnTab: true
                             Accessible.role: Accessible.Button
                             Accessible.name: "Saved search " + modelData.name
@@ -2193,7 +2511,63 @@ ApplicationWindow {
                                         font.weight: n("font-weight-medium", 500)
                                         Layout.alignment: Qt.AlignVCenter
                                     }
+                                    LinkText {
+                                        text: "Key"
+                                        action: function() {
+                                            app.showRecipientKey(root.detail.sender || "");
+                                            recipientKeyPopup.open();
+                                        }
+                                    }
                                 }
+                            }
+
+                            RowLayout {
+                                Layout.fillWidth: true
+                                visible: root.detail.id !== undefined && root.detail.id !== ""
+                                spacing: n("space-1", 4)
+                                Repeater {
+                                    model: root.detail.tags || []
+                                    delegate: Rectangle {
+                                        implicitWidth: tagChipRow.implicitWidth + n("space-2", 8) * 2
+                                        implicitHeight: 22
+                                        radius: n("radius-control", 2)
+                                        color: c("card", "#23262c")
+                                        border.width: n("border-width", 1)
+                                        border.color: c("border", "#171b1e23")
+                                        activeFocusOnTab: true
+                                        Accessible.role: Accessible.Button
+                                        Accessible.name: "Remove tag " + root.tagName(modelData)
+                                        Accessible.onPressAction: root.toggleTag(modelData)
+                                        Keys.onSpacePressed: root.toggleTag(modelData)
+                                        Keys.onReturnPressed: root.toggleTag(modelData)
+                                        RowLayout {
+                                            id: tagChipRow
+                                            anchors.centerIn: parent
+                                            spacing: n("space-1", 4)
+                                            Icon { name: "tag"; size: 12; color: c("muted", "#a8ece7de") }
+                                            Text {
+                                                text: root.tagName(modelData)
+                                                color: c("text-2", "#dbebe7de")
+                                                font.family: c("font-family", "Inter")
+                                                font.pixelSize: n("font-size-micro", 11)
+                                            }
+                                            Icon { name: "close"; size: 10; color: c("muted", "#a8ece7de") }
+                                        }
+                                        MouseArea {
+                                            anchors.fill: parent
+                                            cursorShape: Qt.PointingHandCursor
+                                            onClicked: {
+                                                root.tagTargetIds = [root.detail.id];
+                                                root.toggleTag(modelData);
+                                            }
+                                        }
+                                    }
+                                }
+                                LinkText {
+                                    text: "Add tag"
+                                    action: function() { root.openTagPicker() }
+                                }
+                                Item { Layout.fillWidth: true }
                             }
 
                             RowLayout {
@@ -2687,11 +3061,11 @@ ApplicationWindow {
                                     }
                                 }
 
-                                    Text { text: "SIGNATURE"; color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-micro", 9); font.letterSpacing: 1; Layout.topMargin: n("space-2", 8) }
+                                    Text { text: "Signature"; color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-micro", 11); font.weight: n("font-weight-medium", 500); Layout.topMargin: n("space-2", 8) }
                                     Rectangle {
                                         Layout.fillWidth: true
                                         Layout.preferredHeight: 80
-                                        radius: n("radius-control", 8)
+                                        radius: n("radius-control", 2)
                                         color: c("input", "#221b1e23")
                                         border.width: n("border-width", 1)
                                         border.color: c("border", "#171b1e23")
@@ -2713,11 +3087,11 @@ ApplicationWindow {
                                         }
                                     }
                                     LinkText { text: "Save signature"; action: function() { app.applySettings(JSON.stringify({ compose: { signature: signatureField.text } })) } }
-                                    Text { text: "TEMPLATE"; color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-micro", 9); font.letterSpacing: 1; Layout.topMargin: n("space-2", 8) }
+                                    Text { text: "Template"; color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-micro", 11); font.weight: n("font-weight-medium", 500); Layout.topMargin: n("space-2", 8) }
                                     Rectangle {
                                         Layout.fillWidth: true
                                         Layout.preferredHeight: 80
-                                        radius: n("radius-control", 8)
+                                        radius: n("radius-control", 2)
                                         color: c("input", "#221b1e23")
                                         border.width: n("border-width", 1)
                                         border.color: c("border", "#171b1e23")
@@ -2739,10 +3113,40 @@ ApplicationWindow {
                                         }
                                     }
                                     LinkText { text: "Save template"; action: function() { app.applySettings(JSON.stringify({ compose: { template: templateField.text } })) } }
-                                    Text { text: "SERVER TEMPLATES"; color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-micro", 9); font.letterSpacing: 1; Layout.topMargin: n("space-2", 8) }
+                                    Text { text: "Server templates"; color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-micro", 11); font.weight: n("font-weight-medium", 500); Layout.topMargin: n("space-2", 8) }
+                                    RowLayout {
+                                        Layout.fillWidth: true
+                                        spacing: n("space-2", 8)
+                                        SettingsField { id: serverTemplateName; Layout.fillWidth: true; placeholder: "Template name" }
+                                        SettingsField { id: serverTemplateCategory; Layout.preferredWidth: 160; placeholder: "Category" }
+                                        LinkText { text: "Create template"; action: function() { app.createServerTemplate(serverTemplateName.text, serverTemplateCategory.text, serverTemplateContent.text) } }
+                                    }
+                                    Rectangle {
+                                        Layout.fillWidth: true
+                                        Layout.preferredHeight: 70
+                                        radius: n("radius-control", 2)
+                                        color: c("input", "#221b1e23")
+                                        border.width: n("border-width", 1)
+                                        border.color: c("border", "#171b1e23")
+                                        TextArea {
+                                            id: serverTemplateContent
+                                            anchors.fill: parent
+                                            anchors.margins: n("space-2", 8)
+                                            color: c("text", "#ece7de")
+                                            wrapMode: TextArea.Wrap
+                                            background: null
+                                            font.family: c("font-mail", "Inter")
+                                            font.pixelSize: n("font-size-small", 12)
+                                        }
+                                    }
                                     Repeater {
                                         model: root.serverTemplates
-                                        delegate: Text { text: modelData.name + " · " + modelData.category; color: c("text-2", "#dbebe7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-small", 12) }
+                                        delegate: RowLayout {
+                                            Layout.fillWidth: true
+                                            spacing: n("space-2", 8)
+                                            Text { text: modelData.name + " · " + modelData.category; color: c("text-2", "#dbebe7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-small", 12); Layout.fillWidth: true; elide: Text.ElideRight }
+                                            LinkText { text: "Delete"; action: function() { app.deleteServerTemplate(modelData.id) } }
+                                        }
                                     }
                                     RowLayout {
                                         Layout.fillWidth: true
@@ -2753,12 +3157,42 @@ ApplicationWindow {
                                             onToggled: app.applySettings(JSON.stringify({ compose: { server_undo_send: !checked } }))
                                         }
                                     }
-                                    Text { text: "SERVER SIGNATURES"; color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-micro", 9); font.letterSpacing: 1; Layout.topMargin: n("space-2", 8) }
+                                    Text { text: "Server signatures"; color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-micro", 11); font.weight: n("font-weight-medium", 500); Layout.topMargin: n("space-2", 8) }
+                                    RowLayout {
+                                        Layout.fillWidth: true
+                                        spacing: n("space-2", 8)
+                                        SettingsField { id: serverSignatureName; Layout.fillWidth: true; placeholder: "Signature name" }
+                                        LinkText { text: "Create signature"; action: function() { app.createServerSignature(serverSignatureName.text, serverSignatureContent.text) } }
+                                    }
+                                    Rectangle {
+                                        Layout.fillWidth: true
+                                        Layout.preferredHeight: 70
+                                        radius: n("radius-control", 2)
+                                        color: c("input", "#221b1e23")
+                                        border.width: n("border-width", 1)
+                                        border.color: c("border", "#171b1e23")
+                                        TextArea {
+                                            id: serverSignatureContent
+                                            anchors.fill: parent
+                                            anchors.margins: n("space-2", 8)
+                                            color: c("text", "#ece7de")
+                                            wrapMode: TextArea.Wrap
+                                            background: null
+                                            font.family: c("font-mail", "Inter")
+                                            font.pixelSize: n("font-size-small", 12)
+                                        }
+                                    }
                                     Repeater {
                                         model: root.serverSignatures
-                                        delegate: Text { text: modelData.name + (modelData.is_default ? " · default" : ""); color: c("text-2", "#dbebe7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-small", 12) }
+                                        delegate: RowLayout {
+                                            Layout.fillWidth: true
+                                            spacing: n("space-2", 8)
+                                            Text { text: modelData.name + (modelData.is_default ? " · default" : ""); color: c("text-2", "#dbebe7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-small", 12); Layout.fillWidth: true; elide: Text.ElideRight }
+                                            LinkText { text: "Use default"; action: function() { app.setDefaultSignature(modelData.id) } }
+                                            LinkText { text: "Delete"; action: function() { app.deleteServerSignature(modelData.id) } }
+                                        }
                                     }
-                                    Text { text: "SCHEDULED SENDS"; color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-micro", 9); font.letterSpacing: 1; Layout.topMargin: n("space-2", 8) }
+                                    Text { text: "Scheduled sends"; color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-micro", 11); font.weight: n("font-weight-medium", 500); Layout.topMargin: n("space-2", 8) }
                                     Repeater {
                                         model: root.scheduledSends
                                         delegate: RowLayout {
@@ -2797,6 +3231,9 @@ ApplicationWindow {
                                                     Text { text: modelData.name || "Untitled rule"; color: c("text", "#ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-small", 12); font.weight: n("font-weight-semibold", 600) }
                                                     Text { text: (modelData.conditions ? modelData.conditions.length : 0) + " conditions · " + (modelData.actions ? modelData.actions.length : 0) + " actions · " + (modelData.applied_count || 0) + " applied"; color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-micro", 11) }
                                                 }
+                                                LinkText { text: "Edit"; action: function() { root.editRule(modelData) } }
+                                                LinkText { text: "Up"; action: function() { root.moveRule(modelData.id, -1) } }
+                                                LinkText { text: "Down"; action: function() { root.moveRule(modelData.id, 1) } }
                                                 LinkText { text: "Run"; action: function() { app.runRule(modelData.id) } }
                                                 LinkText { text: "Delete"; action: function() { app.deleteRule(modelData.id) } }
                                             }
@@ -2868,7 +3305,8 @@ ApplicationWindow {
                                         Layout.fillWidth: true
                                         LinkText { text: "Add action"; action: function() { actionModel.append({ kind: "move_to", target: "" }) } }
                                         Item { Layout.fillWidth: true }
-                                        LinkText { text: "Create rule"; action: function() { root.createVisualRule() } }
+                                        LinkText { text: root.editingRuleId.length > 0 ? "Save rule" : "Create rule"; action: function() { root.saveRule() } }
+                                        LinkText { visible: root.editingRuleId.length > 0; text: "Cancel edit"; action: function() { root.cancelRuleEdit() } }
                                     }
                                     Text {
                                         text: "Fields: from, to, cc, bcc, subject, body, list_id, header, attachment_name, has_attachment, is_reply, is_forward, attachment_size, total_size, recipient_count, spam_score, date_received, dkim_result, spf_result, dmarc_result. Operators: is, is_not, contains, does_not_contain, starts_with, ends_with, matches_domain, does_not_match_domain, is_empty, matches_regex. Actions: move_to, apply_labels, mark_as, star, skip_inbox, delete, forward, auto_reply, pin, snooze, categorize, notify."
@@ -2962,7 +3400,7 @@ ApplicationWindow {
                                             }
                                         }
                                     }
-                                    Text { text: "TAGS"; color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-micro", 9); font.letterSpacing: 1; Layout.topMargin: n("space-2", 8) }
+                                    Text { text: "Tags"; color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-micro", 11); font.weight: n("font-weight-medium", 500); Layout.topMargin: n("space-2", 8) }
                                     RowLayout {
                                         Layout.fillWidth: true
                                         spacing: n("space-2", 8)
@@ -2979,15 +3417,24 @@ ApplicationWindow {
                                         }
                                     }
                                     Text { visible: root.tags.length === 0; text: "No tags yet."; color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-micro", 11) }
-                                    Text { text: "FOLDER MANAGEMENT"; color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-micro", 9); font.letterSpacing: 1; Layout.topMargin: n("space-2", 8) }
+                                    Text { text: "Folder management"; color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-micro", 11); font.weight: n("font-weight-medium", 500); Layout.topMargin: n("space-2", 8) }
+                                    RowLayout {
+                                        Layout.fillWidth: true
+                                        spacing: n("space-2", 8)
+                                        SettingsField { id: newFolderName; Layout.fillWidth: true; placeholder: "New folder name"; testId: "settings-new-folder" }
+                                        SettingsField { id: newFolderParent; Layout.preferredWidth: 200; placeholder: "Parent token (optional)"; testId: "settings-new-folder-parent" }
+                                        LinkText { text: "Create folder"; action: function() { app.createFolder(newFolderName.text, newFolderParent.text) } }
+                                    }
                                     SettingsField { id: folderRenameName; Layout.fillWidth: true; placeholder: "New folder name"; testId: "settings-folder-rename" }
+                                    SettingsField { id: folderMoveParent; Layout.fillWidth: true; placeholder: "Move under parent token (blank = root)"; testId: "settings-folder-move-parent" }
                                     Repeater {
-                                        model: root.customFolders
+                                        model: root.folderTree
                                         delegate: RowLayout {
                                             Layout.fillWidth: true
                                             spacing: n("space-2", 8)
-                                            Text { text: modelData.name; color: c("text-2", "#dbebe7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-small", 12); Layout.fillWidth: true }
+                                            Text { text: "\u00a0".repeat((modelData.depth || 0) * 2) + modelData.name; color: c("text-2", "#dbebe7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-small", 12); Layout.fillWidth: true }
                                             LinkText { text: "Rename"; action: function() { app.renameFolder(modelData.token, folderRenameName.text) } }
+                                            LinkText { text: "Move"; action: function() { app.moveFolder(modelData.token, folderMoveParent.text) } }
                                             LinkText { text: "Delete"; action: function() { app.deleteFolder(modelData.token) } }
                                         }
                                     }
@@ -3106,7 +3553,7 @@ ApplicationWindow {
                                     Rectangle {
                                         Layout.fillWidth: true
                                         implicitHeight: gpgCol.implicitHeight + n("space-3", 12) * 2
-                                        radius: n("radius-control", 8)
+                                        radius: n("radius-control", 2)
                                         color: c("card", "#23262c")
                                         border.width: n("border-width", 1)
                                         border.color: c("border", "#171b1e23")
@@ -3235,9 +3682,12 @@ ApplicationWindow {
                                     SettingsSubtitle { text: "Local state used by Aster Qt." }
                                     Text { text: "Data directory"; color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-micro", 11); font.weight: n("font-weight-medium", 500) }
                                     Text { text: app.dataDir; color: c("text-2", "#dbebe7de"); font.family: c("font-mono", "JetBrains Mono"); font.pixelSize: n("font-size-micro", 11); wrapMode: Text.WrapAnywhere; Layout.fillWidth: true }
+                                    Text { text: "Cached messages: " + (root.diagnostics.messages || 0) + " · " + root.formatBytes(root.diagnostics.bytes || 0); color: c("text-2", "#dbebe7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-small", 12) }
+                                    Text { text: "Outbox: " + ((root.diagnostics.outbox && root.diagnostics.outbox.pending) || 0) + " pending · " + ((root.diagnostics.outbox && root.diagnostics.outbox.failed) || 0) + " failed"; color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-small", 12) }
                                     RowLayout {
                                         Layout.fillWidth: true
-                                        LinkText { text: "Open themes folder"; action: function() { app.openThemesFolder() } }
+                                        LinkText { text: "Reload diagnostics"; action: function() { app.loadDiagnostics() } }
+                                        LinkText { text: "Repair cache"; action: function() { app.repairCache(); app.loadDiagnostics() } }
                                         Item { Layout.fillWidth: true }
                                         LinkText { text: "Reload themes"; action: function() { app.refreshThemes() } }
                                         LinkText { text: "Refresh mail"; action: function() { app.refreshMail() } }
@@ -3258,7 +3708,7 @@ ApplicationWindow {
         anchors.bottomMargin: n("statusbar-height", 30) + n("space-4", 16) + 40
         width: undoSendRow.implicitWidth + n("space-4", 16) * 2
         height: 34
-        radius: n("radius-control", 8)
+        radius: n("radius-control", 2)
         color: c("surface-strong", "#2e323a")
         border.width: n("border-width", 1)
         border.color: c("border-strong", "#292e323a")
@@ -3480,7 +3930,7 @@ ApplicationWindow {
                         font.family: c("font-mono", "JetBrains Mono")
                         font.pixelSize: n("font-size-micro", 11)
                     }
-                    IconButton { icon: "close"; label: "Close composer"; onClicked: root.composeOpen = false }
+                    IconButton { icon: "close"; label: "Close composer"; onClicked: root.closeCompose() }
                 }
                 RowLayout {
                     Layout.fillWidth: true
@@ -3584,6 +4034,7 @@ ApplicationWindow {
                         Accessible.focusable: true
                         color: c("text", "#ece7de")
                         placeholderText: "# Hello\n\nWrite in Markdown. Bold, lists, links, quotes and code blocks are converted to email HTML and plain text."
+                        onTextChanged: { root.draftDirty = true; draftTimer.restart(); }
                         placeholderTextColor: c("muted", "#a8ece7de")
                         selectionColor: c("accent", "#d98e5c")
                         selectedTextColor: c("accent-ink", "#171717")
