@@ -89,6 +89,9 @@ if not error:
     check("signatures_list")
     check("signature_delete", {"id": json.loads(text)["id"]})
 
+for view in ["starred", "all", "scheduled"]:
+    check("mail_list", {"folder": view, "limit": 3})
+
 # message state lifecycle
 error, text = check("mail_list", {"folder": "inbox", "limit": 1})
 if not error:
@@ -103,6 +106,8 @@ if not error:
     until = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=1)).isoformat()
     check("mail_snooze", {"ids": [mid], "until_iso8601": until})
     check("mail_unsnooze", {"id": mid})
+    check("mail_spam", {"ids": [mid], "spam": True})
+    check("mail_restore", {"ids": [mid]})
     check("mail_from_sender_list", {"sender": message["sender"][:12], "limit": 3})
 
 # queue and cancel

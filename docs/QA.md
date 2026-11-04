@@ -55,6 +55,10 @@ Suites: `smoke`, `mcp`, `folders`, `search`, `reader`, `thread`, `compose`,
 - Delete confirmation dialog appears and requires typed confirmation.
 - Compose edits fields and queues a Markdown message through the outbox.
 - MCP initialize, tools list, status, mail list, search, rules, contacts, PGP, lists, and stdio bridge.
+- Starred, All Mail, Scheduled, global tag, and alias views render.
+- Reader sender-authentication summary, remote-content report, spam/restore, and attachment preview.
+- Composer recipient suggestions, markdown formatting actions, emoji/link popups, and server signature/template fallback.
+- Scheduled messages are created, listed, decrypted, and cancelled through the server API.
 
 ## Still to test exhaustively
 
@@ -65,7 +69,7 @@ Suites: `smoke`, `mcp`, `folders`, `search`, `reader`, `thread`, `compose`,
 - MCP send with approval disabled and enabled.
 - Tags create/list/delete via MCP.
 - Folder create/rename/move/delete via MCP.
-- Snooze and unsnooze one message via MCP.
+- Snooze, unsnooze, spam, restore, and view listing via MCP.
 - Compose signature/template insertion links render.
 - On-demand attachment fetch via MCP.
 - Pin and unpin via MCP.

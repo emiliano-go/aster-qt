@@ -113,18 +113,26 @@ ApplicationWindow {
     readonly property var mailboxes: parse(app.mailboxesJson, [])
     readonly property var messages: parse(app.messagesJson, [])
     readonly property var detail: parse(app.selectedJson, ({}))
+    readonly property var viewCounts: parse(app.viewCountsJson, ({}))
 
-    readonly property var systemOrder: ["inbox", "snoozed", "sent", "drafts", "archive", "spam", "trash"]
-    readonly property var snoozedFolder: ({ folder_label: "snoozed", name: "Snoozed", unread: 0, total: 0 })
+    readonly property var systemOrder: ["inbox", "starred", "all", "sent", "scheduled", "snoozed", "drafts", "archive", "spam", "trash"]
+    readonly property var virtualFolders: ["starred", "all", "scheduled", "snoozed"]
     readonly property var systemFolders: {
         var out = [];
         for (var i = 0; i < root.systemOrder.length; i++) {
-            if (root.systemOrder[i] === "snoozed") {
-                out.push(root.snoozedFolder);
+            var label = root.systemOrder[i];
+            if (root.virtualFolders.indexOf(label) !== -1) {
+                var counts = root.viewCounts[label] || ({});
+                out.push({
+                    folder_label: label,
+                    name: root.folderLabel(label),
+                    unread: counts.unread || 0,
+                    total: counts.total || 0
+                });
                 continue;
             }
             for (var j = 0; j < root.mailboxes.length; j++) {
-                if (root.mailboxes[j].folder_label === root.systemOrder[i]) {
+                if (root.mailboxes[j].folder_label === label) {
                     out.push(root.mailboxes[j]);
                     break;
                 }
@@ -227,6 +235,7 @@ ApplicationWindow {
     readonly property var outboxItems: parse(app.outboxJson, [])
     readonly property var recipientKey: parse(app.recipientKeyJson, {})
     readonly property var diagnostics: parse(app.diagnosticsJson, {})
+    readonly property var attachmentPreview: parse(app.attachmentPreviewJson, {})
     readonly property var activeList: {
         for (var i = 0; i < mailingLists.length; i++)
             if (mailingLists[i].list_id === root.listFilter) return mailingLists[i];
@@ -243,6 +252,9 @@ ApplicationWindow {
     property bool ruleMatchAll: true
     property var snoozeTargets: []
     property string snoozeCustom: ""
+    property var recipientSuggestions: []
+    property string replyInReplyTo: ""
+    property string replyReferences: ""
 
     ListModel {
         id: conditionModel
@@ -522,13 +534,34 @@ ApplicationWindow {
         return out;
     }
 
+    function authVerdict() {
+        var checks = [root.detail.spf_result, root.detail.dkim_result, root.detail.dmarc_result].map(function(value) {
+            return String(value || "").trim().toLowerCase();
+        });
+        if (checks.every(function(value) { return value === "pass"; })) return "verified";
+        if (checks.some(function(value) { return value === "fail" || value === "hardfail"; })) return "failed";
+        if (checks.some(function(value) { return value === "pass"; })) return "partial";
+        return root.detail.sender_unverified ? "unverified" : "none";
+    }
+
+    function authLabel() {
+        var verdict = root.authVerdict();
+        if (verdict === "verified") return "SPF, DKIM and DMARC pass";
+        if (verdict === "failed") return "Sender authentication failed";
+        if (verdict === "partial") return "Partial sender authentication";
+        if (verdict === "unverified") return "Unverified sender";
+        return "No sender authentication";
+    }
+
     function folderLabel(label) {
-        var names = { inbox: "Inbox", snoozed: "Snoozed", sent: "Sent", drafts: "Drafts", archive: "Archive", spam: "Junk", trash: "Trash" };
+        if (label.indexOf("tag:") === 0) return "Tag: " + root.tagName(label.substring(4));
+        if (label.indexOf("alias:") === 0) return label.substring(6);
+        var names = { inbox: "Inbox", starred: "Starred", all: "All mail", sent: "Sent", scheduled: "Scheduled", snoozed: "Snoozed", drafts: "Drafts", archive: "Archive", spam: "Junk", trash: "Trash" };
         return names[label] || label;
     }
 
     function folderIcon(label) {
-        var icons = { inbox: "inbox", snoozed: "clock", sent: "send", drafts: "drafts", archive: "archive", spam: "junk", trash: "trash" };
+        var icons = { inbox: "inbox", starred: "star", all: "inbox", scheduled: "clock", snoozed: "clock", sent: "send", drafts: "drafts", archive: "archive", spam: "junk", trash: "trash" };
         return icons[label] || "folder";
     }
 
@@ -707,6 +740,29 @@ ApplicationWindow {
         root.categoryFilter = "";
     }
 
+    function wrapComposeSelection(before, after) {
+        var start = composeBody.selectionStart;
+        var end = composeBody.selectionEnd;
+        if (start === end) {
+            var pos = composeBody.cursorPosition;
+            composeBody.text = composeBody.text.slice(0, pos) + before + after + composeBody.text.slice(pos);
+            composeBody.cursorPosition = pos + before.length;
+        } else {
+            var selected = composeBody.text.slice(start, end);
+            composeBody.text = composeBody.text.slice(0, start) + before + selected + after + composeBody.text.slice(end);
+            composeBody.selectionStart = start + before.length;
+            composeBody.selectionEnd = end + before.length;
+        }
+        composeBody.forceActiveFocus();
+    }
+
+    function insertComposeText(value) {
+        var pos = composeBody.cursorPosition;
+        composeBody.text = composeBody.text.slice(0, pos) + value + composeBody.text.slice(pos);
+        composeBody.cursorPosition = pos + value.length;
+        composeBody.forceActiveFocus();
+    }
+
     function hasComposeContent() {
         return composeTo.text.trim().length > 0
             || composeCc.text.trim().length > 0
@@ -741,6 +797,8 @@ ApplicationWindow {
         composeSubject.text = "";
         composeBody.text = "";
         root.composeAttachments = [];
+        root.replyInReplyTo = "";
+        root.replyReferences = "";
         root.composeFrom = root.defaultIdentityAddress();
         root.draftId = "";
         root.editingDraftId = "";
@@ -760,9 +818,62 @@ ApplicationWindow {
         return /^re\s*:/i.test(value) ? value : "Re: " + value;
     }
 
+    function updateRecipientSuggestions(text) {
+        var token = String(text || "").split(",").pop().trim().toLowerCase();
+        if (token.length < 2) {
+            root.recipientSuggestions = [];
+            return;
+        }
+        var seen = {};
+        var out = [];
+        function add(address, name) {
+            var key = String(address || "").toLowerCase();
+            if (!key || seen[key] || key.indexOf(token) === -1) return;
+            seen[key] = true;
+            out.push({ address: address, name: name || address });
+        }
+        for (var i = 0; i < root.identities.length; i++) add(root.identities[i].address, root.identities[i].display_name);
+        for (var c = 0; c < root.contacts.length; c++) {
+            var card = root.contacts[c].vcard || "";
+            var matches = card.match(/EMAIL[^:\r\n]*:([^\r\n]+)/gi) || [];
+            for (var m = 0; m < matches.length; m++) {
+                var address = matches[m].split(":").pop().trim().replace(/^mailto:/i, "");
+                add(address, "");
+            }
+        }
+        out.sort(function(a, b) { return a.address.localeCompare(b.address); });
+        root.recipientSuggestions = out.slice(0, 6);
+    }
+
+    function applyRecipientSuggestion(address) {
+        var text = composeTo.text || "";
+        var parts = text.split(",");
+        parts[parts.length - 1] = " " + address;
+        composeTo.text = parts.join(",").replace(/^\s+/, "") + ", ";
+        root.recipientSuggestions = [];
+    }
+
     function openReply() {
         root.resetCompose();
-        composeTo.text = root.detail.sender || "";
+        root.replyInReplyTo = root.detail.message_id || "";
+        root.replyReferences = root.detail.references || "";
+        composeTo.text = root.detail.reply_to || root.detail.sender || "";
+        composeSubject.text = root.replySubject(root.detail.subject);
+        var quoted = (root.detail.body || "").trim();
+        if (quoted.length > 0) {
+            var lines = quoted.split("\n").map(function(line) { return "> " + line; }).join("\n");
+            composeBody.text = "\n\nOn " + (root.formatWhen(root.detail.date) || "an earlier date")
+                + ", " + (root.detail.sender || "the sender") + " wrote:\n" + lines;
+        }
+        root.composeOpen = true;
+    }
+
+    function openReplyAll() {
+        root.resetCompose();
+        root.replyInReplyTo = root.detail.message_id || "";
+        root.replyReferences = root.detail.references || "";
+        composeTo.text = root.detail.reply_to || root.detail.sender || "";
+        composeCc.text = root.detail.cc || "";
         composeSubject.text = root.replySubject(root.detail.subject);
         var quoted = (root.detail.body || "").trim();
         if (quoted.length > 0) {
@@ -781,7 +892,9 @@ ApplicationWindow {
             bcc: composeBcc.text,
             subject: composeSubject.text,
             body: composeBody.text,
-            attachments: root.composeAttachments.slice()
+            attachments: root.composeAttachments.slice(),
+            in_reply_to: root.replyInReplyTo,
+            references: root.replyReferences
         };
     }
 
@@ -800,7 +913,11 @@ ApplicationWindow {
             app.deleteDraft(root.editingDraftId);
             root.editingDraftId = "";
         }
-        app.sendMessage(payload.from, payload.to, payload.cc, payload.bcc, payload.subject, payload.body, JSON.stringify(payload.attachments));
+        if (payload.in_reply_to || payload.references) {
+            app.sendThreadedMessage(payload.from, payload.to, payload.cc, payload.bcc, payload.subject, payload.body, JSON.stringify(payload.attachments), payload.in_reply_to || "", payload.references || "");
+        } else {
+            app.sendMessage(payload.from, payload.to, payload.cc, payload.bcc, payload.subject, payload.body, JSON.stringify(payload.attachments));
+        }
         root.composeOpen = false;
     }
 
@@ -818,11 +935,7 @@ ApplicationWindow {
     }
 
     function cancelScheduled(id) {
-        var list = root.settings.compose && root.settings.compose.scheduled
-            ? root.settings.compose.scheduled.filter(function(item) { return item.id !== id; })
-            : [];
-        app.applySettings(JSON.stringify({ compose: { scheduled: list } }));
-        app.cancelQueuedSend(id);
+        app.cancelScheduled(id);
     }
 
     function checkScheduledSends() {
@@ -1773,10 +1886,32 @@ ApplicationWindow {
                 SplitView.minimumWidth: 208
                 visible: root.sidebarVisible
                 color: c("sidebar", "#1a1d22")
-                ColumnLayout {
+                Flickable {
+                    id: sidebarScroll
                     anchors.fill: parent
                     anchors.margins: n("space-3", 12)
-                    spacing: n("space-1", 4)
+                    clip: true
+                    contentWidth: width
+                    contentHeight: sidebarColumn.implicitHeight
+                    boundsBehavior: Flickable.StopAtBounds
+                    flickDeceleration: 5000
+                    maximumFlickVelocity: 9000
+                    ScrollBar.vertical: MailScrollBar {}
+                    WheelHandler {
+                        acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
+                        onWheel: function(event) {
+                            var dy = event.pixelDelta.y !== 0 ? event.pixelDelta.y * 2.5 : event.angleDelta.y * 2
+                            if (dy === 0) return
+                            sidebarScroll.contentY = Math.max(0, Math.min(
+                                Math.max(0, sidebarScroll.contentHeight - sidebarScroll.height),
+                                sidebarScroll.contentY - dy))
+                            event.accepted = true
+                        }
+                    }
+                    ColumnLayout {
+                        id: sidebarColumn
+                        width: sidebarScroll.width
+                        spacing: n("space-1", 4)
 
                     Rectangle {
                         id: accountCard
@@ -2033,6 +2168,51 @@ ApplicationWindow {
                     }
 
                     Text {
+                        visible: root.identities.length > 1
+                        text: "Aliases"
+                        color: c("muted", "#a8ece7de")
+                        font.family: c("font-family", "Inter")
+                        font.pixelSize: n("font-size-micro", 11)
+                        font.weight: n("font-weight-medium", 500)
+                        Layout.topMargin: n("space-3", 12)
+                        Layout.leftMargin: n("space-2", 8)
+                    }
+                    Repeater {
+                        model: root.identities.length > 1 ? root.identities : []
+                        delegate: Rectangle {
+                            readonly property string aliasView: "alias:" + modelData.address
+                            Layout.fillWidth: true
+                            implicitHeight: 28
+                            radius: n("radius-control", 2)
+                            activeFocusOnTab: true
+                            Accessible.role: Accessible.Button
+                            Accessible.name: "Alias " + modelData.address
+                            Accessible.selected: app.folderId === aliasView
+                            Accessible.onPressAction: app.openMailbox(aliasView)
+                            Keys.onSpacePressed: app.openMailbox(aliasView)
+                            Keys.onReturnPressed: app.openMailbox(aliasView)
+                            color: app.folderId === aliasView ? c("selected", "#3d2e323a") : "transparent"
+                            Text {
+                                anchors.verticalCenter: parent.verticalCenter
+                                anchors.left: parent.left
+                                anchors.leftMargin: n("space-3", 12)
+                                anchors.right: parent.right
+                                anchors.rightMargin: n("space-3", 12)
+                                text: modelData.address
+                                color: c("text-2", "#dbebe7de")
+                                font.family: c("font-family", "Inter")
+                                font.pixelSize: n("font-size-small", 12)
+                                elide: Text.ElideRight
+                            }
+                            MouseArea {
+                                anchors.fill: parent
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: app.openMailbox(aliasView)
+                            }
+                        }
+                    }
+
+                    Text {
                         text: "Tags"
                         color: c("muted", "#a8ece7de")
                         font.family: c("font-family", "Inter")
@@ -2049,9 +2229,9 @@ ApplicationWindow {
                         Accessible.role: Accessible.Button
                         Accessible.name: "All tags"
                         Accessible.selected: root.tagFilter === ""
-                        Accessible.onPressAction: root.tagFilter = ""
-                        Keys.onSpacePressed: root.tagFilter = ""
-                        Keys.onReturnPressed: root.tagFilter = ""
+                        Accessible.onPressAction: function() { root.tagFilter = ""; if (app.folderId.indexOf("tag:") === 0) app.openMailbox("all") }
+                        Keys.onSpacePressed: function() { root.tagFilter = ""; if (app.folderId.indexOf("tag:") === 0) app.openMailbox("all") }
+                        Keys.onReturnPressed: function() { root.tagFilter = ""; if (app.folderId.indexOf("tag:") === 0) app.openMailbox("all") }
                         color: root.tagFilter === "" ? c("hover", "#2e2e323a") : "transparent"
                         Text {
                             anchors.verticalCenter: parent.verticalCenter
@@ -2065,23 +2245,24 @@ ApplicationWindow {
                         MouseArea {
                             anchors.fill: parent
                             cursorShape: Qt.PointingHandCursor
-                            onClicked: root.tagFilter = ""
+                            onClicked: { root.tagFilter = ""; if (app.folderId.indexOf("tag:") === 0) app.openMailbox("all"); }
                         }
                     }
                     Repeater {
                         model: root.tags
                         delegate: Rectangle {
+                            readonly property string tagView: "tag:" + modelData.tag_token
                             Layout.fillWidth: true
                             implicitHeight: 28
                             radius: n("radius-control", 2)
                             activeFocusOnTab: true
                             Accessible.role: Accessible.Button
                             Accessible.name: "Tag " + modelData.name
-                            Accessible.selected: root.tagFilter === modelData.tag_token
-                            Accessible.onPressAction: root.tagFilter = modelData.tag_token
-                            Keys.onSpacePressed: root.tagFilter = modelData.tag_token
-                            Keys.onReturnPressed: root.tagFilter = modelData.tag_token
-                            color: root.tagFilter === modelData.tag_token ? c("selected", "#3d2e323a") : (tagHover.hovered ? c("hover", "#2e2e323a") : "transparent")
+                            Accessible.selected: app.folderId === tagView
+                            Accessible.onPressAction: function() { root.tagFilter = modelData.tag_token; app.openMailbox(tagView) }
+                            Keys.onSpacePressed: function() { root.tagFilter = modelData.tag_token; app.openMailbox(tagView) }
+                            Keys.onReturnPressed: function() { root.tagFilter = modelData.tag_token; app.openMailbox(tagView) }
+                            color: app.folderId === tagView ? c("selected", "#3d2e323a") : (tagHover.hovered ? c("hover", "#2e2e323a") : "transparent")
                             HoverHandler { id: tagHover }
                             RowLayout {
                                 anchors.fill: parent
@@ -2107,7 +2288,7 @@ ApplicationWindow {
                             MouseArea {
                                 anchors.fill: parent
                                 cursorShape: Qt.PointingHandCursor
-                                onClicked: root.tagFilter = modelData.tag_token
+                                onClicked: { root.tagFilter = modelData.tag_token; app.openMailbox(tagView); }
                             }
                         }
                     }
@@ -2197,6 +2378,7 @@ ApplicationWindow {
                             font.family: c("font-family", "Inter")
                             font.pixelSize: n("font-size-micro", 11)
                         }
+                    }
                     }
                 }
             }
@@ -2317,6 +2499,8 @@ ApplicationWindow {
                             LinkText { text: "Snooze"; action: function() { root.openSnooze() } }
                             LinkText { text: "Archive"; action: function() { root.batch("archive") } }
                             LinkText { text: "Trash"; action: function() { root.batch("trash") } }
+                            LinkText { text: "Spam"; action: function() { root.batch("spam") } }
+                            LinkText { text: "Restore"; action: function() { root.batch("restore") } }
                             LinkText { text: "Unsubscribe"; action: function() { root.unsubConfirmOpen = true } }
                             LinkText { text: "Clear"; action: function() { root.clearSelection() } }
                         }
@@ -2355,14 +2539,16 @@ ApplicationWindow {
                         }
                         ScrollBar.vertical: MailScrollBar {}
                         WheelHandler {
+                            acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
                             onWheel: function(event) {
                                 var step = event.pixelDelta.y !== 0
-                                         ? event.pixelDelta.y
-                                         : event.angleDelta.y;
+                                         ? event.pixelDelta.y * 2.5
+                                         : event.angleDelta.y * 2;
                                 if (step === 0) return;
                                 messageList.cancelFlick();
-                                messageList.contentY = Math.max(0, Math.min(messageList.contentHeight - messageList.height,
-                                                                             messageList.contentY - step));
+                                messageList.contentY = Math.max(0, Math.min(
+                                    Math.max(0, messageList.contentHeight - messageList.height),
+                                    messageList.contentY - step));
                                 event.accepted = true;
                             }
                         }
@@ -2414,6 +2600,11 @@ ApplicationWindow {
                         spacing: n("space-1", 4)
                         LinkText { visible: app.folderId === "drafts"; text: "Edit draft"; action: function() { root.openDraft() } }
                         LinkText {
+                            visible: app.folderId === "scheduled"
+                            text: "Send now"
+                            action: function() { app.sendScheduledNow(root.detail.id) }
+                        }
+                        LinkText {
                             visible: root.detail.snoozed_until !== null && root.detail.snoozed_until !== undefined && root.detail.snoozed_until.length > 0
                             text: "Unsnooze"
                             action: function() { app.unsnoozeMessage(root.detail.id) }
@@ -2428,6 +2619,7 @@ ApplicationWindow {
                         }
                         IconButton { icon: "clock"; label: "Snooze"; onClicked: root.openSnooze() }
                         IconButton { icon: "reply"; label: "Reply"; onClicked: root.openReply() }
+                        IconButton { icon: "reply"; label: "Reply all"; onClicked: root.openReplyAll() }
                         IconButton { icon: "forward"; label: "Forward"; onClicked: root.openForward() }
                         Item { Layout.fillWidth: true }
                         IconButton {
@@ -2456,6 +2648,17 @@ ApplicationWindow {
                             label: "Delete"
                             danger: true
                             onClicked: app.trashMessage(root.detail.id)
+                        }
+                        IconButton {
+                            icon: "junk"
+                            label: app.folderId === "spam" ? "Not spam" : "Mark as spam"
+                            onClicked: app.setSpam(root.detail.id, app.folderId !== "spam")
+                        }
+                        IconButton {
+                            icon: "refresh"
+                            label: "Restore"
+                            visible: app.folderId === "trash" || app.folderId === "spam"
+                            onClicked: app.restoreMessage(root.detail.id)
                         }
                         IconButton { icon: "more"; label: "More" }
                         IconButton { icon: "close"; label: "Close reader"; onClicked: root.readerOpen = false }
@@ -2557,17 +2760,16 @@ ApplicationWindow {
                                     Icon {
                                         name: "shield"
                                         size: n("icon-small", 16)
-                                        color: root.detail.sender_unverified || root.detail.not_end_to_end_encrypted
-                                               ? c("trust-warning", "#d9b36a")
-                                               : c("trust-verified", "#7fae83")
+                                        color: root.authVerdict() === "verified"
+                                               ? c("trust-verified", "#7fae83")
+                                               : c("trust-warning", "#d9b36a")
                                         Layout.alignment: Qt.AlignVCenter
                                     }
                                     Text {
-                                        text: root.detail.sender_unverified ? "Unverified sender"
-                                              : (root.detail.not_end_to_end_encrypted ? "Not end-to-end" : "Verified")
-                                        color: root.detail.sender_unverified || root.detail.not_end_to_end_encrypted
-                                               ? c("trust-warning", "#d9b36a")
-                                               : c("trust-verified", "#7fae83")
+                                        text: root.authLabel()
+                                        color: root.authVerdict() === "verified"
+                                               ? c("trust-verified", "#7fae83")
+                                               : c("trust-warning", "#d9b36a")
                                         font.family: c("font-family", "Inter")
                                         font.pixelSize: n("font-size-micro", 11)
                                         font.weight: n("font-weight-medium", 500)
@@ -2579,6 +2781,13 @@ ApplicationWindow {
                                             app.showRecipientKey(root.detail.sender || "");
                                             recipientKeyPopup.open();
                                         }
+                                    }
+                                    Text {
+                                        visible: root.detail.expires_at !== null && root.detail.expires_at !== undefined && root.detail.expires_at.length > 0
+                                        text: "Expires " + root.formatWhen(root.detail.expires_at)
+                                        color: c("muted", "#a8ece7de")
+                                        font.family: c("font-family", "Inter")
+                                        font.pixelSize: n("font-size-micro", 11)
                                     }
                                 }
                             }
@@ -2714,6 +2923,54 @@ ApplicationWindow {
                             }
 
                             Rectangle {
+                                Layout.fillWidth: true
+                                Layout.preferredHeight: visible ? bannerRow.implicitHeight + n("space-3", 12) * 2 : 0
+                                visible: root.detail.external_content && root.detail.external_content.blocked_count > 0
+                                radius: n("radius-control", 2)
+                                color: c("card", "#23262c")
+                                border.width: n("border-width", 1)
+                                border.color: c("trust-warning", "#d9b36a")
+                                RowLayout {
+                                    id: bannerRow
+                                    anchors.fill: parent
+                                    anchors.margins: n("space-3", 12)
+                                    spacing: n("space-2", 8)
+                                    Icon { name: "shield"; size: n("icon-small", 16); color: c("trust-warning", "#d9b36a") }
+                                    Text {
+                                        text: "Remote content blocked (" + root.detail.external_content.blocked_count + ")"
+                                        color: c("text", "#ece7de")
+                                        font.family: c("font-family", "Inter")
+                                        font.pixelSize: n("font-size-small", 12)
+                                        Layout.fillWidth: true
+                                    }
+                                }
+                            }
+
+                            Rectangle {
+                                Layout.fillWidth: true
+                                Layout.preferredHeight: visible ? phishingRow.implicitHeight + n("space-3", 12) * 2 : 0
+                                visible: root.detail.phishing_level === "dangerous" || root.detail.phishing_level === "suspicious"
+                                radius: n("radius-control", 2)
+                                color: c("card", "#23262c")
+                                border.width: n("border-width", 1)
+                                border.color: c("danger", "#d96a5c")
+                                RowLayout {
+                                    id: phishingRow
+                                    anchors.fill: parent
+                                    anchors.margins: n("space-3", 12)
+                                    spacing: n("space-2", 8)
+                                    Icon { name: "junk"; size: n("icon-small", 16); color: c("danger", "#d96a5c") }
+                                    Text {
+                                        text: root.detail.phishing_level === "dangerous" ? "This message looks dangerous" : "This message looks suspicious"
+                                        color: c("text", "#ece7de")
+                                        font.family: c("font-family", "Inter")
+                                        font.pixelSize: n("font-size-small", 12)
+                                        Layout.fillWidth: true
+                                    }
+                                }
+                            }
+
+                            Rectangle {
                                 id: mailCard
                                 readonly property bool bodyIsHtml: root.detail.is_html && (root.detail.body_html || "").length > 0
                                 readonly property string bodyText: bodyIsHtml ? (root.detail.body_html || "") : (root.detail.body || "")
@@ -2807,11 +3064,18 @@ ApplicationWindow {
                                                 font.pixelSize: n("font-size-micro", 11)
                                                 Layout.alignment: Qt.AlignVCenter
                                             }
+                                            LinkText {
+                                                text: "Save"
+                                                action: function() { app.saveAttachment(root.detail.id, modelData.seq) }
+                                            }
                                         }
                                         MouseArea {
                                             anchors.fill: parent
                                             cursorShape: Qt.PointingHandCursor
-                                            onClicked: app.saveAttachment(root.detail.id, modelData.seq)
+                                            onClicked: {
+                                                app.previewAttachment(root.detail.id, modelData.seq);
+                                                attachmentPreviewPopup.open();
+                                            }
                                         }
                                     }
                                 }
@@ -2832,6 +3096,7 @@ ApplicationWindow {
                 anchors.rightMargin: n("space-3", 12)
                 spacing: n("space-3", 12)
                 Text {
+                    visible: app.statusText.length > 0 && app.statusText !== "Ready"
                     text: app.statusText
                     color: c("muted", "#a8ece7de")
                     font.family: c("font-family", "Inter")
@@ -2869,10 +3134,6 @@ ApplicationWindow {
             toastTimer.restart();
         }
         function onScheduledQueued(id, at, subject) {
-            var list = root.settings.compose && root.settings.compose.scheduled
-                ? root.settings.compose.scheduled.slice() : [];
-            list.push({ id: id, at: at, subject: subject });
-            app.applySettings(JSON.stringify({ compose: { scheduled: list } }));
             root.toastVisible = true;
             app.notify("Message scheduled", subject);
         }
@@ -4043,7 +4304,46 @@ ApplicationWindow {
                         }
                     }
                 }
-                SettingsField { id: composeTo; Layout.fillWidth: true; placeholder: "To, comma separated"; testId: "compose-to" }
+                SettingsField {
+                    id: composeTo
+                    Layout.fillWidth: true
+                    placeholder: "To, comma separated"
+                    testId: "compose-to"
+                    onEdited: root.updateRecipientSuggestions(value)
+                }
+                ColumnLayout {
+                    visible: root.recipientSuggestions.length > 0
+                    Layout.fillWidth: true
+                    spacing: 2
+                    Repeater {
+                        model: root.recipientSuggestions
+                        delegate: Rectangle {
+                            Layout.fillWidth: true
+                            implicitHeight: 28
+                            radius: n("radius-control", 2)
+                            color: recHover.hovered ? c("hover", "#2e2e323a") : c("card", "#23262c")
+                            HoverHandler { id: recHover }
+                            Text {
+                                anchors.verticalCenter: parent.verticalCenter
+                                anchors.left: parent.left
+                                anchors.leftMargin: n("space-3", 12)
+                                text: modelData.name && modelData.name !== modelData.address
+                                      ? modelData.name + " · " + modelData.address
+                                      : modelData.address
+                                color: c("text-2", "#dbebe7de")
+                                font.family: c("font-family", "Inter")
+                                font.pixelSize: n("font-size-small", 12)
+                                elide: Text.ElideRight
+                                width: parent.width - n("space-6", 32)
+                            }
+                            MouseArea {
+                                anchors.fill: parent
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: root.applyRecipientSuggestion(modelData.address)
+                            }
+                        }
+                    }
+                }
                 RowLayout {
                     Layout.fillWidth: true
                     spacing: n("space-2", 8)
@@ -4058,6 +4358,11 @@ ApplicationWindow {
                         text: "Insert signature"
                         action: function() {
                             var signature = root.settings.compose ? (root.settings.compose.signature || "") : "";
+                            if (signature.length === 0) {
+                                var server = root.serverSignatures.filter(function(item) { return item.is_default; });
+                                if (server.length === 0) server = root.serverSignatures;
+                                if (server.length > 0) signature = server[0].content || "";
+                            }
                             if (signature.length > 0) composeBody.text += "\n\n" + signature;
                         }
                     }
@@ -4065,9 +4370,17 @@ ApplicationWindow {
                         text: "Insert template"
                         action: function() {
                             var template = root.settings.compose ? (root.settings.compose.template || "") : "";
+                            if (template.length === 0 && root.serverTemplates.length > 0)
+                                template = root.serverTemplates[0].content || "";
                             if (template.length > 0) composeBody.text = template + "\n\n" + composeBody.text;
                         }
                     }
+                    LinkText { text: "Bold"; action: function() { root.wrapComposeSelection("**", "**") } }
+                    LinkText { text: "Italic"; action: function() { root.wrapComposeSelection("_", "_") } }
+                    LinkText { text: "Code"; action: function() { root.wrapComposeSelection("`", "`") } }
+                    LinkText { text: "Quote"; action: function() { root.insertComposeText("\n> ") } }
+                    LinkText { text: "Link"; action: function() { composeLinkPopup.open() } }
+                    LinkText { text: "Emoji"; action: function() { emojiPopup.open() } }
                     Item { Layout.fillWidth: true }
                     Text {
                         text: "Body · Markdown"
@@ -4332,6 +4645,156 @@ ApplicationWindow {
             Text {
                 visible: root.identities.length === 0 && root.identityLoading
                 text: "Loading aliases…"
+                color: c("muted", "#a8ece7de")
+                font.family: c("font-family", "Inter")
+                font.pixelSize: n("font-size-small", 12)
+            }
+        }
+    }
+
+    Popup {
+        id: composeLinkPopup
+        width: 380
+        height: 190
+        modal: true
+        focus: true
+        anchors.centerIn: Overlay.overlay
+        background: Rectangle {
+            color: c("menu", "#23262c")
+            border.width: n("border-width", 1)
+            border.color: c("border-strong", "#292e323a")
+            radius: n("radius-panel", 8)
+        }
+        ColumnLayout {
+            anchors.fill: parent
+            anchors.margins: n("space-4", 16)
+            spacing: n("space-2", 8)
+            Text { text: "Insert link"; color: c("text", "#ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-title", 16); font.weight: n("font-weight-semibold", 600) }
+            SettingsField { id: composeLinkText; Layout.fillWidth: true; placeholder: "Link text" }
+            SettingsField { id: composeLinkUrl; Layout.fillWidth: true; placeholder: "https://example.com" }
+            RowLayout {
+                Layout.fillWidth: true
+                Item { Layout.fillWidth: true }
+                LinkText { text: "Cancel"; action: function() { composeLinkPopup.close() } }
+                LinkText {
+                    text: "Insert"
+                    action: function() {
+                        var label = composeLinkText.text || composeLinkUrl.text;
+                        root.insertComposeText("[" + label + "](" + composeLinkUrl.text + ")");
+                        composeLinkPopup.close();
+                    }
+                }
+            }
+        }
+    }
+
+    Popup {
+        id: emojiPopup
+        width: 320
+        height: 220
+        modal: true
+        focus: true
+        anchors.centerIn: Overlay.overlay
+        background: Rectangle {
+            color: c("menu", "#23262c")
+            border.width: n("border-width", 1)
+            border.color: c("border-strong", "#292e323a")
+            radius: n("radius-panel", 8)
+        }
+        ColumnLayout {
+            anchors.fill: parent
+            anchors.margins: n("space-4", 16)
+            spacing: n("space-2", 8)
+            RowLayout {
+                Layout.fillWidth: true
+                Text { text: "Emoji"; color: c("text", "#ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-title", 16); font.weight: n("font-weight-semibold", 600); Layout.fillWidth: true }
+                LinkText { text: "Close"; action: function() { emojiPopup.close() } }
+            }
+            Flow {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                spacing: n("space-1", 4)
+                Repeater {
+                    model: ["😀","😂","🥹","😊","😍","🤔","👍","👎","🎉","🔥","❤️","✅","⚠️","📎","📅","🔒","🙏","👀","💡","🚀","☕","🌿","✨","💯"]
+                    delegate: Rectangle {
+                        width: 36
+                        height: 32
+                        radius: n("radius-control", 2)
+                        color: emojiHover.hovered ? c("hover", "#2e2e323a") : "transparent"
+                        HoverHandler { id: emojiHover }
+                        Text { anchors.centerIn: parent; text: modelData; font.pixelSize: 18 }
+                        MouseArea {
+                            anchors.fill: parent
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: { root.insertComposeText(modelData); emojiPopup.close(); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Popup {
+        id: attachmentPreviewPopup
+        width: 760
+        height: 560
+        modal: true
+        focus: true
+        anchors.centerIn: Overlay.overlay
+        background: Rectangle {
+            color: c("menu", "#23262c")
+            border.width: n("border-width", 1)
+            border.color: c("border-strong", "#292e323a")
+            radius: n("radius-panel", 8)
+        }
+        ColumnLayout {
+            anchors.fill: parent
+            anchors.margins: n("space-4", 16)
+            spacing: n("space-2", 8)
+            RowLayout {
+                Layout.fillWidth: true
+                Text {
+                    text: root.attachmentPreview.name || "Attachment"
+                    color: c("text", "#ece7de")
+                    font.family: c("font-family", "Inter")
+                    font.pixelSize: n("font-size-title", 16)
+                    font.weight: n("font-weight-semibold", 600)
+                    Layout.fillWidth: true
+                    elide: Text.ElideRight
+                }
+                IconButton { icon: "close"; label: "Close preview"; onClicked: attachmentPreviewPopup.close() }
+            }
+            Image {
+                visible: (root.attachmentPreview.data_url || "").length > 0
+                source: root.attachmentPreview.data_url || ""
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                fillMode: Image.PreserveAspectFit
+                asynchronous: true
+            }
+            Flickable {
+                visible: root.attachmentPreview.text !== undefined
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                clip: true
+                contentWidth: width
+                contentHeight: previewText.contentHeight
+                ScrollBar.vertical: MailScrollBar {}
+                TextEdit {
+                    id: previewText
+                    width: parent.width
+                    text: root.attachmentPreview.text || ""
+                    readOnly: true
+                    selectByMouse: true
+                    wrapMode: TextEdit.Wrap
+                    color: c("text", "#ece7de")
+                    font.family: c("font-mono", "JetBrains Mono")
+                    font.pixelSize: n("font-size-small", 12)
+                }
+            }
+            Text {
+                visible: (root.attachmentPreview.data_url || "").length === 0 && root.attachmentPreview.text === undefined
+                text: "Preview is not available for this file."
                 color: c("muted", "#a8ece7de")
                 font.family: c("font-family", "Inter")
                 font.pixelSize: n("font-size-small", 12)
