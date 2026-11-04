@@ -241,6 +241,14 @@ pub mod qobject {
         fn select_message(self: &Self, id: &QString);
 
         #[qinvokable]
+        #[cxx_name = "loadRemoteContent"]
+        fn load_remote_content(self: &Self, id: &QString);
+
+        #[qinvokable]
+        #[cxx_name = "printMessage"]
+        fn print_message(self: &Self, id: &QString);
+
+        #[qinvokable]
         #[cxx_name = "setStarred"]
         fn set_starred(self: &Self, id: &QString, starred: bool);
 
@@ -357,12 +365,51 @@ pub mod qobject {
         );
 
         #[qinvokable]
+        #[cxx_name = "sendAdvancedMessage"]
+        fn send_advanced_message(
+            self: &Self,
+            from: &QString,
+            to: &QString,
+            cc: &QString,
+            bcc: &QString,
+            subject: &QString,
+            markdown: &QString,
+            attachments_json: &QString,
+            in_reply_to: &QString,
+            references: &QString,
+            expires_at: &QString,
+            obscure_subject: bool,
+        );
+
+        #[qinvokable]
+        #[cxx_name = "sendRichMessage"]
+        fn send_rich_message(
+            self: &Self,
+            from: &QString,
+            to: &QString,
+            cc: &QString,
+            bcc: &QString,
+            subject: &QString,
+            html: &QString,
+            plain: &QString,
+            attachments_json: &QString,
+            in_reply_to: &QString,
+            references: &QString,
+            expires_at: &QString,
+            obscure_subject: bool,
+        );
+
+        #[qinvokable]
         #[cxx_name = "saveAttachment"]
         fn save_attachment(self: &Self, id: &QString, seq: i64);
 
         #[qinvokable]
         #[cxx_name = "previewAttachment"]
         fn preview_attachment(self: &Self, id: &QString, seq: i64);
+
+        #[qinvokable]
+        #[cxx_name = "saveAllAttachments"]
+        fn save_all_attachments(self: &Self, id: &QString);
 
         #[qinvokable]
         #[cxx_name = "saveContact"]
@@ -420,6 +467,8 @@ pub(crate) enum Command {
     Refresh,
     OpenMailbox(String),
     Select(String),
+    LoadRemoteContent(String),
+    PrintMessage(String),
     SetStarred(String, bool),
     SetRead(String, bool),
     MoveMessage(String, String),
@@ -460,6 +509,33 @@ pub(crate) enum Command {
         attachments: String,
         in_reply_to: String,
         references: String,
+    },
+    SendAdvancedMessage {
+        from: String,
+        to: String,
+        cc: String,
+        bcc: String,
+        subject: String,
+        markdown: String,
+        attachments: String,
+        in_reply_to: String,
+        references: String,
+        expires_at: String,
+        obscure_subject: bool,
+    },
+    SendRichMessage {
+        from: String,
+        to: String,
+        cc: String,
+        bcc: String,
+        subject: String,
+        html: String,
+        plain: String,
+        attachments: String,
+        in_reply_to: String,
+        references: String,
+        expires_at: String,
+        obscure_subject: bool,
     },
     Rpc {
         tool: String,
@@ -518,6 +594,7 @@ pub(crate) enum Command {
     DeleteFolder(String),
     SaveAttachment { id: String, seq: i64 },
     PreviewAttachment { id: String, seq: i64 },
+    SaveAllAttachments(String),
 }
 
 pub struct AppControllerRust {
@@ -684,6 +761,26 @@ impl qobject::AppController {
                             let _ = rt.block_on(runtime.refresh_scheduled());
                         }
                         selected = first_id(&runtime, &folder);
+                    }
+                    Command::PrintMessage(id) => {
+                        let result = runtime
+                            .export_message_pdf(&id)
+                            .and_then(|path| runtime.open_printed_pdf(&path));
+                        notify_result(&qt, result.map_err(|e| e.to_string()), "Print ready");
+                        snapshot_needed = false;
+                    }
+                    Command::LoadRemoteContent(id) => {
+                        match rt.block_on(runtime.message_with_remote_content(&id)) {
+                            Ok(detail) => {
+                                let json = serde_json::to_string(&detail).unwrap_or_else(|_| "{}".into());
+                                let _ = qt.queue(move |mut q| q.as_mut().set_selected_json(json.into()));
+                            }
+                            Err(err) => {
+                                let message = err.to_string();
+                                let _ = qt.queue(move |mut q| q.as_mut().set_toast_text(message.into()));
+                            }
+                        }
+                        snapshot_needed = false;
                     }
                     Command::Select(id) => {
                         let _ = rt.block_on(runtime.ensure_attachments(&id));
@@ -971,6 +1068,106 @@ impl qobject::AppController {
                         notify_result(&qt, result, "Message queued for sending");
                         snapshot_needed = false;
                     }
+                    Command::SendAdvancedMessage {
+                        from,
+                        to,
+                        cc,
+                        bcc,
+                        subject,
+                        markdown,
+                        attachments,
+                        in_reply_to,
+                        references,
+                        expires_at,
+                        obscure_subject,
+                    } => {
+                        let result = rt.block_on(async {
+                            let parse = |value: String| -> Vec<String> {
+                                value
+                                    .split(',')
+                                    .map(str::trim)
+                                    .filter(|part| !part.is_empty())
+                                    .map(str::to_string)
+                                    .collect()
+                            };
+                            let from = from.trim();
+                            let attachments: Vec<std::path::PathBuf> =
+                                serde_json::from_str::<Vec<String>>(&attachments)
+                                    .unwrap_or_default()
+                                    .into_iter()
+                                    .map(std::path::PathBuf::from)
+                                    .collect();
+                            runtime
+                                .send_markdown_with_options(
+                                    if from.is_empty() { None } else { Some(from) },
+                                    &parse(to),
+                                    &parse(cc),
+                                    &parse(bcc),
+                                    &subject,
+                                    &markdown,
+                                    &attachments,
+                                    if in_reply_to.is_empty() { None } else { Some(&in_reply_to) },
+                                    if references.is_empty() { None } else { Some(&references) },
+                                    if expires_at.is_empty() { None } else { Some(&expires_at) },
+                                    obscure_subject,
+                                )
+                                .await
+                                .map_err(|e| e.to_string())
+                        });
+                        notify_result(&qt, result, "Message sent");
+                        snapshot_needed = false;
+                    }
+                    Command::SendRichMessage {
+                        from,
+                        to,
+                        cc,
+                        bcc,
+                        subject,
+                        html,
+                        plain,
+                        attachments,
+                        in_reply_to,
+                        references,
+                        expires_at,
+                        obscure_subject,
+                    } => {
+                        let result = rt.block_on(async {
+                            let parse = |value: String| -> Vec<String> {
+                                value
+                                    .split(',')
+                                    .map(str::trim)
+                                    .filter(|part| !part.is_empty())
+                                    .map(str::to_string)
+                                    .collect()
+                            };
+                            let from = from.trim();
+                            let attachments: Vec<std::path::PathBuf> =
+                                serde_json::from_str::<Vec<String>>(&attachments)
+                                    .unwrap_or_default()
+                                    .into_iter()
+                                    .map(std::path::PathBuf::from)
+                                    .collect();
+                            runtime
+                                .send_html_with_options(
+                                    if from.is_empty() { None } else { Some(from) },
+                                    &parse(to),
+                                    &parse(cc),
+                                    &parse(bcc),
+                                    &subject,
+                                    &html,
+                                    &plain,
+                                    &attachments,
+                                    if in_reply_to.is_empty() { None } else { Some(&in_reply_to) },
+                                    if references.is_empty() { None } else { Some(&references) },
+                                    if expires_at.is_empty() { None } else { Some(&expires_at) },
+                                    obscure_subject,
+                                )
+                                .await
+                                .map_err(|e| e.to_string())
+                        });
+                        notify_result(&qt, result, "Message sent");
+                        snapshot_needed = false;
+                    }
                     Command::SaveContact { uid, vcard } => {
                         let result = rt.block_on(async {
                             runtime
@@ -994,6 +1191,18 @@ impl qobject::AppController {
                                 let _ = qt.queue(move |mut q| q.as_mut().set_toast_text(message.into()));
                             }
                         }
+                        snapshot_needed = false;
+                    }
+                    Command::SaveAllAttachments(id) => {
+                        let result = runtime
+                            .save_all_attachments(&id)
+                            .map(|paths| paths.len())
+                            .map_err(|e| e.to_string());
+                        let message = match &result {
+                            Ok(count) => format!("Saved {count} attachment(s)"),
+                            Err(err) => err.clone(),
+                        };
+                        let _ = qt.queue(move |mut q| q.as_mut().set_toast_text(message.into()));
                         snapshot_needed = false;
                     }
                     Command::SaveAttachment { id, seq } => {
@@ -1388,6 +1597,18 @@ impl qobject::AppController {
     pub fn open_mailbox(self: &Self, folder: &QString) {
         if let Some(tx) = &self.tx {
             let _ = tx.send(Command::OpenMailbox(folder.to_string()));
+        }
+    }
+
+    pub fn print_message(self: &Self, id: &QString) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Command::PrintMessage(id.to_string()));
+        }
+    }
+
+    pub fn load_remote_content(self: &Self, id: &QString) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Command::LoadRemoteContent(id.to_string()));
         }
     }
 
@@ -1795,6 +2016,12 @@ impl qobject::AppController {
         self.as_mut().set_gpg_json(json.into());
     }
 
+    pub fn save_all_attachments(self: &Self, id: &QString) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Command::SaveAllAttachments(id.to_string()));
+        }
+    }
+
     pub fn preview_attachment(self: &Self, id: &QString, seq: i64) {
         if let Some(tx) = &self.tx {
             let _ = tx.send(Command::PreviewAttachment { id: id.to_string(), seq });
@@ -1824,6 +2051,70 @@ impl qobject::AppController {
                 attachments: attachments_json.to_string(),
                 in_reply_to: in_reply_to.to_string(),
                 references: references.to_string(),
+            });
+        }
+    }
+
+    pub fn send_advanced_message(
+        self: &Self,
+        from: &QString,
+        to: &QString,
+        cc: &QString,
+        bcc: &QString,
+        subject: &QString,
+        markdown: &QString,
+        attachments_json: &QString,
+        in_reply_to: &QString,
+        references: &QString,
+        expires_at: &QString,
+        obscure_subject: bool,
+    ) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Command::SendAdvancedMessage {
+                from: from.to_string(),
+                to: to.to_string(),
+                cc: cc.to_string(),
+                bcc: bcc.to_string(),
+                subject: subject.to_string(),
+                markdown: markdown.to_string(),
+                attachments: attachments_json.to_string(),
+                in_reply_to: in_reply_to.to_string(),
+                references: references.to_string(),
+                expires_at: expires_at.to_string(),
+                obscure_subject,
+            });
+        }
+    }
+
+    pub fn send_rich_message(
+        self: &Self,
+        from: &QString,
+        to: &QString,
+        cc: &QString,
+        bcc: &QString,
+        subject: &QString,
+        html: &QString,
+        plain: &QString,
+        attachments_json: &QString,
+        in_reply_to: &QString,
+        references: &QString,
+        expires_at: &QString,
+        obscure_subject: bool,
+    ) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Command::SendRichMessage {
+                from: from.to_string(),
+                to: to.to_string(),
+                cc: cc.to_string(),
+                bcc: bcc.to_string(),
+                subject: subject.to_string(),
+                html: html.to_string(),
+                plain: plain.to_string(),
+                attachments: attachments_json.to_string(),
+                in_reply_to: in_reply_to.to_string(),
+                references: references.to_string(),
+                expires_at: expires_at.to_string(),
+                obscure_subject,
             });
         }
     }

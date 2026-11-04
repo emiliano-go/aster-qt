@@ -79,12 +79,19 @@ pub struct CachedAttachmentView {
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
+pub struct BlockedContentItem {
+    pub kind: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct ExternalContentReport {
     pub blocked_count: u32,
     pub has_remote_images: bool,
     pub has_tracking_pixels: bool,
     pub has_remote_fonts: bool,
     pub has_remote_css: bool,
+    pub blocked_items: Vec<BlockedContentItem>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -324,9 +331,35 @@ impl ClientRuntime {
             .get_cached_message(id)
             .map_err(ClientError::Storage)?
             .ok_or_else(|| ClientError::Protocol(format!("message not found: {}", id)))?;
+        self.build_detail(msg, None)
+    }
+
+    pub async fn message_with_remote_content(&self, id: &str) -> ClientResult<MessageDetail> {
+        let msg = self
+            .db()
+            .get_cached_message(id)
+            .map_err(ClientError::Storage)?
+            .ok_or_else(|| ClientError::Protocol(format!("message not found: {}", id)))?;
+        let is_html = is_html(&msg);
+        let body = msg.body_text.clone().unwrap_or_default();
+        let rewritten = if is_html {
+            self.fetch_remote_images(&body).await
+        } else {
+            body
+        };
+        let body_html = safe_body_html(&rewritten, is_html, true);
+        self.build_detail(msg, Some(body_html))
+    }
+
+    fn build_detail(
+        &self,
+        msg: CachedMessage,
+        body_html_override: Option<String>,
+    ) -> ClientResult<MessageDetail> {
+        let id = msg.aster_id.clone();
         let attachments = self
             .db()
-            .get_message_attachment_meta(id)
+            .get_message_attachment_meta(&id)
             .map_err(ClientError::Storage)?
             .into_iter()
             .map(|a| CachedAttachmentView {
@@ -341,9 +374,10 @@ impl ClientRuntime {
             .collect();
         let is_html = is_html(&msg);
         let body = msg.body_text.clone().unwrap_or_default();
-        let mut body_html = safe_body_html(&body, is_html);
+        let mut body_html = body_html_override
+            .unwrap_or_else(|| safe_body_html(&body, is_html, false));
         if body_html.contains("cid:") {
-            if let Ok(parts) = self.db().get_message_attachments(id) {
+            if let Ok(parts) = self.db().get_message_attachments(&id) {
                 for part in parts {
                     let Some(content_id) = part.content_id.as_deref() else {
                         continue;
@@ -382,6 +416,131 @@ impl ClientRuntime {
         Ok(detail)
     }
 
+    async fn fetch_remote_images(&self, body: &str) -> String {
+        let urls = image_urls(body);
+        if urls.is_empty() {
+            return body.to_string();
+        }
+        let Ok(client) = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+        else {
+            return neutralized_html(body);
+        };
+        let dir = self.data_dir().join("remote-images");
+        let _ = std::fs::create_dir_all(&dir);
+        let mut replacements: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for url in urls.into_iter().take(20) {
+            let Ok(parsed) = reqwest::Url::parse(&url) else {
+                continue;
+            };
+            if parsed.scheme() != "http" && parsed.scheme() != "https" {
+                continue;
+            }
+            let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
+            if host == "localhost"
+                || host == "0.0.0.0"
+                || host == "::1"
+                || host.starts_with("127.")
+                || host.starts_with("10.")
+                || host.starts_with("192.168.")
+                || host.starts_with("169.254.")
+                || host
+                    .strip_prefix("172.")
+                    .and_then(|rest| rest.split('.').next())
+                    .and_then(|octet| octet.parse::<u8>().ok())
+                    .is_some_and(|octet| (16..=31).contains(&octet))
+            {
+                continue;
+            }
+            let Ok(response) = client.get(parsed).send().await else {
+                continue;
+            };
+            if !response.status().is_success() {
+                continue;
+            }
+            if response.content_length().unwrap_or(0) > 8 * 1024 * 1024 {
+                continue;
+            }
+            let content_type = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("image/png")
+                .to_string();
+            let ext = match content_type.split(';').next().unwrap_or_default() {
+                "image/jpeg" => "jpg",
+                "image/gif" => "gif",
+                "image/webp" => "webp",
+                "image/svg+xml" => "svg",
+                _ => "png",
+            };
+            let Ok(bytes) = response.bytes().await else {
+                continue;
+            };
+            if bytes.len() > 8 * 1024 * 1024 {
+                continue;
+            }
+            let name = format!("{}.{}", uuid::Uuid::new_v4().simple(), ext);
+            let path = dir.join(name);
+            if std::fs::write(&path, &bytes).is_ok() {
+                replacements.insert(url, format!("file://{}", path.display()));
+            }
+        }
+        map_img_srcs(body, |value| {
+            if let Some(path) = replacements.get(value) {
+                Some(path.clone())
+            } else if value.starts_with("http://") || value.starts_with("https://") {
+                Some(String::new())
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn export_message_pdf(&self, id: &str) -> ClientResult<std::path::PathBuf> {
+        let detail = self.message(id)?;
+        let dir = self.data_dir().join("print");
+        std::fs::create_dir_all(&dir).map_err(|e| ClientError::Storage(e.to_string()))?;
+        let stem = format!("message-{}", uuid::Uuid::new_v4().simple());
+        let html_path = dir.join(format!("{stem}.html"));
+        let pdf_path = dir.join(format!("{stem}.pdf"));
+        let html = format!(
+            "<!doctype html><html><head><meta charset=\"utf-8\"><title>{}</title><style>body{{font-family:Inter,system-ui,sans-serif;color:#111;margin:32px;line-height:1.5}}img{{max-width:100%;height:auto}}a{{color:#8a4b22}}</style></head><body><h1>{}</h1><p><strong>{}</strong></p><p>{}</p><hr>{}</body></html>",
+            escape_html(&detail.message.subject),
+            escape_html(&detail.message.subject),
+            escape_html(&detail.message.sender),
+            escape_html(&detail.message.date.as_deref().unwrap_or("")),
+            if detail.is_html { detail.body_html } else { format!("<pre>{}</pre>", escape_html(&detail.body)) },
+        );
+        std::fs::write(&html_path, html).map_err(|e| ClientError::Storage(e.to_string()))?;
+        let status = std::process::Command::new("chromium")
+            .arg("--headless")
+            .arg("--disable-gpu")
+            .arg("--no-sandbox")
+            .arg("--no-pdf-header-footer")
+            .arg("--print-to-pdf")
+            .arg(pdf_path.to_string_lossy().to_string())
+            .arg(format!("file://{}", html_path.display()))
+            .status();
+        if status.map(|status| status.success()).unwrap_or(false) {
+            return Ok(pdf_path);
+        }
+        let _ = std::process::Command::new("xdg-open")
+            .arg(&html_path)
+            .spawn();
+        Err(ClientError::Protocol("could not render a printable PDF".into()))
+    }
+
+    pub fn open_printed_pdf(&self, path: &std::path::Path) -> ClientResult<()> {
+        std::process::Command::new("xdg-open")
+            .arg(path)
+            .spawn()
+            .map(|_| ())
+            .map_err(|err| ClientError::Protocol(format!("open PDF: {err}")))
+    }
+
     pub fn attachment(&self, id: &str, seq: i64) -> ClientResult<Vec<u8>> {
         self.db()
             .get_message_attachments(id)
@@ -411,6 +570,33 @@ impl ClientRuntime {
                 "data:{};base64,{}",
                 attachment.content_type, encoded
             ));
+        } else if attachment.content_type == "application/pdf" {
+            let dir = self.data_dir().join("previews");
+            std::fs::create_dir_all(&dir).map_err(|e| ClientError::Storage(e.to_string()))?;
+            let stem = format!("pdf-{}", uuid::Uuid::new_v4().simple());
+            let pdf = dir.join(format!("{stem}.pdf"));
+            let png = dir.join(format!("{stem}.png"));
+            std::fs::write(&pdf, &attachment.data)
+                .map_err(|e| ClientError::Storage(e.to_string()))?;
+            let rendered = std::process::Command::new("pdftoppm")
+                .arg("-png")
+                .arg("-f")
+                .arg("1")
+                .arg("-singlefile")
+                .arg("-scale-to")
+                .arg("1600")
+                .arg(&pdf)
+                .arg(dir.join(&stem))
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false);
+            if rendered {
+                if let Ok(bytes) = std::fs::read(&png) {
+                    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+                    value["data_url"] = serde_json::json!(format!("data:image/png;base64,{encoded}"));
+                }
+            }
+            let _ = std::fs::remove_file(&pdf);
         } else if attachment.content_type.starts_with("text/")
             || attachment.content_type == "application/json"
         {
@@ -577,6 +763,118 @@ impl ClientRuntime {
             .await
             .map_err(|_| ClientError::Session("outbox worker is not running".into()))?;
         Ok(id)
+    }
+
+    pub async fn send_html_with_options(
+        &self,
+        from: Option<&str>,
+        to: &[String],
+        cc: &[String],
+        bcc: &[String],
+        subject: &str,
+        html: &str,
+        plain: &str,
+        attachments: &[PathBuf],
+        in_reply_to: Option<&str>,
+        references: Option<&str>,
+        expires_at: Option<&str>,
+        obscure_subject: bool,
+    ) -> ClientResult<()> {
+        if to.is_empty() && cc.is_empty() && bcc.is_empty() {
+            return Err(ClientError::Protocol("add at least one recipient".into()));
+        }
+        let from = match from {
+            Some(value) if !value.trim().is_empty() => value.to_string(),
+            _ => self.session().read().await.default_sender_address(),
+        };
+        let raw = build_html_mime(
+            &from,
+            to,
+            cc,
+            bcc,
+            subject,
+            plain,
+            html,
+            attachments,
+            in_reply_to,
+            references,
+        )?;
+        let recipients: Vec<String> = to.iter().chain(cc.iter()).chain(bcc.iter()).cloned().collect();
+        let (mut payload, token) = aster_bridge_core::smtp::server::build_threaded_send_payload(
+            &raw,
+            Some(from),
+            recipients,
+            self.session(),
+            self.client(),
+            self.db(),
+        )
+        .await
+        .map_err(ClientError::from_bridge)?;
+        if let Some(value) = expires_at.filter(|value| !value.trim().is_empty()) {
+            payload["expires_at"] = serde_json::json!(value);
+        }
+        if obscure_subject {
+            payload["obscure_subject"] = serde_json::json!(true);
+        }
+        self.client()
+            .send_mail(&token, &payload)
+            .await
+            .map_err(ClientError::from_bridge)
+    }
+
+    pub async fn send_markdown_with_options(
+        &self,
+        from: Option<&str>,
+        to: &[String],
+        cc: &[String],
+        bcc: &[String],
+        subject: &str,
+        markdown: &str,
+        attachments: &[PathBuf],
+        in_reply_to: Option<&str>,
+        references: Option<&str>,
+        expires_at: Option<&str>,
+        obscure_subject: bool,
+    ) -> ClientResult<()> {
+        if to.is_empty() && cc.is_empty() && bcc.is_empty() {
+            return Err(ClientError::Protocol("add at least one recipient".into()));
+        }
+        let from = match from {
+            Some(value) if !value.trim().is_empty() => value.to_string(),
+            _ => self.session().read().await.default_sender_address(),
+        };
+        let raw = build_markdown_mime(
+            &from,
+            to,
+            cc,
+            bcc,
+            subject,
+            markdown,
+            attachments,
+            in_reply_to,
+            references,
+        )?;
+        let recipients: Vec<String> = to.iter().chain(cc.iter()).chain(bcc.iter()).cloned().collect();
+        let (mut payload, token) = aster_bridge_core::smtp::server::build_threaded_send_payload(
+            &raw,
+            Some(from),
+            recipients,
+            self.session(),
+            self.client(),
+            self.db(),
+        )
+        .await
+        .map_err(ClientError::from_bridge)?;
+        if let Some(value) = expires_at.filter(|value| !value.trim().is_empty()) {
+            payload["expires_at"] = serde_json::json!(value);
+        }
+        if obscure_subject {
+            payload["obscure_subject"] = serde_json::json!(true);
+        }
+        self.client()
+            .send_mail(&token, &payload)
+            .await
+            .map_err(ClientError::from_bridge)
     }
 
     pub async fn queue_markdown_with_attachments(
@@ -1810,6 +2108,21 @@ impl ClientRuntime {
         Ok(path)
     }
 
+    pub fn save_all_attachments(&self, id: &str) -> ClientResult<Vec<std::path::PathBuf>> {
+        let seqs: Vec<i64> = self
+            .db()
+            .get_message_attachment_meta(id)
+            .map_err(ClientError::Storage)?
+            .into_iter()
+            .map(|item| item.seq)
+            .collect();
+        let mut saved = Vec::with_capacity(seqs.len());
+        for seq in seqs {
+            saved.push(self.save_attachment(id, seq)?);
+        }
+        Ok(saved)
+    }
+
     pub async fn send_identities(&self) -> Vec<SendIdentityView> {
         let session = self.session().read().await;
         session
@@ -2194,6 +2507,74 @@ impl ClientRuntime {
     }
 }
 
+fn build_html_mime(
+    from: &str,
+    to: &[String],
+    cc: &[String],
+    bcc: &[String],
+    subject: &str,
+    plain: &str,
+    html: &str,
+    attachments: &[PathBuf],
+    in_reply_to: Option<&str>,
+    references: Option<&str>,
+) -> ClientResult<Vec<u8>> {
+    let mut html = html.to_string();
+    let mut builder = MessageBuilder::new();
+    builder = builder.from(Address::new_address(None::<String>, from.to_string()));
+    builder = builder.subject(subject.to_string());
+    if let Some(value) = in_reply_to.filter(|value| !value.is_empty()) {
+        builder = builder.in_reply_to(value.to_string());
+    }
+    if let Some(value) = references.filter(|value| !value.is_empty()) {
+        builder = builder.references(value.to_string());
+    }
+    if !to.is_empty() {
+        builder = builder.to(Address::new_list(
+            to.iter()
+                .map(|email| Address::new_address(None::<String>, email.clone()))
+                .collect(),
+        ));
+    }
+    if !cc.is_empty() {
+        builder = builder.cc(Address::new_list(
+            cc.iter()
+                .map(|email| Address::new_address(None::<String>, email.clone()))
+                .collect(),
+        ));
+    }
+    if !bcc.is_empty() {
+        builder = builder.bcc(Address::new_list(
+            bcc.iter()
+                .map(|email| Address::new_address(None::<String>, email.clone()))
+                .collect(),
+        ));
+    }
+    for path in attachments {
+        let name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| ClientError::Protocol(format!("invalid attachment path: {}", path.display())))?;
+        let data = std::fs::read(path)
+            .map_err(|err| ClientError::Protocol(format!("read {}: {}", path.display(), err)))?;
+        let content_type = attachment_content_type(name);
+        let quoted = format!("src=\"{}\"", name);
+        let dotted = format!("src=\"./{}\"", name);
+        if content_type.starts_with("image/") && (html.contains(&quoted) || html.contains(&dotted)) {
+            let cid = format!("{}@aster", uuid::Uuid::new_v4().simple());
+            let cid_url = format!("src=\"cid:{}\"", cid);
+            html = html.replace(&quoted, &cid_url).replace(&dotted, &cid_url);
+            builder = builder.inline(content_type, cid, data);
+        } else {
+            builder = builder.attachment(content_type, name, data);
+        }
+    }
+    builder = builder.text_body(plain.to_string()).html_body(html);
+    builder
+        .write_to_vec()
+        .map_err(|e| ClientError::Protocol(format!("build message: {e}")))
+}
+
 fn build_markdown_mime(
     from: &str,
     to: &[String],
@@ -2313,19 +2694,105 @@ fn external_content_report(body: &str, is_html: bool) -> ExternalContentReport {
         if tiny {
             report.has_tracking_pixels = true;
         }
+        let detail = tag
+            .split("src=")
+            .nth(1)
+            .and_then(|rest| rest.trim_start().chars().next().filter(|c| *c == '"' || *c == '\'').map(|quote| {
+                rest.trim_start()[1..].split(quote).next().unwrap_or_default().to_string()
+            }))
+            .unwrap_or_default();
+        report.blocked_items.push(BlockedContentItem {
+            kind: if tiny { "tracking pixel".to_string() } else { "remote image".to_string() },
+            detail,
+        });
     }
     if lower.contains("@font-face") || lower.contains(".woff") || lower.contains(".ttf") {
         report.has_remote_fonts = true;
         report.blocked_count += 1;
+        report.blocked_items.push(BlockedContentItem {
+            kind: "remote font".to_string(),
+            detail: String::new(),
+        });
     }
     if lower.contains("@import") || lower.contains("<link") {
         report.has_remote_css = true;
         report.blocked_count += 1;
+        report.blocked_items.push(BlockedContentItem {
+            kind: "remote stylesheet".to_string(),
+            detail: String::new(),
+        });
     }
     report
 }
 
-fn safe_body_html(body: &str, is_html: bool) -> String {
+fn map_img_srcs<F>(html: &str, mut map: F) -> String
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    let lower = html.to_ascii_lowercase();
+    let mut out = String::with_capacity(html.len());
+    let mut cursor = 0usize;
+    while let Some(rel) = lower[cursor..].find("<img") {
+        let start = cursor + rel;
+        let Some(end_rel) = lower[start..].find('>') else {
+            break;
+        };
+        let end = start + end_rel;
+        out.push_str(&html[cursor..start]);
+        let tag = &html[start..end];
+        let tag_lower = tag.to_ascii_lowercase();
+        let mut rewritten = tag.to_string();
+        if let Some(src_rel) = tag_lower.find("src") {
+            let after = &tag[src_rel + 3..];
+            let after_trim = after.trim_start();
+            if let Some(eq_rest) = after_trim.strip_prefix('=') {
+                let eq_trim = eq_rest.trim_start();
+                if let Some(quote) = eq_trim.chars().next().filter(|c| *c == '"' || *c == '\'') {
+                    if let Some(close) = eq_trim[1..].find(quote) {
+                        let value = &eq_trim[1..1 + close];
+                        if let Some(replacement) = map(value) {
+                            let value_start = src_rel
+                                + 3
+                                + (after.len() - after_trim.len())
+                                + 1
+                                + (eq_rest.len() - eq_trim.len())
+                                + 1;
+                            let value_end = value_start + value.len();
+                            rewritten.replace_range(value_start..value_end, &replacement);
+                        }
+                    }
+                }
+            }
+        }
+        out.push_str(&rewritten);
+        out.push('>');
+        cursor = end + 1;
+    }
+    out.push_str(&html[cursor..]);
+    out
+}
+
+fn neutralized_html(body: &str) -> String {
+    map_img_srcs(body, |value| {
+        (value.starts_with("http://") || value.starts_with("https://"))
+            .then(|| String::new())
+    })
+}
+
+fn image_urls(body: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let _ = map_img_srcs(body, |value| {
+        if (value.starts_with("http://") || value.starts_with("https://"))
+            && !out.iter().any(|item| item == value)
+        {
+            out.push(value.to_string());
+        }
+        None
+    });
+    out
+}
+
+fn safe_body_html(body: &str, is_html: bool, allow_images: bool) -> String {
     if !is_html {
         return format!(
             "<pre style=\"white-space:pre-wrap;margin:0;font-family:Inter,system-ui,sans-serif;font-size:15px;line-height:1.5;color:inherit\">{}</pre>",
@@ -2345,8 +2812,14 @@ fn safe_body_html(body: &str, is_html: bool) -> String {
             "valign", "colspan", "rowspan", "dir", "lang", "border", "cellpadding",
             "cellspacing", "bgcolor", "color", "face", "size",
         ])
-        .add_url_schemes(&["http", "https", "mailto"]);
-    let inlined = css_inline::inline(body).unwrap_or_else(|_| body.to_string());
+        .add_url_schemes(&["http", "https", "mailto", "cid", "data", "file"]);
+    if allow_images {
+        builder
+            .add_tags(&["img"])
+            .add_generic_attributes(&["src", "srcset", "loading"]);
+    }
+    let source = if allow_images { body.to_string() } else { neutralized_html(body) };
+    let inlined = css_inline::inline(&source).unwrap_or(source);
     builder.clean(&inlined).to_string()
 }
 
