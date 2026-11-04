@@ -52,6 +52,8 @@ pub mod qobject {
         #[qproperty(QString, outbox_json, cxx_name = "outboxJson")]
         #[qproperty(QString, recipient_key_json, cxx_name = "recipientKeyJson")]
         #[qproperty(QString, diagnostics_json, cxx_name = "diagnosticsJson")]
+        #[qproperty(QString, view_counts_json, cxx_name = "viewCountsJson")]
+        #[qproperty(QString, attachment_preview_json, cxx_name = "attachmentPreviewJson")]
         #[qproperty(QString, folder_id, cxx_name = "folderId")]
         #[qproperty(bool, loading, cxx_name = "loading")]
         #[qproperty(bool, ready, cxx_name = "ready")]
@@ -100,6 +102,14 @@ pub mod qobject {
         #[qinvokable]
         #[cxx_name = "cancelQueuedSend"]
         fn cancel_queued_send(self: &Self, queue_id: &QString);
+
+        #[qinvokable]
+        #[cxx_name = "cancelScheduled"]
+        fn cancel_scheduled(self: &Self, scheduled_id: &QString);
+
+        #[qinvokable]
+        #[cxx_name = "sendScheduledNow"]
+        fn send_scheduled_now(self: &Self, scheduled_id: &QString);
 
         #[qsignal]
         #[cxx_name = "confirmDelete"]
@@ -247,6 +257,14 @@ pub mod qobject {
         fn trash_message(self: &Self, id: &QString);
 
         #[qinvokable]
+        #[cxx_name = "setSpam"]
+        fn set_spam(self: &Self, id: &QString, spam: bool);
+
+        #[qinvokable]
+        #[cxx_name = "restoreMessage"]
+        fn restore_message(self: &Self, id: &QString);
+
+        #[qinvokable]
         #[cxx_name = "moveMessage"]
         fn move_message(self: &Self, id: &QString, folder: &QString);
 
@@ -324,8 +342,27 @@ pub mod qobject {
         );
 
         #[qinvokable]
+        #[cxx_name = "sendThreadedMessage"]
+        fn send_threaded_message(
+            self: &Self,
+            from: &QString,
+            to: &QString,
+            cc: &QString,
+            bcc: &QString,
+            subject: &QString,
+            markdown: &QString,
+            attachments_json: &QString,
+            in_reply_to: &QString,
+            references: &QString,
+        );
+
+        #[qinvokable]
         #[cxx_name = "saveAttachment"]
         fn save_attachment(self: &Self, id: &QString, seq: i64);
+
+        #[qinvokable]
+        #[cxx_name = "previewAttachment"]
+        fn preview_attachment(self: &Self, id: &QString, seq: i64);
 
         #[qinvokable]
         #[cxx_name = "saveContact"]
@@ -387,6 +424,8 @@ pub(crate) enum Command {
     SetRead(String, bool),
     MoveMessage(String, String),
     TrashMessage(String),
+    SetSpam(String, bool),
+    RestoreMessage(String),
     LoadSettingsData,
     LoadOutbox,
     RetryOutbox(i64),
@@ -410,6 +449,17 @@ pub(crate) enum Command {
         subject: String,
         markdown: String,
         attachments: String,
+    },
+    SendThreadedMessage {
+        from: String,
+        to: String,
+        cc: String,
+        bcc: String,
+        subject: String,
+        markdown: String,
+        attachments: String,
+        in_reply_to: String,
+        references: String,
     },
     Rpc {
         tool: String,
@@ -451,6 +501,8 @@ pub(crate) enum Command {
         at_iso: String,
     },
     CancelQueued(String),
+    CancelScheduled(String),
+    SendScheduledNow(String),
     CreateTag(String),
     DeleteTag(String),
     AssignTag { ids: Vec<String>, token: String },
@@ -465,6 +517,7 @@ pub(crate) enum Command {
     MoveFolder { token: String, parent: String },
     DeleteFolder(String),
     SaveAttachment { id: String, seq: i64 },
+    PreviewAttachment { id: String, seq: i64 },
 }
 
 pub struct AppControllerRust {
@@ -497,6 +550,8 @@ pub struct AppControllerRust {
     outbox_json: QString,
     recipient_key_json: QString,
     diagnostics_json: QString,
+    view_counts_json: QString,
+    attachment_preview_json: QString,
     folder_id: QString,
     loading: bool,
     ready: bool,
@@ -548,6 +603,8 @@ impl Default for AppControllerRust {
             outbox_json: "[]".into(),
             recipient_key_json: "{}".into(),
             diagnostics_json: "{}".into(),
+            view_counts_json: "{}".into(),
+            attachment_preview_json: "{}".into(),
             folder_id: "inbox".into(),
             loading: true,
             ready: false,
@@ -623,6 +680,9 @@ impl qobject::AppController {
                     Command::Refresh => {}
                     Command::OpenMailbox(next) => {
                         folder = next;
+                        if folder == "scheduled" {
+                            let _ = rt.block_on(runtime.refresh_scheduled());
+                        }
                         selected = first_id(&runtime, &folder);
                     }
                     Command::Select(id) => {
@@ -664,6 +724,24 @@ impl qobject::AppController {
                                 .map_err(|e| e.to_string())
                         });
                         notify_result(&qt, result, "Message moved to Trash");
+                    }
+                    Command::SetSpam(id, spam) => {
+                        let result = rt.block_on(async {
+                            runtime
+                                .set_spam(std::slice::from_ref(&id), spam)
+                                .await
+                                .map_err(|e| e.to_string())
+                        });
+                        notify_result(&qt, result, if spam { "Marked as spam" } else { "Marked as not spam" });
+                    }
+                    Command::RestoreMessage(id) => {
+                        let result = rt.block_on(async {
+                            runtime
+                                .restore_messages(std::slice::from_ref(&id))
+                                .await
+                                .map_err(|e| e.to_string())
+                        });
+                        notify_result(&qt, result, "Message restored");
                     }
                     Command::LoadSettingsData => {
                         rt.block_on(push_settings_data(&runtime, &qt));
@@ -847,6 +925,52 @@ impl qobject::AppController {
                         notify_result(&qt, result, "Message queued for sending");
                         snapshot_needed = false;
                     }
+                    Command::SendThreadedMessage {
+                        from,
+                        to,
+                        cc,
+                        bcc,
+                        subject,
+                        markdown,
+                        attachments,
+                        in_reply_to,
+                        references,
+                    } => {
+                        let result = rt.block_on(async {
+                            let parse = |value: String| -> Vec<String> {
+                                value
+                                    .split(',')
+                                    .map(str::trim)
+                                    .filter(|part| !part.is_empty())
+                                    .map(str::to_string)
+                                    .collect()
+                            };
+                            let from = from.trim();
+                            let attachments: Vec<std::path::PathBuf> =
+                                serde_json::from_str::<Vec<String>>(&attachments)
+                                    .unwrap_or_default()
+                                    .into_iter()
+                                    .map(std::path::PathBuf::from)
+                                    .collect();
+                            runtime
+                                .send_markdown_with_headers(
+                                    if from.is_empty() { None } else { Some(from) },
+                                    &parse(to),
+                                    &parse(cc),
+                                    &parse(bcc),
+                                    &subject,
+                                    &markdown,
+                                    &attachments,
+                                    if in_reply_to.is_empty() { None } else { Some(&in_reply_to) },
+                                    if references.is_empty() { None } else { Some(&references) },
+                                )
+                                .await
+                                .map(|_| ())
+                                .map_err(|e| e.to_string())
+                        });
+                        notify_result(&qt, result, "Message queued for sending");
+                        snapshot_needed = false;
+                    }
                     Command::SaveContact { uid, vcard } => {
                         let result = rt.block_on(async {
                             runtime
@@ -857,6 +981,19 @@ impl qobject::AppController {
                         });
                         notify_result(&qt, result, "Contact saved");
                         rt.block_on(push_settings_data(&runtime, &qt));
+                        snapshot_needed = false;
+                    }
+                    Command::PreviewAttachment { id, seq } => {
+                        match runtime.attachment_preview(&id, seq) {
+                            Ok(value) => {
+                                let json = value.to_string();
+                                let _ = qt.queue(move |mut q| q.as_mut().set_attachment_preview_json(json.into()));
+                            }
+                            Err(err) => {
+                                let message = err.to_string();
+                                let _ = qt.queue(move |mut q| q.as_mut().set_toast_text(message.into()));
+                            }
+                        }
                         snapshot_needed = false;
                     }
                     Command::SaveAttachment { id, seq } => {
@@ -984,6 +1121,21 @@ impl qobject::AppController {
                                 .into_iter()
                                 .map(std::path::PathBuf::from)
                                 .collect();
+                            if schedule {
+                                return runtime
+                                    .schedule_markdown_with_attachments(
+                                        if from.is_empty() { None } else { Some(&from) },
+                                        &parse(to),
+                                        &parse(cc),
+                                        &parse(bcc),
+                                        &subject,
+                                        &markdown,
+                                        &paths,
+                                        &at_iso,
+                                    )
+                                    .await
+                                    .map_err(|e| e.to_string());
+                            }
                             runtime
                                 .queue_markdown_with_attachments(
                                     if from.is_empty() { None } else { Some(&from) },
@@ -1021,6 +1173,20 @@ impl qobject::AppController {
                         });
                         notify_result(&qt, result, "Queued send cancelled");
                         snapshot_needed = false;
+                    }
+                    Command::CancelScheduled(scheduled_id) => {
+                        let result = rt.block_on(async {
+                            runtime.cancel_scheduled(&scheduled_id).await.map_err(|e| e.to_string())
+                        });
+                        notify_result(&qt, result, "Scheduled send cancelled");
+                        snapshot_needed = true;
+                    }
+                    Command::SendScheduledNow(scheduled_id) => {
+                        let result = rt.block_on(async {
+                            runtime.send_scheduled_now(&scheduled_id).await.map_err(|e| e.to_string())
+                        });
+                        notify_result(&qt, result, "Scheduled send released");
+                        snapshot_needed = true;
                     }
                     Command::BulkUnsubscribe(ids) => {
                         let result = rt.block_on(async {
@@ -1134,6 +1300,9 @@ impl qobject::AppController {
                                 "archive" => runtime.move_messages(&ids, "archive").await,
                                 "trash" => runtime.trash_messages(&ids).await,
                                 "delete" => runtime.trash_messages(&ids).await,
+                                "spam" => runtime.set_spam(&ids, true).await,
+                                "not_spam" => runtime.set_spam(&ids, false).await,
+                                "restore" => runtime.restore_messages(&ids).await,
                                 other if other.starts_with("move:") => {
                                     runtime.move_messages(&ids, &other[5..]).await
                                 }
@@ -1249,6 +1418,18 @@ impl qobject::AppController {
     pub fn trash_message(self: &Self, id: &QString) {
         if let Some(tx) = &self.tx {
             let _ = tx.send(Command::TrashMessage(id.to_string()));
+        }
+    }
+
+    pub fn set_spam(self: &Self, id: &QString, spam: bool) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Command::SetSpam(id.to_string(), spam));
+        }
+    }
+
+    pub fn restore_message(self: &Self, id: &QString) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Command::RestoreMessage(id.to_string()));
         }
     }
 
@@ -1508,6 +1689,18 @@ impl qobject::AppController {
         }
     }
 
+    pub fn cancel_scheduled(self: &Self, scheduled_id: &QString) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Command::CancelScheduled(scheduled_id.to_string()));
+        }
+    }
+
+    pub fn send_scheduled_now(self: &Self, scheduled_id: &QString) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Command::SendScheduledNow(scheduled_id.to_string()));
+        }
+    }
+
     pub fn bulk_unsubscribe(self: &Self, ids: &QString) {
         if let Some(tx) = &self.tx {
             let ids: Vec<String> = serde_json::from_str(&ids.to_string()).unwrap_or_default();
@@ -1600,6 +1793,39 @@ impl qobject::AppController {
         let status = aster_client_core::pgp_agent::detect();
         let json = serde_json::to_string(&status).unwrap_or_else(|_| "{}".into());
         self.as_mut().set_gpg_json(json.into());
+    }
+
+    pub fn preview_attachment(self: &Self, id: &QString, seq: i64) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Command::PreviewAttachment { id: id.to_string(), seq });
+        }
+    }
+
+    pub fn send_threaded_message(
+        self: &Self,
+        from: &QString,
+        to: &QString,
+        cc: &QString,
+        bcc: &QString,
+        subject: &QString,
+        markdown: &QString,
+        attachments_json: &QString,
+        in_reply_to: &QString,
+        references: &QString,
+    ) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Command::SendThreadedMessage {
+                from: from.to_string(),
+                to: to.to_string(),
+                cc: cc.to_string(),
+                bcc: bcc.to_string(),
+                subject: subject.to_string(),
+                markdown: markdown.to_string(),
+                attachments: attachments_json.to_string(),
+                in_reply_to: in_reply_to.to_string(),
+                references: references.to_string(),
+            });
+        }
     }
 
     pub fn save_attachment(self: &Self, id: &QString, seq: i64) {
@@ -1783,6 +2009,9 @@ async fn snapshot(
     selected: Option<&str>,
     qt: &cxx_qt::CxxQtThread<qobject::AppController>,
 ) {
+    if folder == "scheduled" {
+        let _ = runtime.refresh_scheduled().await;
+    }
     let mailboxes = runtime
         .mailboxes()
         .map(|rows| serde_json::to_string(&rows).unwrap_or_else(|_| "[]".into()))
@@ -1805,6 +2034,10 @@ async fn snapshot(
         .mailing_lists()
         .map(|rows| serde_json::to_string(&rows).unwrap_or_else(|_| "[]".into()))
         .unwrap_or_else(|_| "[]".into());
+    let view_counts = runtime
+        .view_counts()
+        .map(|value| value.to_string())
+        .unwrap_or_else(|_| "{}".into());
     let status = runtime.status().await;
 
     let folder = folder.to_string();
@@ -1815,6 +2048,7 @@ async fn snapshot(
         q.as_mut().set_selected_json(detail.into());
         q.as_mut().set_thread_json(thread.into());
         q.as_mut().set_lists_json(lists.into());
+        q.as_mut().set_view_counts_json(view_counts.into());
         q.as_mut().set_folder_id(folder.into());
         q.as_mut().set_loading(false);
         q.as_mut().set_ready(true);
@@ -1937,6 +2171,9 @@ async fn handle_rpc(
                 .get("limit")
                 .and_then(|value| value.as_u64())
                 .unwrap_or(50) as usize;
+            if folder == "scheduled" {
+                runtime.refresh_scheduled().await.map_err(|e| e.to_string())?;
+            }
             Ok(serde_json::to_value(
                 runtime
                     .messages(folder, limit, 0)
@@ -2087,6 +2324,64 @@ async fn handle_rpc(
         "mail_trash" => {
             runtime
                 .trash_messages(&ids())
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({ "ok": true }))
+        }
+        "mail_schedule" => {
+            let parse = |key: &str| -> Vec<String> {
+                args.get(key)
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("")
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|part| !part.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            };
+            let subject = args.get("subject").and_then(|value| value.as_str()).unwrap_or("");
+            let markdown = args.get("markdown").and_then(|value| value.as_str()).unwrap_or("");
+            let scheduled_at = args
+                .get("scheduled_at")
+                .and_then(|value| value.as_str())
+                .ok_or("scheduled_at is required")?;
+            let id = runtime
+                .schedule_markdown_with_attachments(
+                    None,
+                    &parse("to"),
+                    &parse("cc"),
+                    &parse("bcc"),
+                    subject,
+                    markdown,
+                    &[],
+                    scheduled_at,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({ "scheduled_id": id }))
+        }
+        "mail_scheduled_cancel" => {
+            let id = args
+                .get("id")
+                .and_then(|value| value.as_str())
+                .ok_or("id is required")?;
+            runtime.cancel_scheduled(id).await.map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({ "ok": true }))
+        }
+        "mail_spam" => {
+            let spam = args
+                .get("spam")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(true);
+            runtime
+                .set_spam(&ids(), spam)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({ "ok": true }))
+        }
+        "mail_restore" => {
+            runtime
+                .restore_messages(&ids())
                 .await
                 .map_err(|e| e.to_string())?;
             Ok(serde_json::json!({ "ok": true }))
