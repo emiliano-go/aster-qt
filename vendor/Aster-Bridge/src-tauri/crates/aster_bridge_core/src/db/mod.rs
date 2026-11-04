@@ -1785,21 +1785,18 @@ impl Database {
         })
     }
 
-    pub fn list_visible_message_meta(&self, folder: &str) -> Result<Vec<CachedMessage>, String> {
+    pub fn list_message_meta_for_view(&self, view: &str) -> Result<Vec<CachedMessage>, String> {
         self.with_conn(|conn| {
-            let mut stmt = conn.prepare(
+            let (filter, params) = view_filter(view);
+            let sql = format!(
                 "SELECT m.aster_id, m.folder, m.subject, m.sender, m.recipients, m.date, m.size, m.flags, NULL, m.raw_headers, COALESCE(u.imap_uid, 0), m.thread_id, m.attachments_state
                  FROM message_cache m
                  LEFT JOIN uid_map u ON u.aster_id = m.aster_id AND u.folder = m.folder
-                 WHERE m.folder = ?1
-                   AND NOT EXISTS (
-                     SELECT 1 FROM message_snooze s
-                     WHERE s.aster_id = m.aster_id
-                       AND julianday(s.snoozed_until) > julianday('now')
-                   )
-                 ORDER BY u.imap_uid ASC",
-            )?;
-            let rows = stmt.query_map([folder], |row| cached_message_from_row(row))?;
+                 WHERE {filter}
+                 ORDER BY u.imap_uid ASC"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(params), cached_message_from_row)?;
             let mut out = Vec::new();
             for r in rows {
                 out.push(r?);
@@ -1808,22 +1805,38 @@ impl Database {
         })
     }
 
-    pub fn list_snoozed_message_meta(&self) -> Result<Vec<CachedMessage>, String> {
+    pub fn list_tag_message_meta(&self, tag_token: &str) -> Result<Vec<CachedMessage>, String> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT m.aster_id, m.folder, m.subject, m.sender, m.recipients, m.date, m.size, m.flags, NULL, m.raw_headers, COALESCE(u.imap_uid, 0), m.thread_id, m.attachments_state
-                 FROM message_snooze s
-                 JOIN message_cache m ON m.aster_id = s.aster_id
+                 FROM message_cache m
+                 JOIN message_tag t ON t.aster_id = m.aster_id
                  LEFT JOIN uid_map u ON u.aster_id = m.aster_id AND u.folder = m.folder
-                 WHERE julianday(s.snoozed_until) > julianday('now')
-                 ORDER BY julianday(s.snoozed_until) ASC",
+                 WHERE t.tag_token = ?1 AND m.folder NOT IN ('spam', 'trash')
+                 ORDER BY u.imap_uid ASC",
             )?;
-            let rows = stmt.query_map([], |row| cached_message_from_row(row))?;
+            let rows = stmt.query_map([tag_token], cached_message_from_row)?;
             let mut out = Vec::new();
             for r in rows {
                 out.push(r?);
             }
             Ok(out)
+        })
+    }
+
+    pub fn count_messages_for_view(&self, view: &str) -> Result<(u32, u32), String> {
+        self.with_conn(|conn| {
+            let (filter, params) = view_filter(view);
+            let sql = format!(
+                "SELECT COUNT(*), COALESCE(SUM(CASE WHEN (m.flags & 1) = 0 THEN 1 ELSE 0 END), 0)
+                 FROM message_cache m WHERE {filter}"
+            );
+            let (total, unread): (i64, i64) = conn.query_row(
+                &sql,
+                rusqlite::params_from_iter(params),
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            Ok((total.max(0) as u32, unread.max(0) as u32))
         })
     }
 
@@ -3311,6 +3324,35 @@ fn body_starts_with_predicate(marker: &str) -> String {
 
 fn sql_placeholders(n: usize) -> String {
     vec!["?"; n].join(",")
+}
+
+fn view_filter(view: &str) -> (String, Vec<rusqlite::types::Value>) {
+    const ACTIVE_SNOOZE: &str = "EXISTS (
+        SELECT 1 FROM message_snooze s
+        WHERE s.aster_id = m.aster_id
+          AND julianday(s.snoozed_until) > julianday('now')
+    )";
+    match view {
+        "inbox" => (
+            format!("m.folder = 'inbox' AND NOT {ACTIVE_SNOOZE}"),
+            Vec::new(),
+        ),
+        "snoozed" => (ACTIVE_SNOOZE.to_string(), Vec::new()),
+        "sent" => ("m.folder = 'sent'".to_string(), Vec::new()),
+        "drafts" => ("m.folder = 'drafts'".to_string(), Vec::new()),
+        "archive" => ("m.folder = 'archive'".to_string(), Vec::new()),
+        "spam" => ("m.folder = 'spam'".to_string(), Vec::new()),
+        "trash" => ("m.folder = 'trash'".to_string(), Vec::new()),
+        "all" => ("m.folder NOT IN ('spam', 'trash')".to_string(), Vec::new()),
+        "starred" => (
+            "(m.flags & 4) != 0 AND m.folder NOT IN ('spam', 'trash')".to_string(),
+            Vec::new(),
+        ),
+        folder => (
+            "m.folder = ?1".to_string(),
+            vec![rusqlite::types::Value::Text(folder.to_string())],
+        ),
+    }
 }
 
 fn cached_message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CachedMessage> {
@@ -4843,23 +4885,44 @@ mod db_tests {
     }
 
     #[test]
-    fn future_snoozes_leave_visible_lists_and_expire_back() {
+    fn view_filters_match_snooze_star_and_folder_semantics() {
         let (_d, db) = open_db();
-        db.upsert_cached_message("snoozed-1", "inbox", Some("later"), None, None, None, 0, None, None)
-            .unwrap();
+        for (id, folder) in [
+            ("inbox-1", "inbox"),
+            ("starred-archive", "archive"),
+            ("spam-1", "spam"),
+            ("trash-1", "trash"),
+            ("custom-1", "custom"),
+        ] {
+            db.upsert_cached_message(id, folder, Some(id), None, None, None, 0, None, None)
+                .unwrap();
+        }
+        db.set_message_flags_by_id("starred-archive", 4).unwrap();
+        db.set_message_snooze("inbox-1", "2999-01-01T09:00:00Z").unwrap();
 
-        db.set_message_snooze("snoozed-1", "2999-01-01T09:00:00Z").unwrap();
-        assert!(db.list_visible_message_meta("inbox").unwrap().is_empty());
-        assert_eq!(db.count_cached_messages("inbox").unwrap(), 0);
-        assert_eq!(db.list_snoozed_message_meta().unwrap().len(), 1);
+        let ids = |view: &str| {
+            db.list_message_meta_for_view(view)
+                .unwrap()
+                .into_iter()
+                .map(|row| row.aster_id)
+                .collect::<Vec<_>>()
+        };
+        assert!(!ids("inbox").contains(&"inbox-1".to_string()));
+        assert!(ids("snoozed").contains(&"inbox-1".to_string()));
+        assert!(ids("all").contains(&"inbox-1".to_string()));
+        assert!(ids("all").contains(&"starred-archive".to_string()));
+        assert!(!ids("all").contains(&"spam-1".to_string()));
+        assert!(!ids("all").contains(&"trash-1".to_string()));
+        assert_eq!(ids("starred"), vec!["starred-archive"]);
+        assert_eq!(ids("custom"), vec!["custom-1"]);
+        assert_eq!(ids("spam"), vec!["spam-1"]);
+        assert_eq!(ids("trash"), vec!["trash-1"]);
 
-        db.set_message_snooze("snoozed-1", "2000-01-01T09:00:00Z").unwrap();
-        assert_eq!(db.list_visible_message_meta("inbox").unwrap().len(), 1);
-        assert!(db.list_snoozed_message_meta().unwrap().is_empty());
-
-        db.set_message_snooze("snoozed-1", "2999-01-01T09:00:00Z").unwrap();
-        db.clear_message_snooze("snoozed-1").unwrap();
-        assert_eq!(db.list_visible_message_meta("inbox").unwrap().len(), 1);
+        db.set_message_snooze("inbox-1", "2000-01-01T09:00:00Z").unwrap();
+        assert!(ids("inbox").contains(&"inbox-1".to_string()));
+        assert!(ids("snoozed").is_empty());
+        db.clear_message_snooze("inbox-1").unwrap();
+        assert!(ids("inbox").contains(&"inbox-1".to_string()));
     }
 
     #[test]

@@ -538,6 +538,26 @@ pub struct MailItem {
     pub labels: Option<Vec<MailItemLabel>>,
     #[serde(default)]
     pub tag_tokens: Option<Vec<String>>,
+    #[serde(default)]
+    pub routing_token: Option<String>,
+    #[serde(default)]
+    pub size_bytes: Option<i64>,
+    #[serde(default)]
+    pub system_origin: Option<bool>,
+    #[serde(default)]
+    pub spf_result: Option<String>,
+    #[serde(default)]
+    pub dkim_result: Option<String>,
+    #[serde(default)]
+    pub dmarc_result: Option<String>,
+    #[serde(default)]
+    pub sender_verified: Option<bool>,
+    #[serde(default)]
+    pub sender_verified_domain: Option<String>,
+    #[serde(default)]
+    pub sender_aligned: Option<bool>,
+    #[serde(default)]
+    pub phishing_level: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -1288,6 +1308,133 @@ impl ApiClient {
             return Err(map_response_error(resp).await);
         }
 
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn list_scheduled(
+        &self,
+        access_token: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<serde_json::Value> {
+        let resp = self
+            .client
+            .get(format!("{}/mail/v1/scheduled", self.base_url))
+            .bearer_auth(access_token)
+            .query(&[
+                ("limit", limit.to_string()),
+                ("offset", offset.to_string()),
+            ])
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn get_scheduled(
+        &self,
+        access_token: &str,
+        scheduled_id: &str,
+    ) -> Result<serde_json::Value> {
+        let resp = self
+            .client
+            .get(format!(
+                "{}/mail/v1/scheduled/{}",
+                self.base_url,
+                urlencoding_path(scheduled_id)
+            ))
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn create_scheduled(
+        &self,
+        access_token: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let resp = self
+            .client
+            .post(format!("{}/mail/v1/scheduled", self.base_url))
+            .bearer_auth(access_token)
+            .json(body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn cancel_scheduled(
+        &self,
+        access_token: &str,
+        scheduled_id: &str,
+    ) -> Result<()> {
+        let resp = self
+            .client
+            .delete(format!(
+                "{}/mail/v1/scheduled/{}",
+                self.base_url,
+                urlencoding_path(scheduled_id)
+            ))
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+        Ok(())
+    }
+
+    pub async fn update_scheduled(
+        &self,
+        access_token: &str,
+        scheduled_id: &str,
+        scheduled_at: &str,
+    ) -> Result<serde_json::Value> {
+        let resp = self
+            .client
+            .patch(format!(
+                "{}/mail/v1/scheduled/{}",
+                self.base_url,
+                urlencoding_path(scheduled_id)
+            ))
+            .bearer_auth(access_token)
+            .json(&serde_json::json!({ "scheduled_at": scheduled_at }))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn send_scheduled_now(
+        &self,
+        access_token: &str,
+        scheduled_id: &str,
+    ) -> Result<serde_json::Value> {
+        let resp = self
+            .client
+            .patch(format!(
+                "{}/mail/v1/scheduled/{}",
+                self.base_url,
+                urlencoding_path(scheduled_id)
+            ))
+            .bearer_auth(access_token)
+            .json(&serde_json::json!({ "status": "send_now" }))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
         resp.json().await.map_err(BridgeError::from)
     }
 

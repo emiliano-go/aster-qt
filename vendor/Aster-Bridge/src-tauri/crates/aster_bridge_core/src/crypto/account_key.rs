@@ -29,6 +29,7 @@ use crate::api_client::ApiClient;
 pub const ACCOUNT_KEY_LEN: usize = 32;
 pub const PREFERENCES_CONTEXT: &str = "astermail-preferences-v1";
 pub const DRAFT_CONTEXT: &str = "astermail-draft-v2";
+pub const SCHEDULED_CONTEXT: &str = "astermail-scheduled-v1";
 
 const TOKEN_TYPE: &str = "aster-account-key";
 const TOKEN_VERSION: u64 = 2;

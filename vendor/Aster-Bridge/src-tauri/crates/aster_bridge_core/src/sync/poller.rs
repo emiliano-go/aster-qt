@@ -1563,6 +1563,41 @@ fn commit_prepared(
     if let Some(value) = item.is_archived {
         raw_headers_map.insert("is_archived".to_string(), serde_json::json!(value));
     }
+    if let Some(ref value) = item.routing_token {
+        raw_headers_map.insert("routing_token".to_string(), serde_json::json!(value));
+    }
+    if let Some(ref value) = item.scheduled_at {
+        raw_headers_map.insert("scheduled_at".to_string(), serde_json::json!(value));
+    }
+    if let Some(ref value) = item.send_status {
+        raw_headers_map.insert("send_status".to_string(), serde_json::json!(value));
+    }
+    if let Some(value) = item.expires_at.as_deref() {
+        raw_headers_map.insert("expires_at".to_string(), serde_json::json!(value));
+    }
+    if let Some(value) = item.expiry_type.as_deref() {
+        raw_headers_map.insert("expiry_type".to_string(), serde_json::json!(value));
+    }
+    for (key, value) in [
+        ("spf_result", &item.spf_result),
+        ("dkim_result", &item.dkim_result),
+        ("dmarc_result", &item.dmarc_result),
+        ("sender_verified_domain", &item.sender_verified_domain),
+        ("phishing_level", &item.phishing_level),
+    ] {
+        if let Some(value) = value {
+            raw_headers_map.insert(key.to_string(), serde_json::json!(value));
+        }
+    }
+    for (key, value) in [
+        ("sender_verified", item.sender_verified),
+        ("sender_aligned", item.sender_aligned),
+        ("system_origin", item.system_origin),
+    ] {
+        if let Some(value) = value {
+            raw_headers_map.insert(key.to_string(), serde_json::json!(value));
+        }
+    }
     if let Some(ref value) = prepared.list_id {
         raw_headers_map.insert("list_id".to_string(), serde_json::json!(value));
     }
@@ -3656,6 +3691,16 @@ mod tests {
             attachment_count: None,
             labels: None,
             tag_tokens: None,
+            routing_token: None,
+            size_bytes: None,
+            system_origin: None,
+            spf_result: None,
+            dkim_result: None,
+            dmarc_result: None,
+            sender_verified: None,
+            sender_verified_domain: None,
+            sender_aligned: None,
+            phishing_level: None,
         }
     }
 

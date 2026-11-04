@@ -34,6 +34,7 @@ pub mod preferences;
 pub mod ratchet;
 pub mod ratchet_recovery;
 pub mod recipient_trust;
+pub mod scheduled;
 pub mod sent_copy;
 pub mod tag;
 pub mod vault;
