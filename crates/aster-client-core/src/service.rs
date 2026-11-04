@@ -40,6 +40,8 @@ pub struct MessageView {
     pub list_name: Option<String>,
     pub list_unsubscribe: Option<String>,
     pub list_unsubscribe_post: Option<String>,
+    pub is_pinned: bool,
+    pub category: Option<String>,
     pub message_id: Option<String>,
     pub in_reply_to: Option<String>,
     pub references: Option<String>,
@@ -1155,6 +1157,11 @@ fn view_of(msg: &CachedMessage) -> MessageView {
             .map(str::to_string),
         list_unsubscribe_post: meta
             .get("list_unsubscribe_post")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        is_pinned: meta.get("is_pinned").and_then(|value| value.as_bool()).unwrap_or(false),
+        category: meta
+            .get("category")
             .and_then(|value| value.as_str())
             .map(str::to_string),
         message_id: meta

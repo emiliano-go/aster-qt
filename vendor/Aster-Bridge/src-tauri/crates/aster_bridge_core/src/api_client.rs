@@ -525,6 +525,12 @@ pub struct MailItem {
     pub is_read: Option<bool>,
     pub is_starred: Option<bool>,
     #[serde(default)]
+    pub is_pinned: Option<bool>,
+    #[serde(default)]
+    pub rule_category: Option<String>,
+    #[serde(default)]
+    pub is_archived: Option<bool>,
+    #[serde(default)]
     pub has_attachments: Option<bool>,
     #[serde(default)]
     pub attachment_count: Option<i16>,

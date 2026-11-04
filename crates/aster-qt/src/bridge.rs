@@ -83,6 +83,10 @@ pub mod qobject {
         fn delete_folder(self: &Self, token: &QString);
 
         #[qinvokable]
+        #[cxx_name = "setPinned"]
+        fn set_pinned(self: &Self, id: &QString, pinned: bool);
+
+        #[qinvokable]
         #[cxx_name = "deleteDraft"]
         fn delete_draft(self: &Self, id: &QString);
 
@@ -273,6 +277,7 @@ pub(crate) enum Command {
     EmptyFolder(String),
     DeleteDraft(String),
     ArchiveMailingList(String),
+    SetPinned { id: String, pinned: bool },
     CreateTag(String),
     DeleteTag(String),
     RenameFolder { token: String, name: String },
@@ -642,6 +647,14 @@ impl qobject::AppController {
                         notify_result(&qt, result, "Folder deleted");
                         snapshot_needed = true;
                     }
+                    Command::SetPinned { id, pinned } => {
+                        let result = rt.block_on(async {
+                            runtime.set_pinned(&[id.clone()], pinned).await.map_err(|e| e.to_string())
+                        });
+                        notify_result(&qt, result, if pinned { "Pinned" } else { "Unpinned" });
+                        rt.block_on(snapshot(&runtime, &folder, selected.as_deref(), &qt));
+                        snapshot_needed = false;
+                    }
                     Command::ArchiveMailingList(list_id) => {
                         let result = rt.block_on(async {
                             runtime.archive_mailing_list(&list_id).await.map(|_| ()).map_err(|e| e.to_string())
@@ -889,6 +902,12 @@ impl qobject::AppController {
 
     pub fn delete_folder(self: &Self, token: &QString) {
         if let Some(tx) = &self.tx { let _ = tx.send(Command::DeleteFolder(token.to_string())); }
+    }
+
+    pub fn set_pinned(self: &Self, id: &QString, pinned: bool) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Command::SetPinned { id: id.to_string(), pinned });
+        }
     }
 
     pub fn archive_mailing_list(self: &Self, list_id: &QString) {

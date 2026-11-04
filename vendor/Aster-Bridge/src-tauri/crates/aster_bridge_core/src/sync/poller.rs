@@ -1554,6 +1554,15 @@ fn commit_prepared(
         raw_headers_map.insert("references".to_string(), serde_json::json!(value));
     }
     prepared.addresses.write_to(&mut raw_headers_map);
+    if let Some(value) = item.is_pinned {
+        raw_headers_map.insert("is_pinned".to_string(), serde_json::json!(value));
+    }
+    if let Some(ref value) = item.rule_category {
+        raw_headers_map.insert("category".to_string(), serde_json::json!(value));
+    }
+    if let Some(value) = item.is_archived {
+        raw_headers_map.insert("is_archived".to_string(), serde_json::json!(value));
+    }
     if let Some(ref value) = prepared.list_id {
         raw_headers_map.insert("list_id".to_string(), serde_json::json!(value));
     }

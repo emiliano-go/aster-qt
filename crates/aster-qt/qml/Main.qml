@@ -143,6 +143,7 @@ ApplicationWindow {
     property string filterUntil: ""
     property bool filterStarred: false
     property bool filterAttachmentsOnly: false
+    property string categoryFilter: ""
     property bool composeOpen: false
     property bool settingsOpen: false
     property string settingsTab: "appearance"
@@ -288,6 +289,7 @@ ApplicationWindow {
             if (root.filterBody.length > 0 && (m.preview || "").toLowerCase().indexOf(root.filterBody.toLowerCase()) === -1) continue;
             if (root.filterStarred && !m.is_starred) continue;
             if (root.filterAttachmentsOnly && !m.has_attachments) continue;
+            if (root.categoryFilter.length > 0 && m.category !== root.categoryFilter) continue;
             if (root.filterSince.length > 0) {
                 var since = new Date(root.filterSince);
                 if (!isNaN(since.getTime()) && m.date && new Date(m.date) < since) continue;
@@ -300,6 +302,15 @@ ApplicationWindow {
                 }
             }
             out.push(m);
+        }
+        return out;
+    }
+
+    readonly property var messageCategories: {
+        var out = [];
+        for (var i = 0; i < root.messages.length; i++) {
+            var category = root.messages[i].category;
+            if (category && out.indexOf(category) === -1) out.push(category);
         }
         return out;
     }
@@ -439,6 +450,7 @@ ApplicationWindow {
         root.filterUntil = "";
         root.filterStarred = false;
         root.filterAttachmentsOnly = false;
+        root.categoryFilter = "";
     }
 
     function resetCompose() {
@@ -1030,6 +1042,13 @@ ApplicationWindow {
                     font.weight: row.item && !row.item.is_read ? n("font-weight-unread", 600) : n("font-weight-regular", 400)
                     elide: Text.ElideRight
                     Layout.fillWidth: true
+                }
+                Icon {
+                    name: "pin"
+                    size: 12
+                    color: c("accent-text", "#e7a97f")
+                    visible: row.item && row.item.is_pinned
+                    Layout.alignment: Qt.AlignVCenter
                 }
                 Icon {
                     name: "star"
@@ -1734,6 +1753,24 @@ ApplicationWindow {
 
                     Rectangle {
                         Layout.fillWidth: true
+                        Layout.preferredHeight: root.messageCategories.length > 0 ? 34 : 0
+                        visible: root.messageCategories.length > 0
+                        color: "transparent"
+                        RowLayout {
+                            anchors.fill: parent
+                            anchors.leftMargin: n("space-4", 16)
+                            anchors.rightMargin: n("space-4", 16)
+                            spacing: n("space-2", 8)
+                            ModeChip { label: "All"; active: root.categoryFilter === ""; onClicked: root.categoryFilter = "" }
+                            Repeater {
+                                model: root.messageCategories
+                                delegate: ModeChip { label: modelData; active: root.categoryFilter === modelData; onClicked: root.categoryFilter = modelData }
+                            }
+                            Item { Layout.fillWidth: true }
+                        }
+                    }
+                    Rectangle {
+                        Layout.fillWidth: true
                         Layout.preferredHeight: root.selectionMode ? 36 : 0
                         visible: root.selectionMode
                         color: c("surface", "#1b1e23")
@@ -1854,6 +1891,11 @@ ApplicationWindow {
                         IconButton { icon: "reply"; label: "Reply"; onClicked: root.openReply() }
                         IconButton { icon: "forward"; label: "Forward"; onClicked: root.openForward() }
                         Item { Layout.fillWidth: true }
+                        IconButton {
+                            icon: "pin"
+                            label: root.detail.is_pinned ? "Unpin" : "Pin"
+                            onClicked: app.setPinned(root.detail.id, !root.detail.is_pinned)
+                        }
                         IconButton {
                             icon: "star"
                             label: root.detail.is_starred ? "Unstar" : "Star"
