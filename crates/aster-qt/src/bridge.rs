@@ -132,6 +132,14 @@ pub mod qobject {
         fn delete_draft(self: &Self, id: &QString);
 
         #[qinvokable]
+        #[cxx_name = "bulkUnsubscribe"]
+        fn bulk_unsubscribe(self: &Self, ids: &QString);
+
+        #[qinvokable]
+        #[cxx_name = "archiveNewsletters"]
+        fn archive_newsletters(self: &Self);
+
+        #[qinvokable]
         #[cxx_name = "archiveMailingList"]
         fn archive_mailing_list(self: &Self, list_id: &QString);
 
@@ -319,6 +327,8 @@ pub(crate) enum Command {
     DeleteDraft(String),
     ArchiveMailingList(String),
     SetPinned { id: String, pinned: bool },
+    BulkUnsubscribe(Vec<String>),
+    ArchiveNewsletters,
     QueueMessage {
         from: String,
         to: String,
@@ -749,6 +759,31 @@ impl qobject::AppController {
                         notify_result(&qt, result, "Queued send cancelled");
                         snapshot_needed = false;
                     }
+                    Command::BulkUnsubscribe(ids) => {
+                        let result = rt.block_on(async {
+                            runtime.unsubscribe_messages(&ids).await.map(|report| {
+                                serde_json::to_string(&report).unwrap_or_default()
+                            }).map_err(|e| e.to_string())
+                        });
+                        match result {
+                            Ok(json) => {
+                                let message = format!("Unsubscribe: {json}");
+                                let _ = qt.queue(move |mut q| q.as_mut().set_toast_text(message.into()));
+                            }
+                            Err(err) => {
+                                let _ = qt.queue(move |mut q| q.as_mut().set_toast_text(err.into()));
+                            }
+                        }
+                        snapshot_needed = false;
+                    }
+                    Command::ArchiveNewsletters => {
+                        let result = rt.block_on(async {
+                            runtime.archive_newsletters().await.map(|_| ()).map_err(|e| e.to_string())
+                        });
+                        notify_result(&qt, result, "Newsletters archived");
+                        rt.block_on(snapshot(&runtime, &folder, selected.as_deref(), &qt));
+                        snapshot_needed = false;
+                    }
                     Command::SetPinned { id, pinned } => {
                         let result = rt.block_on(async {
                             runtime.set_pinned(&[id.clone()], pinned).await.map_err(|e| e.to_string())
@@ -1065,6 +1100,17 @@ impl qobject::AppController {
         if let Some(tx) = &self.tx {
             let _ = tx.send(Command::CancelQueued(queue_id.to_string()));
         }
+    }
+
+    pub fn bulk_unsubscribe(self: &Self, ids: &QString) {
+        if let Some(tx) = &self.tx {
+            let ids: Vec<String> = serde_json::from_str(&ids.to_string()).unwrap_or_default();
+            let _ = tx.send(Command::BulkUnsubscribe(ids));
+        }
+    }
+
+    pub fn archive_newsletters(self: &Self) {
+        if let Some(tx) = &self.tx { let _ = tx.send(Command::ArchiveNewsletters); }
     }
 
     pub fn set_pinned(self: &Self, id: &QString, pinned: bool) {
@@ -1530,6 +1576,13 @@ async fn handle_rpc(
                 .await
                 .map_err(|e| e.to_string())?;
             Ok(serde_json::json!({ "ok": true }))
+        }
+        "mail_bulk_unsubscribe" => {
+            let ids = args.get("ids").and_then(|v| v.as_array()).map(|items| items.iter().filter_map(|i| i.as_str().map(str::to_string)).collect::<Vec<_>>()).unwrap_or_default();
+            Ok(serde_json::to_value(runtime.unsubscribe_messages(&ids).await.map_err(|e| e.to_string())?).map_err(|e| e.to_string())?)
+        }
+        "mail_archive_newsletters" => {
+            Ok(serde_json::json!({"archived": runtime.archive_newsletters().await.map_err(|e| e.to_string())?}))
         }
         "mail_unsubscribe_info" => {
             let id = args.get("id").and_then(|v| v.as_str()).ok_or("id is required")?;

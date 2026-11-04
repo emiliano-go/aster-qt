@@ -837,6 +837,80 @@ impl ClientRuntime {
             .collect())
     }
 
+    pub async fn archive_newsletters(&self) -> ClientResult<usize> {
+        let rows = self
+            .db()
+            .list_cached_message_meta("inbox")
+            .map_err(ClientError::Storage)?;
+        let ids: Vec<String> = rows
+            .into_iter()
+            .filter(|row| {
+                row.raw_headers
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                    .map(|meta| {
+                        meta.get("list_id").is_some() || meta.get("list_unsubscribe").is_some()
+                    })
+                    .unwrap_or(false)
+            })
+            .map(|row| row.aster_id)
+            .collect();
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        self.move_messages(&ids, "archive").await?;
+        Ok(ids.len())
+    }
+
+    pub async fn unsubscribe_messages(&self, ids: &[String]) -> ClientResult<UnsubscribeReport> {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .map_err(|e| ClientError::Protocol(e.to_string()))?;
+        let mut attempted = 0;
+        let mut succeeded = 0;
+        for id in ids {
+            let Some(msg) = self.db().get_cached_message(id).map_err(ClientError::Storage)? else {
+                continue;
+            };
+            let Some(meta) = msg
+                .raw_headers
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            else {
+                continue;
+            };
+            let Some(header) = meta.get("list_unsubscribe").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let post = meta
+                .get("list_unsubscribe_post")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            for url in unsubscribe_urls(header) {
+                if !url.starts_with("http") {
+                    continue;
+                }
+                attempted += 1;
+                let one_click = post.to_ascii_lowercase().contains("one-click");
+                let result = if one_click {
+                    client
+                        .post(&url)
+                        .header("content-type", "application/x-www-form-urlencoded")
+                        .body("List-Unsubscribe=One-Click")
+                        .send()
+                        .await
+                } else {
+                    client.get(&url).send().await
+                };
+                if result.map(|resp| resp.status().is_success()).unwrap_or(false) {
+                    succeeded += 1;
+                }
+            }
+        }
+        Ok(UnsubscribeReport { attempted, succeeded })
+    }
+
     pub async fn archive_mailing_list(&self, list_id: &str) -> ClientResult<usize> {
         let rows = self
             .db()
@@ -1611,4 +1685,36 @@ pub struct SignatureView {
     pub is_html: bool,
     pub is_default: bool,
     pub alias_id: Option<String>,
+}
+
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UnsubscribeReport {
+    pub attempted: usize,
+    pub succeeded: usize,
+}
+
+fn unsubscribe_urls(header: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = header;
+    while let Some(open) = rest.find('<') {
+        if let Some(close) = rest[open..].find('>') {
+            let url = rest[open + 1..open + close].trim();
+            if !url.is_empty() {
+                out.push(url.to_string());
+            }
+            rest = &rest[open + close + 1..];
+        } else {
+            break;
+        }
+    }
+    if out.is_empty() {
+        for part in header.split(',') {
+            let trimmed = part.trim();
+            if trimmed.starts_with("http") || trimmed.starts_with("mailto:") {
+                out.push(trimmed.to_string());
+            }
+        }
+    }
+    out
 }

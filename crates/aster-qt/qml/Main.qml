@@ -161,6 +161,7 @@ ApplicationWindow {
     property bool toastVisible: false
     property bool deleteConfirmOpen: false
     property bool emptyConfirmOpen: false
+    property bool unsubConfirmOpen: false
     property string pendingDeleteToken: ""
     property string pendingDeleteIds: "[]"
     property string deleteConfirmWord: ""
@@ -1791,6 +1792,7 @@ ApplicationWindow {
                             LinkText { text: "Star"; action: function() { root.batch("star") } }
                             LinkText { text: "Archive"; action: function() { root.batch("archive") } }
                             LinkText { text: "Trash"; action: function() { root.batch("trash") } }
+                            LinkText { text: "Unsubscribe"; action: function() { root.unsubConfirmOpen = true } }
                             LinkText { text: "Clear"; action: function() { root.clearSelection() } }
                         }
                     }
@@ -2594,6 +2596,7 @@ ApplicationWindow {
                                             LinkText { text: "Cancel"; action: function() { root.cancelScheduled(modelData.id) } }
                                         }
                                     }
+                                    LinkText { text: "Archive newsletters"; action: function() { app.archiveNewsletters() } }
 
                                 // Rules
                                 ColumnLayout {
@@ -3090,6 +3093,35 @@ ApplicationWindow {
                     } else {
                         root.cancelPendingSend();
                     }
+                }
+            }
+        }
+    }
+
+    Rectangle {
+        anchors.fill: parent
+        color: c("overlay", "#8c000000")
+        visible: root.unsubConfirmOpen
+        MouseArea { anchors.fill: parent }
+        Rectangle {
+            width: 460; height: 210
+            anchors.centerIn: parent
+            radius: n("radius-panel", 18)
+            color: c("surface", "#1b1e23")
+            border.width: n("border-width", 1)
+            border.color: c("border-strong", "#292e323a")
+            ColumnLayout {
+                anchors.fill: parent
+                anchors.margins: n("space-5", 24)
+                spacing: n("space-3", 12)
+                Text { text: "Unsubscribe from selected mail?"; color: c("text", "#ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-title", 16); font.weight: n("font-weight-semibold", 600) }
+                Text { text: "Aster will call the List-Unsubscribe URL for each selected message. Mailto-only lists are skipped."; color: c("text-2", "#dbebe7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-small", 12); wrapMode: Text.WordWrap; Layout.fillWidth: true }
+                Item { Layout.fillHeight: true }
+                RowLayout {
+                    Layout.fillWidth: true
+                    Item { Layout.fillWidth: true }
+                    LinkText { text: "Cancel"; action: function() { root.unsubConfirmOpen = false } }
+                    LinkText { text: "Unsubscribe"; action: function() { app.bulkUnsubscribe(JSON.stringify(root.selectedIds)); root.clearSelection(); root.unsubConfirmOpen = false } }
                 }
             }
         }
