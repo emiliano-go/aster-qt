@@ -114,10 +114,15 @@ ApplicationWindow {
     readonly property var messages: parse(app.messagesJson, [])
     readonly property var detail: parse(app.selectedJson, ({}))
 
-    readonly property var systemOrder: ["inbox", "sent", "drafts", "archive", "spam", "trash"]
+    readonly property var systemOrder: ["inbox", "snoozed", "sent", "drafts", "archive", "spam", "trash"]
+    readonly property var snoozedFolder: ({ folder_label: "snoozed", name: "Snoozed", unread: 0, total: 0 })
     readonly property var systemFolders: {
         var out = [];
         for (var i = 0; i < root.systemOrder.length; i++) {
+            if (root.systemOrder[i] === "snoozed") {
+                out.push(root.snoozedFolder);
+                continue;
+            }
             for (var j = 0; j < root.mailboxes.length; j++) {
                 if (root.mailboxes[j].folder_label === root.systemOrder[i]) {
                     out.push(root.mailboxes[j]);
@@ -236,6 +241,8 @@ ApplicationWindow {
     property var selectedIds: []
     property int lastUnread: -1
     property bool ruleMatchAll: true
+    property var snoozeTargets: []
+    property string snoozeCustom: ""
 
     ListModel {
         id: conditionModel
@@ -397,6 +404,54 @@ ApplicationWindow {
         app.batchAction(action, JSON.stringify(root.selectedIds));
         root.clearSelection();
     }
+
+    function openSnooze() {
+        var ids = root.selectionMode && root.selectedIds.length > 0
+            ? root.selectedIds.slice()
+            : (root.detail.id ? [root.detail.id] : []);
+        if (ids.length === 0) return;
+        root.snoozeTargets = ids;
+        root.snoozeCustom = "";
+        snoozePopup.open();
+    }
+
+    function applySnooze(when) {
+        if (!when || isNaN(when.getTime()) || root.snoozeTargets.length === 0) return;
+        app.snoozeMessages(JSON.stringify(root.snoozeTargets), when.toISOString());
+        root.snoozeTargets = [];
+        root.clearSelection();
+        snoozePopup.close();
+    }
+
+    function snoozeLater(hours) {
+        var when = new Date();
+        when.setHours(when.getHours() + hours);
+        root.applySnooze(when);
+    }
+
+    function snoozeTomorrow() {
+        var when = new Date();
+        when.setDate(when.getDate() + 1);
+        when.setHours(9, 0, 0, 0);
+        root.applySnooze(when);
+    }
+
+    function snoozeNextWeek() {
+        var when = new Date();
+        when.setDate(when.getDate() + 7);
+        when.setHours(9, 0, 0, 0);
+        root.applySnooze(when);
+    }
+
+    function snoozeCustomDate() {
+        var value = root.snoozeCustom.trim().replace(" ", "T");
+        var when = new Date(value);
+        if (isNaN(when.getTime())) {
+            app.notify("Snooze", "Enter a valid date and time.");
+            return;
+        }
+        root.applySnooze(when);
+    }
     onIdentitiesChanged: {
         if (root.activeIdentity.length === 0)
             root.activeIdentity = root.defaultIdentityAddress();
@@ -468,12 +523,12 @@ ApplicationWindow {
     }
 
     function folderLabel(label) {
-        var names = { inbox: "Inbox", sent: "Sent", drafts: "Drafts", archive: "Archive", spam: "Junk", trash: "Trash" };
+        var names = { inbox: "Inbox", snoozed: "Snoozed", sent: "Sent", drafts: "Drafts", archive: "Archive", spam: "Junk", trash: "Trash" };
         return names[label] || label;
     }
 
     function folderIcon(label) {
-        var icons = { inbox: "inbox", sent: "send", drafts: "drafts", archive: "archive", spam: "junk", trash: "trash" };
+        var icons = { inbox: "inbox", snoozed: "clock", sent: "send", drafts: "drafts", archive: "archive", spam: "junk", trash: "trash" };
         return icons[label] || "folder";
     }
 
@@ -2259,6 +2314,7 @@ ApplicationWindow {
                             LinkText { text: "Read"; action: function() { root.batch("mark_read") } }
                             LinkText { text: "Unread"; action: function() { root.batch("mark_unread") } }
                             LinkText { text: "Star"; action: function() { root.batch("star") } }
+                            LinkText { text: "Snooze"; action: function() { root.openSnooze() } }
                             LinkText { text: "Archive"; action: function() { root.batch("archive") } }
                             LinkText { text: "Trash"; action: function() { root.batch("trash") } }
                             LinkText { text: "Unsubscribe"; action: function() { root.unsubConfirmOpen = true } }
@@ -2358,6 +2414,11 @@ ApplicationWindow {
                         spacing: n("space-1", 4)
                         LinkText { visible: app.folderId === "drafts"; text: "Edit draft"; action: function() { root.openDraft() } }
                         LinkText {
+                            visible: root.detail.snoozed_until !== null && root.detail.snoozed_until !== undefined && root.detail.snoozed_until.length > 0
+                            text: "Unsnooze"
+                            action: function() { app.unsnoozeMessage(root.detail.id) }
+                        }
+                        LinkText {
                             visible: root.detail.list_unsubscribe && root.detail.list_unsubscribe.length > 0
                             text: "Unsubscribe"
                             action: function() {
@@ -2365,6 +2426,7 @@ ApplicationWindow {
                                 if (url.length > 0) Qt.openUrlExternally(url);
                             }
                         }
+                        IconButton { icon: "clock"; label: "Snooze"; onClicked: root.openSnooze() }
                         IconButton { icon: "reply"; label: "Reply"; onClicked: root.openReply() }
                         IconButton { icon: "forward"; label: "Forward"; onClicked: root.openForward() }
                         Item { Layout.fillWidth: true }
@@ -4274,6 +4336,51 @@ ApplicationWindow {
                 font.family: c("font-family", "Inter")
                 font.pixelSize: n("font-size-small", 12)
             }
+        }
+    }
+
+    Popup {
+        id: snoozePopup
+        width: 340
+        height: 250
+        modal: true
+        focus: true
+        anchors.centerIn: Overlay.overlay
+        background: Rectangle {
+            color: c("menu", "#23262c")
+            border.width: n("border-width", 1)
+            border.color: c("border-strong", "#292e323a")
+            radius: n("radius-panel", 8)
+        }
+        ColumnLayout {
+            anchors.fill: parent
+            anchors.margins: n("space-4", 16)
+            spacing: n("space-2", 8)
+            Text {
+                text: "Snooze until"
+                color: c("text", "#ece7de")
+                font.family: c("font-family", "Inter")
+                font.pixelSize: n("font-size-title", 16)
+                font.weight: n("font-weight-semibold", 600)
+                Layout.fillWidth: true
+            }
+            LinkText { text: "Later today"; action: function() { root.snoozeLater(4) } }
+            LinkText { text: "Tomorrow morning"; action: function() { root.snoozeTomorrow() } }
+            LinkText { text: "Next week"; action: function() { root.snoozeNextWeek() } }
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: n("space-2", 8)
+                SettingsField {
+                    id: snoozeCustomField
+                    Layout.fillWidth: true
+                    placeholder: "YYYY-MM-DD HH:MM"
+                    testId: "snooze-custom"
+                    onEdited: root.snoozeCustom = value
+                }
+                LinkText { text: "Snooze"; action: function() { root.snoozeCustomDate() } }
+            }
+            Item { Layout.fillHeight: true }
+            LinkText { text: "Cancel"; action: function() { snoozePopup.close() } }
         }
     }
 
