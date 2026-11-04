@@ -30,7 +30,9 @@ pub fn defaults() -> Value {
         },
         "compose": {
             "signature": "",
-            "template": ""
+            "template": "",
+            "server_undo_send": false,
+            "scheduled": []
         },
         "mcp": {
             "enabled": false,

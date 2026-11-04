@@ -59,6 +59,47 @@ pub mod qobject {
         fn boot(self: Pin<&mut Self>);
 
         #[qsignal]
+        #[cxx_name = "queueReady"]
+        fn queue_ready(self: Pin<&mut Self>, id: QString);
+
+        #[qsignal]
+        #[cxx_name = "scheduledQueued"]
+        fn scheduled_queued(self: Pin<&mut Self>, id: QString, at: QString, subject: QString);
+
+        #[qinvokable]
+        #[cxx_name = "scheduleMessage"]
+        fn schedule_message(
+            self: &Self,
+            from: &QString,
+            to: &QString,
+            cc: &QString,
+            bcc: &QString,
+            subject: &QString,
+            markdown: &QString,
+            attachments: &QString,
+            delay_seconds: u64,
+            at_iso: &QString,
+        );
+
+        #[qinvokable]
+        #[cxx_name = "sendQueued"]
+        fn send_queued(
+            self: &Self,
+            from: &QString,
+            to: &QString,
+            cc: &QString,
+            bcc: &QString,
+            subject: &QString,
+            markdown: &QString,
+            attachments: &QString,
+            delay_seconds: u64,
+        );
+
+        #[qinvokable]
+        #[cxx_name = "cancelQueuedSend"]
+        fn cancel_queued_send(self: &Self, queue_id: &QString);
+
+        #[qsignal]
         #[cxx_name = "confirmDelete"]
         fn confirm_delete(self: Pin<&mut Self>, token: QString, ids: QString);
 
@@ -278,6 +319,19 @@ pub(crate) enum Command {
     DeleteDraft(String),
     ArchiveMailingList(String),
     SetPinned { id: String, pinned: bool },
+    QueueMessage {
+        from: String,
+        to: String,
+        cc: String,
+        bcc: String,
+        subject: String,
+        markdown: String,
+        attachments: String,
+        delay_seconds: u64,
+        schedule: bool,
+        at_iso: String,
+    },
+    CancelQueued(String),
     CreateTag(String),
     DeleteTag(String),
     RenameFolder { token: String, name: String },
@@ -647,6 +701,54 @@ impl qobject::AppController {
                         notify_result(&qt, result, "Folder deleted");
                         snapshot_needed = true;
                     }
+                    Command::QueueMessage { from, to, cc, bcc, subject, markdown, attachments, delay_seconds, schedule, at_iso } => {
+                        let result = rt.block_on(async {
+                            let parse = |value: String| -> Vec<String> {
+                                value.split(',').map(str::trim).filter(|p| !p.is_empty()).map(str::to_string).collect()
+                            };
+                            let paths: Vec<std::path::PathBuf> = serde_json::from_str::<Vec<String>>(&attachments)
+                                .unwrap_or_default()
+                                .into_iter()
+                                .map(std::path::PathBuf::from)
+                                .collect();
+                            runtime
+                                .queue_markdown_with_attachments(
+                                    if from.is_empty() { None } else { Some(&from) },
+                                    &parse(to),
+                                    &parse(cc),
+                                    &parse(bcc),
+                                    &subject,
+                                    &markdown,
+                                    &paths,
+                                    delay_seconds,
+                                )
+                                .await
+                                .map_err(|e| e.to_string())
+                        });
+                        match result {
+                            Ok(id) => {
+                                if schedule {
+                                    let subject_copy = subject.clone();
+                                    let _ = qt.queue(move |mut q| {
+                                        q.as_mut().scheduled_queued(id.into(), at_iso.into(), subject_copy.into());
+                                    });
+                                } else {
+                                    let _ = qt.queue(move |mut q| q.as_mut().queue_ready(id.into()));
+                                }
+                            }
+                            Err(err) => {
+                                let _ = qt.queue(move |mut q| q.as_mut().set_toast_text(err.into()));
+                            }
+                        }
+                        snapshot_needed = false;
+                    }
+                    Command::CancelQueued(queue_id) => {
+                        let result = rt.block_on(async {
+                            runtime.cancel_queued_send(&queue_id).await.map_err(|e| e.to_string())
+                        });
+                        notify_result(&qt, result, "Queued send cancelled");
+                        snapshot_needed = false;
+                    }
                     Command::SetPinned { id, pinned } => {
                         let result = rt.block_on(async {
                             runtime.set_pinned(&[id.clone()], pinned).await.map_err(|e| e.to_string())
@@ -902,6 +1004,67 @@ impl qobject::AppController {
 
     pub fn delete_folder(self: &Self, token: &QString) {
         if let Some(tx) = &self.tx { let _ = tx.send(Command::DeleteFolder(token.to_string())); }
+    }
+
+    pub fn send_queued(
+        self: &Self,
+        from: &QString,
+        to: &QString,
+        cc: &QString,
+        bcc: &QString,
+        subject: &QString,
+        markdown: &QString,
+        attachments: &QString,
+        delay_seconds: u64,
+    ) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Command::QueueMessage {
+                from: from.to_string(),
+                to: to.to_string(),
+                cc: cc.to_string(),
+                bcc: bcc.to_string(),
+                subject: subject.to_string(),
+                markdown: markdown.to_string(),
+                attachments: attachments.to_string(),
+                delay_seconds,
+                schedule: false,
+                at_iso: String::new(),
+            });
+        }
+    }
+
+    pub fn schedule_message(
+        self: &Self,
+        from: &QString,
+        to: &QString,
+        cc: &QString,
+        bcc: &QString,
+        subject: &QString,
+        markdown: &QString,
+        attachments: &QString,
+        delay_seconds: u64,
+        at_iso: &QString,
+    ) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Command::QueueMessage {
+                from: from.to_string(),
+                to: to.to_string(),
+                cc: cc.to_string(),
+                bcc: bcc.to_string(),
+                subject: subject.to_string(),
+                markdown: markdown.to_string(),
+                attachments: attachments.to_string(),
+                delay_seconds,
+                schedule: true,
+                at_iso: at_iso.to_string(),
+            });
+        }
+    }
+
+    pub fn cancel_queued_send(self: &Self, queue_id: &QString) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Command::CancelQueued(queue_id.to_string()));
+        }
     }
 
     pub fn set_pinned(self: &Self, id: &QString, pinned: bool) {
@@ -1764,6 +1927,25 @@ async fn handle_rpc(
             } else {
                 Ok(runtime.publish_wkd().await.map_err(|e| e.to_string())?)
             }
+        }
+        "mail_send_queued" => {
+            let to = args.get("to").and_then(|v| v.as_str()).ok_or("to is required")?;
+            let subject = args.get("subject").and_then(|v| v.as_str()).unwrap_or("");
+            let markdown = args.get("markdown").and_then(|v| v.as_str()).unwrap_or("");
+            let delay = args.get("delay_seconds").and_then(|v| v.as_u64()).unwrap_or(10);
+            let parse = |value: String| -> Vec<String> {
+                value.split(',').map(str::trim).filter(|p| !p.is_empty()).map(str::to_string).collect()
+            };
+            let id = runtime
+                .queue_markdown_with_attachments(None, &parse(to.to_string()), &[], &[], subject, markdown, &[], delay)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({ "queue_id": id }))
+        }
+        "mail_cancel_queued" => {
+            let id = args.get("queue_id").and_then(|v| v.as_str()).ok_or("queue_id is required")?;
+            runtime.cancel_queued_send(id).await.map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({ "ok": true }))
         }
         "mail_send" => {
             let settings = app_settings::load(data_dir);

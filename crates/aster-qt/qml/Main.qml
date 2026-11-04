@@ -153,6 +153,7 @@ ApplicationWindow {
     property string composeFrom: ""
     property string editingDraftId: ""
     property bool sendUndoVisible: false
+    property string pendingQueueId: ""
     property var pendingSend: null
     readonly property var scheduledSends: root.settings.compose && root.settings.compose.scheduled ? root.settings.compose.scheduled : []
     property string activeIdentity: ""
@@ -525,12 +526,17 @@ ApplicationWindow {
     function scheduleCurrentSend() {
         var when = new Date(scheduleAtField.text);
         if (isNaN(when.getTime())) return;
-        var payload = root.buildSendPayload();
-        payload.at = when.toISOString();
-        var list = root.scheduledSends.slice();
-        list.push(payload);
-        app.applySettings(JSON.stringify({ compose: { scheduled: list } }));
+        var delay = Math.max(1, Math.round((when.getTime() - Date.now()) / 1000));
+        app.scheduleMessage(root.composeFrom, composeTo.text, composeCc.text, composeBcc.text, composeSubject.text, composeBody.text, JSON.stringify(root.composeAttachments), delay, when.toISOString());
         root.composeOpen = false;
+    }
+
+    function cancelScheduled(id) {
+        var list = root.settings.compose && root.settings.compose.scheduled
+            ? root.settings.compose.scheduled.filter(function(item) { return item.id !== id; })
+            : [];
+        app.applySettings(JSON.stringify({ compose: { scheduled: list } }));
+        app.cancelQueuedSend(id);
     }
 
     function checkScheduledSends() {
@@ -2272,6 +2278,19 @@ ApplicationWindow {
             root.toastVisible = app.toastText.length > 0;
             toastTimer.restart();
         }
+        function onScheduledQueued(id, at, subject) {
+            var list = root.settings.compose && root.settings.compose.scheduled
+                ? root.settings.compose.scheduled.slice() : [];
+            list.push({ id: id, at: at, subject: subject });
+            app.applySettings(JSON.stringify({ compose: { scheduled: list } }));
+            root.toastVisible = true;
+            app.notify("Message scheduled", subject);
+        }
+        function onQueueReady(id) {
+            root.pendingQueueId = id;
+            root.sendUndoVisible = true;
+            queueUndoTimer.restart();
+        }
         function onConfirmDelete(token, ids) {
             root.pendingDeleteToken = token;
             root.pendingDeleteIds = ids;
@@ -2290,6 +2309,15 @@ ApplicationWindow {
         id: sendUndoTimer
         interval: 5000
         onTriggered: root.performPendingSend()
+    }
+
+    Timer {
+        id: queueUndoTimer
+        interval: 10000
+        onTriggered: {
+            root.pendingQueueId = "";
+            root.sendUndoVisible = false;
+        }
     }
 
     Timer {
@@ -2543,10 +2571,28 @@ ApplicationWindow {
                                         model: root.serverTemplates
                                         delegate: Text { text: modelData.name + " · " + modelData.category; color: c("text-2", "#dbebe7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-small", 12) }
                                     }
+                                    RowLayout {
+                                        Layout.fillWidth: true
+                                        Text { text: "Server-side undo send"; color: c("text-2", "#dbebe7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-small", 12); Layout.fillWidth: true }
+                                        Toggle {
+                                            checked: root.settings.compose ? root.settings.compose.server_undo_send === true : false
+                                            onToggled: app.applySettings(JSON.stringify({ compose: { server_undo_send: !checked } }))
+                                        }
+                                    }
                                     Text { text: "SERVER SIGNATURES"; color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-micro", 9); font.letterSpacing: 1; Layout.topMargin: n("space-2", 8) }
                                     Repeater {
                                         model: root.serverSignatures
                                         delegate: Text { text: modelData.name + (modelData.is_default ? " · default" : ""); color: c("text-2", "#dbebe7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-small", 12) }
+                                    }
+                                    Text { text: "SCHEDULED SENDS"; color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-micro", 9); font.letterSpacing: 1; Layout.topMargin: n("space-2", 8) }
+                                    Repeater {
+                                        model: root.scheduledSends
+                                        delegate: RowLayout {
+                                            Layout.fillWidth: true
+                                            spacing: n("space-2", 8)
+                                            Text { text: (modelData.subject || "Scheduled message") + " · " + (modelData.at || ""); color: c("text-2", "#dbebe7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-small", 12); Layout.fillWidth: true; elide: Text.ElideRight }
+                                            LinkText { text: "Cancel"; action: function() { root.cancelScheduled(modelData.id) } }
+                                        }
                                     }
 
                                 // Rules
@@ -3033,8 +3079,19 @@ ApplicationWindow {
             id: undoSendRow
             anchors.centerIn: parent
             spacing: n("space-3", 12)
-            Text { text: "Sending in 5 seconds"; color: c("text", "#ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-small", 12) }
-            LinkText { text: "Undo"; action: function() { root.cancelPendingSend() } }
+            Text { text: root.pendingQueueId.length > 0 ? "Sending in 10 seconds" : "Sending in 5 seconds"; color: c("text", "#ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-small", 12) }
+            LinkText {
+                text: "Undo"
+                action: function() {
+                    if (root.pendingQueueId.length > 0) {
+                        app.cancelQueuedSend(root.pendingQueueId);
+                        root.pendingQueueId = "";
+                        root.sendUndoVisible = false;
+                    } else {
+                        root.cancelPendingSend();
+                    }
+                }
+            }
         }
     }
 
@@ -3360,7 +3417,14 @@ ApplicationWindow {
                         MouseArea {
                             anchors.fill: parent
                             cursorShape: Qt.PointingHandCursor
-                            onClicked: root.sendWithUndo()
+                            onClicked: {
+                                if (root.settings.compose && root.settings.compose.server_undo_send === true) {
+                                    app.sendQueued(root.composeFrom, composeTo.text, composeCc.text, composeBcc.text, composeSubject.text, composeBody.text, JSON.stringify(root.composeAttachments), 10);
+                                    root.composeOpen = false;
+                                } else {
+                                    root.sendWithUndo();
+                                }
+                            }
                         }
                     }
                 }

@@ -2012,6 +2012,42 @@ impl ApiClient {
         resp.json().await.map_err(BridgeError::from)
     }
 
+    pub async fn queue_undo_send(
+        &self,
+        access_token: &str,
+        body: &serde_json::Value,
+        delay_seconds: u64,
+    ) -> Result<serde_json::Value> {
+        let mut payload = body.clone();
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("delay_seconds".to_string(), serde_json::json!(delay_seconds));
+        }
+        let resp = self
+            .client
+            .post(format!("{}/mail/v1/undo_send/queue", self.base_url))
+            .bearer_auth(access_token)
+            .json(&payload)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn cancel_queued_send(&self, access_token: &str, queue_id: &str) -> Result<()> {
+        let resp = self
+            .client
+            .delete(format!("{}/mail/v1/undo_send/{}", self.base_url, urlencoding_path(queue_id)))
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+        Ok(())
+    }
+
     pub async fn list_mail_rules(&self, access_token: &str) -> Result<serde_json::Value> {
         let resp = self
             .client

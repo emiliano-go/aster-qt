@@ -399,6 +399,104 @@ impl ClientRuntime {
         Ok(id)
     }
 
+    pub async fn queue_markdown_with_attachments(
+        &self,
+        from: Option<&str>,
+        to: &[String],
+        cc: &[String],
+        bcc: &[String],
+        subject: &str,
+        markdown: &str,
+        attachments: &[PathBuf],
+        delay_seconds: u64,
+    ) -> ClientResult<String> {
+        if to.is_empty() && cc.is_empty() && bcc.is_empty() {
+            return Err(ClientError::Protocol("add at least one recipient".into()));
+        }
+        let from = match from {
+            Some(value) if !value.trim().is_empty() => value.to_string(),
+            _ => self.session().read().await.default_sender_address(),
+        };
+        let (plain, mut html) = crate::compose::markdown_to_email(markdown);
+        let mut builder = MessageBuilder::new();
+        builder = builder.from(Address::new_address(None::<String>, from.clone()));
+        builder = builder.subject(subject.to_string());
+        if !to.is_empty() {
+            builder = builder.to(Address::new_list(
+                to.iter().map(|email| Address::new_address(None::<String>, email.clone())).collect(),
+            ));
+        }
+        if !cc.is_empty() {
+            builder = builder.cc(Address::new_list(
+                cc.iter().map(|email| Address::new_address(None::<String>, email.clone())).collect(),
+            ));
+        }
+        if !bcc.is_empty() {
+            builder = builder.bcc(Address::new_list(
+                bcc.iter().map(|email| Address::new_address(None::<String>, email.clone())).collect(),
+            ));
+        }
+        for path in attachments {
+            let name = path.file_name().and_then(|value| value.to_str()).ok_or_else(|| {
+                ClientError::Protocol(format!("invalid attachment path: {}", path.display()))
+            })?;
+            let data = std::fs::read(path)
+                .map_err(|err| ClientError::Protocol(format!("read {}: {}", path.display(), err)))?;
+            let content_type = attachment_content_type(name);
+            let quoted = format!("src=\"{}\"", name);
+            let dotted = format!("src=\"./{}\"", name);
+            if content_type.starts_with("image/") && (html.contains(&quoted) || html.contains(&dotted)) {
+                let cid = format!("{}@aster", uuid::Uuid::new_v4().simple());
+                let cid_url = format!("src=\"cid:{}\"", cid);
+                html = html.replace(&quoted, &cid_url).replace(&dotted, &cid_url);
+                builder = builder.inline(content_type, cid, data);
+            } else {
+                builder = builder.attachment(content_type, name, data);
+            }
+        }
+        builder = builder.text_body(plain).html_body(html);
+        let mut raw = builder
+            .write_to_vec()
+            .map_err(|e| ClientError::Protocol(format!("build message: {e}")))?;
+        let settings = crate::settings::load(self.data_dir());
+        if crate::settings::boolean(&settings, &["security", "gpg_sign_outgoing"], false) {
+            let fingerprint = crate::settings::string(&settings, &["security", "gpg_key_fingerprint"], "");
+            if !fingerprint.is_empty() {
+                raw = crate::pgp_agent::sign_mime(&raw, &fingerprint)
+                    .map_err(|err| ClientError::Protocol(format!("gpg signing failed: {err}")))?;
+            }
+        }
+        let recipients: Vec<String> = to.iter().chain(cc.iter()).chain(bcc.iter()).cloned().collect();
+        let (payload, token) = aster_bridge_core::smtp::server::build_threaded_send_payload(
+            &raw,
+            Some(from),
+            recipients,
+            self.session(),
+            self.client(),
+            self.db(),
+        )
+        .await
+        .map_err(ClientError::from_bridge)?;
+        let value = self
+            .client()
+            .queue_undo_send(&token, &payload, delay_seconds)
+            .await
+            .map_err(ClientError::from_bridge)?;
+        value
+            .get("queue_id")
+            .and_then(|id| id.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| ClientError::Protocol("queue response had no queue_id".into()))
+    }
+
+    pub async fn cancel_queued_send(&self, queue_id: &str) -> ClientResult<()> {
+        let token = self.access_token().await;
+        self.client()
+            .cancel_queued_send(&token, queue_id)
+            .await
+            .map_err(ClientError::from_bridge)
+    }
+
     pub async fn server_templates(&self) -> ClientResult<Vec<TemplateView>> {
         let (token, key) = self.encryption_material().await?;
         let value = self
