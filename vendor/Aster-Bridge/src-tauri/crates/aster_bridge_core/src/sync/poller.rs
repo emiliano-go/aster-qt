@@ -1617,6 +1617,11 @@ fn commit_prepared(
             return CacheOutcome::default();
         }
     };
+    if let Some(until) = item.snoozed_until.as_deref().filter(|value| !value.is_empty()) {
+        if let Err(e) = db.set_message_snooze(&item.id, until) {
+            tracing::warn!("snooze cache failed for {}: {}", item.id, e);
+        }
+    }
     if bare_message_id.is_some() {
         if let Err(e) = db.update_message_thread_and_msgid(&item.id, None, bare_message_id.as_deref()) {
             tracing::warn!("message id index failed for {}: {}", item.id, e);
@@ -3644,6 +3649,9 @@ mod tests {
             is_spam: None,
             is_read: None,
             is_starred: None,
+            is_pinned: None,
+            rule_category: None,
+            is_archived: None,
             has_attachments: None,
             attachment_count: None,
             labels: None,

@@ -475,6 +475,7 @@ const REQUIRED_COLUMNS: &[(&str, &[&str])] = &[
         &["id", "label", "hash", "created_at", "last_used_at", "last_client", "use_count"],
     ),
     ("sync_state", &["key", "value"]),
+    ("message_snooze", &["aster_id", "snoozed_until"]),
     (
         "jmap_mailbox",
         &["id", "name", "parent_id", "role", "sort_order", "folder_label"],
@@ -816,6 +817,11 @@ impl Database {
                 PRIMARY KEY (aster_id, keyword)
             );
 
+            CREATE TABLE IF NOT EXISTS message_snooze (
+                aster_id TEXT PRIMARY KEY,
+                snoozed_until TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS message_cache (
                 aster_id TEXT PRIMARY KEY,
                 folder TEXT NOT NULL,
@@ -845,6 +851,7 @@ impl Database {
 
             CREATE INDEX IF NOT EXISTS idx_message_cache_folder ON message_cache(folder);
             CREATE INDEX IF NOT EXISTS idx_uid_map_folder_uid ON uid_map(folder, imap_uid);
+            CREATE INDEX IF NOT EXISTS idx_message_snooze_until ON message_snooze(snoozed_until);
 
             CREATE TABLE IF NOT EXISTS jmap_mailbox (
                 id TEXT PRIMARY KEY,
@@ -1778,10 +1785,105 @@ impl Database {
         })
     }
 
+    pub fn list_visible_message_meta(&self, folder: &str) -> Result<Vec<CachedMessage>, String> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT m.aster_id, m.folder, m.subject, m.sender, m.recipients, m.date, m.size, m.flags, NULL, m.raw_headers, COALESCE(u.imap_uid, 0), m.thread_id, m.attachments_state
+                 FROM message_cache m
+                 LEFT JOIN uid_map u ON u.aster_id = m.aster_id AND u.folder = m.folder
+                 WHERE m.folder = ?1
+                   AND NOT EXISTS (
+                     SELECT 1 FROM message_snooze s
+                     WHERE s.aster_id = m.aster_id
+                       AND julianday(s.snoozed_until) > julianday('now')
+                   )
+                 ORDER BY u.imap_uid ASC",
+            )?;
+            let rows = stmt.query_map([folder], |row| cached_message_from_row(row))?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+    }
+
+    pub fn list_snoozed_message_meta(&self) -> Result<Vec<CachedMessage>, String> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT m.aster_id, m.folder, m.subject, m.sender, m.recipients, m.date, m.size, m.flags, NULL, m.raw_headers, COALESCE(u.imap_uid, 0), m.thread_id, m.attachments_state
+                 FROM message_snooze s
+                 JOIN message_cache m ON m.aster_id = s.aster_id
+                 LEFT JOIN uid_map u ON u.aster_id = m.aster_id AND u.folder = m.folder
+                 WHERE julianday(s.snoozed_until) > julianday('now')
+                 ORDER BY julianday(s.snoozed_until) ASC",
+            )?;
+            let rows = stmt.query_map([], |row| cached_message_from_row(row))?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+    }
+
+    pub fn set_message_snooze(&self, aster_id: &str, snoozed_until: &str) -> Result<(), String> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO message_snooze (aster_id, snoozed_until) VALUES (?1, ?2)
+                 ON CONFLICT(aster_id) DO UPDATE SET snoozed_until = excluded.snoozed_until",
+                rusqlite::params![aster_id, snoozed_until],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn clear_message_snooze(&self, aster_id: &str) -> Result<(), String> {
+        self.with_conn(|conn| {
+            conn.execute("DELETE FROM message_snooze WHERE aster_id = ?1", [aster_id])?;
+            Ok(())
+        })
+    }
+
+    pub fn snoozed_until_for_ids(
+        &self,
+        ids: &[String],
+    ) -> Result<HashMap<String, String>, String> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        self.with_conn(|conn| {
+            let mut out = HashMap::new();
+            for chunk in ids.chunks(SQL_IN_CHUNK) {
+                let sql = format!(
+                    "SELECT aster_id, snoozed_until FROM message_snooze
+                     WHERE julianday(snoozed_until) > julianday('now')
+                       AND aster_id IN ({})",
+                    sql_placeholders(chunk.len()),
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?;
+                for row in rows {
+                    let (id, until) = row?;
+                    out.insert(id, until);
+                }
+            }
+            Ok(out)
+        })
+    }
+
     pub fn count_cached_messages(&self, folder: &str) -> Result<u32, String> {
         self.with_conn(|conn| {
             let n: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM message_cache WHERE folder = ?1",
+                "SELECT COUNT(*) FROM message_cache m
+                 WHERE m.folder = ?1
+                   AND NOT EXISTS (
+                     SELECT 1 FROM message_snooze s
+                     WHERE s.aster_id = m.aster_id
+                       AND julianday(s.snoozed_until) > julianday('now')
+                   )",
                 [folder],
                 |r| r.get(0),
             )?;
@@ -1792,7 +1894,13 @@ impl Database {
     pub fn count_unread_messages(&self, folder: &str) -> Result<u32, String> {
         self.with_conn(|conn| {
             let n: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM message_cache WHERE folder = ?1 AND (flags & 1) = 0",
+                "SELECT COUNT(*) FROM message_cache m
+                 WHERE m.folder = ?1 AND (m.flags & 1) = 0
+                   AND NOT EXISTS (
+                     SELECT 1 FROM message_snooze s
+                     WHERE s.aster_id = m.aster_id
+                       AND julianday(s.snoozed_until) > julianday('now')
+                   )",
                 [folder],
                 |r| r.get(0),
             )?;
@@ -3203,6 +3311,24 @@ fn body_starts_with_predicate(marker: &str) -> String {
 
 fn sql_placeholders(n: usize) -> String {
     vec!["?"; n].join(",")
+}
+
+fn cached_message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CachedMessage> {
+    Ok(CachedMessage {
+        aster_id: row.get(0)?,
+        folder: row.get(1)?,
+        subject: row.get(2)?,
+        sender: row.get(3)?,
+        recipients: row.get(4)?,
+        date: row.get(5)?,
+        size: row.get(6)?,
+        flags: row.get(7)?,
+        body_text: row.get(8)?,
+        raw_headers: row.get(9)?,
+        imap_uid: row.get::<_, i64>(10)? as u32,
+        thread_id: row.get(11)?,
+        attachments_state: row.get(12)?,
+    })
 }
 
 fn unique_ids(ids: &[String]) -> Vec<&str> {
@@ -4714,6 +4840,26 @@ mod db_tests {
             })
             .unwrap();
         assert!(!plan.iter().any(|step| step.starts_with("SCAN envelope_nonces")), "{:?}", plan);
+    }
+
+    #[test]
+    fn future_snoozes_leave_visible_lists_and_expire_back() {
+        let (_d, db) = open_db();
+        db.upsert_cached_message("snoozed-1", "inbox", Some("later"), None, None, None, 0, None, None)
+            .unwrap();
+
+        db.set_message_snooze("snoozed-1", "2999-01-01T09:00:00Z").unwrap();
+        assert!(db.list_visible_message_meta("inbox").unwrap().is_empty());
+        assert_eq!(db.count_cached_messages("inbox").unwrap(), 0);
+        assert_eq!(db.list_snoozed_message_meta().unwrap().len(), 1);
+
+        db.set_message_snooze("snoozed-1", "2000-01-01T09:00:00Z").unwrap();
+        assert_eq!(db.list_visible_message_meta("inbox").unwrap().len(), 1);
+        assert!(db.list_snoozed_message_meta().unwrap().is_empty());
+
+        db.set_message_snooze("snoozed-1", "2999-01-01T09:00:00Z").unwrap();
+        db.clear_message_snooze("snoozed-1").unwrap();
+        assert_eq!(db.list_visible_message_meta("inbox").unwrap().len(), 1);
     }
 
     #[test]
