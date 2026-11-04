@@ -37,4 +37,7 @@ check rules_list
 check contacts_list
 check pgp_key_info
 check pgp_status
+check tags_list
+check mailing_lists_list
+check gpg_status
 exit "$fail"

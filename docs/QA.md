@@ -32,5 +32,11 @@
 - Offline startup, session expiry, plan failure, and revoked device.
 - Rule create, delete, run, and failure paths from the visual builder.
 - MCP send with approval disabled and enabled.
+- Tags create/list/delete via MCP.
+- Folder create/rename/move/delete via MCP.
+- Snooze and unsnooze one message via MCP.
+- Batch selection bar and actions compile and render.
+- Compose signature/template insertion links render.
+- On-demand attachment fetch via MCP.
 - Aster key imported into the real system gpg-agent and listed with `gpg --list-secret-keys`.
 - Light, dark, and custom themes across all dialogs.
