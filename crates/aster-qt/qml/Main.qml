@@ -142,6 +142,7 @@ ApplicationWindow {
     property bool threadListOpen: false
     property var aliasSelection: []
     property string composeFrom: ""
+    property string editingDraftId: ""
     property string activeIdentity: ""
     property var composeAttachments: []
     property bool toastVisible: false
@@ -162,6 +163,8 @@ ApplicationWindow {
     readonly property var gpg: parse(app.gpgJson, ({}))
     readonly property var contacts: parse(app.contactsJson, [])
     readonly property var tags: parse(app.tagsJson, [])
+    readonly property var serverTemplates: parse(app.templatesJson, [])
+    readonly property var serverSignatures: parse(app.signaturesJson, [])
     readonly property var threadMessages: parse(app.threadJson, [])
     readonly property var mailingLists: parse(app.listsJson, [])
     readonly property var outboxItems: parse(app.outboxJson, [])
@@ -457,6 +460,19 @@ ApplicationWindow {
             composeBody.text = "\n\nOn " + (root.formatWhen(root.detail.date) || "an earlier date")
                 + ", " + (root.detail.sender || "the sender") + " wrote:\n" + lines;
         }
+        root.composeOpen = true;
+    }
+
+    function openDraft() {
+        if (!root.detail || !root.detail.id) return;
+        root.editingDraftId = root.detail.id;
+        root.composeFrom = root.detail.recipients && root.identities.length > 0 ? root.identities[0].address : root.composeFrom;
+        composeTo.text = root.detail.recipients || "";
+        composeCc.text = "";
+        composeBcc.text = "";
+        composeSubject.text = root.detail.subject || "";
+        composeBody.text = root.detail.body || "";
+        root.composeAttachments = [];
         root.composeOpen = true;
     }
 
@@ -1743,6 +1759,7 @@ ApplicationWindow {
                         Layout.leftMargin: n("space-4", 16)
                         Layout.rightMargin: n("space-4", 16)
                         spacing: n("space-1", 4)
+                        LinkText { visible: app.folderId === "drafts"; text: "Edit draft"; action: function() { root.openDraft() } }
                         IconButton { icon: "reply"; label: "Reply"; onClicked: root.openReply() }
                         IconButton { icon: "forward"; label: "Forward"; onClicked: root.openForward() }
                         Item { Layout.fillWidth: true }
@@ -2375,6 +2392,16 @@ ApplicationWindow {
                                         }
                                     }
                                     LinkText { text: "Save template"; action: function() { app.applySettings(JSON.stringify({ compose: { template: templateField.text } })) } }
+                                    Text { text: "SERVER TEMPLATES"; color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-micro", 9); font.letterSpacing: 1; Layout.topMargin: n("space-2", 8) }
+                                    Repeater {
+                                        model: root.serverTemplates
+                                        delegate: Text { text: modelData.name + " · " + modelData.category; color: c("text-2", "#dbebe7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-small", 12) }
+                                    }
+                                    Text { text: "SERVER SIGNATURES"; color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-micro", 9); font.letterSpacing: 1; Layout.topMargin: n("space-2", 8) }
+                                    Repeater {
+                                        model: root.serverSignatures
+                                        delegate: Text { text: modelData.name + (modelData.is_default ? " · default" : ""); color: c("text-2", "#dbebe7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-small", 12) }
+                                    }
 
                                 // Rules
                                 ColumnLayout {
@@ -3162,6 +3189,10 @@ ApplicationWindow {
                             anchors.fill: parent
                             cursorShape: Qt.PointingHandCursor
                             onClicked: {
+                                if (root.editingDraftId.length > 0) {
+                                    app.deleteDraft(root.editingDraftId);
+                                    root.editingDraftId = "";
+                                }
                                 app.sendMessage(root.composeFrom, composeTo.text, composeCc.text, composeBcc.text, composeSubject.text, composeBody.text, JSON.stringify(root.composeAttachments));
                                 root.composeOpen = false;
                             }

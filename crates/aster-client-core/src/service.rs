@@ -383,6 +383,152 @@ impl ClientRuntime {
         Ok(id)
     }
 
+    pub async fn server_templates(&self) -> ClientResult<Vec<TemplateView>> {
+        let (token, key) = self.encryption_material().await?;
+        let value = self
+            .client()
+            .list_templates(&token)
+            .await
+            .map_err(ClientError::from_bridge)?;
+        let items = value
+            .get("templates")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let mut out = Vec::new();
+        for item in items {
+            let name = decrypt_field(&key, &item, "encrypted_name", "name_nonce")?;
+            let category = decrypt_field(&key, &item, "encrypted_category", "category_nonce")?;
+            let content = decrypt_field(&key, &item, "encrypted_content", "content_nonce")?;
+            out.push(TemplateView {
+                id: item["id"].as_str().unwrap_or_default().to_string(),
+                name,
+                category,
+                content,
+                sort_order: item["sort_order"].as_i64().unwrap_or(0),
+            });
+        }
+        Ok(out)
+    }
+
+    pub async fn create_server_template(
+        &self,
+        name: &str,
+        category: &str,
+        content: &str,
+    ) -> ClientResult<String> {
+        let (token, key) = self.encryption_material().await?;
+        let (enc_name, name_nonce) = encrypt_field(&key, name)?;
+        let (enc_category, category_nonce) = encrypt_field(&key, category)?;
+        let (enc_content, content_nonce) = encrypt_field(&key, content)?;
+        let body = serde_json::json!({
+            "encrypted_name": enc_name,
+            "name_nonce": name_nonce,
+            "encrypted_category": enc_category,
+            "category_nonce": category_nonce,
+            "encrypted_content": enc_content,
+            "content_nonce": content_nonce,
+            "sort_order": 0
+        });
+        let value = self
+            .client()
+            .create_template(&token, &body)
+            .await
+            .map_err(ClientError::from_bridge)?;
+        Ok(value["id"].as_str().unwrap_or_default().to_string())
+    }
+
+    pub async fn delete_server_template(&self, id: &str) -> ClientResult<()> {
+        let token = self.access_token().await;
+        self.client()
+            .delete_template(&token, id)
+            .await
+            .map_err(ClientError::from_bridge)
+    }
+
+    pub async fn server_signatures(&self) -> ClientResult<Vec<SignatureView>> {
+        let (token, key) = self.encryption_material().await?;
+        let value = self
+            .client()
+            .list_signatures(&token)
+            .await
+            .map_err(ClientError::from_bridge)?;
+        let items = value
+            .get("signatures")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let mut out = Vec::new();
+        for item in items {
+            let name = decrypt_field(&key, &item, "encrypted_name", "name_nonce")?;
+            let content = decrypt_field(&key, &item, "encrypted_content", "content_nonce")?;
+            out.push(SignatureView {
+                id: item["id"].as_str().unwrap_or_default().to_string(),
+                name,
+                content,
+                is_html: item["is_html"].as_bool().unwrap_or(false),
+                is_default: item["is_default"].as_bool().unwrap_or(false),
+                alias_id: item["alias_id"].as_str().map(str::to_string),
+            });
+        }
+        Ok(out)
+    }
+
+    pub async fn create_server_signature(&self, name: &str, content: &str) -> ClientResult<String> {
+        let (token, key) = self.encryption_material().await?;
+        let (enc_name, name_nonce) = encrypt_field(&key, name)?;
+        let (enc_content, content_nonce) = encrypt_field(&key, content)?;
+        let body = serde_json::json!({
+            "encrypted_name": enc_name,
+            "name_nonce": name_nonce,
+            "encrypted_content": enc_content,
+            "content_nonce": content_nonce,
+            "is_default": false,
+            "is_html": false,
+            "alias_id": serde_json::Value::Null,
+            "placement": serde_json::Value::Null
+        });
+        let value = self
+            .client()
+            .create_signature(&token, &body)
+            .await
+            .map_err(ClientError::from_bridge)?;
+        Ok(value["id"].as_str().unwrap_or_default().to_string())
+    }
+
+    pub async fn delete_server_signature(&self, id: &str) -> ClientResult<()> {
+        let token = self.access_token().await;
+        self.client()
+            .delete_signature(&token, id)
+            .await
+            .map_err(ClientError::from_bridge)
+    }
+
+    pub async fn set_default_signature(&self, id: &str) -> ClientResult<()> {
+        let token = self.access_token().await;
+        self.client()
+            .set_default_signature(&token, id)
+            .await
+            .map(|_| ())
+            .map_err(ClientError::from_bridge)
+    }
+
+    async fn encryption_material(&self) -> ClientResult<(String, [u8; 32])> {
+        let session = self.session().read().await;
+        let token = session.access_token.to_string();
+        let data_kek = session
+            .data_kek
+            .as_ref()
+            .ok_or_else(|| ClientError::Session("encryption key is not unlocked".into()))?;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(data_kek.as_bytes())
+            .map_err(|e| ClientError::Protocol(format!("data key decode: {e}")))?;
+        let key: [u8; 32] = decoded
+            .try_into()
+            .map_err(|_| ClientError::Protocol("data key must be 32 bytes".into()))?;
+        Ok((token, key))
+    }
+
     pub fn tags(&self) -> ClientResult<Vec<TagView>> {
         let tags = self.db().list_custom_tags().map_err(ClientError::Storage)?;
         Ok(tags
@@ -590,6 +736,16 @@ impl ClientRuntime {
 
     pub async fn trash_messages(&self, ids: &[String]) -> ClientResult<()> {
         self.move_messages(ids, "trash").await
+    }
+
+    pub async fn delete_draft(&self, id: &str) -> ClientResult<()> {
+        let token = self.access_token().await;
+        self.client()
+            .delete_draft(&token, id)
+            .await
+            .map_err(ClientError::from_bridge)?;
+        let _ = self.db().delete_message_by_aster_id(id);
+        Ok(())
     }
 
     pub async fn empty_folder(&self, folder: &str) -> ClientResult<usize> {
@@ -1237,4 +1393,71 @@ pub struct TagView {
     pub name: String,
     pub keyword: Option<String>,
     pub position: i64,
+}
+
+
+fn encrypt_field(key: &[u8; 32], plaintext: &str) -> ClientResult<(String, String)> {
+    use aes_gcm::aead::{Aead, KeyInit};
+    use aes_gcm::Aes256Gcm;
+    use aes_gcm::Nonce;
+    use rand::RngCore;
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| ClientError::Protocol(e.to_string()))?;
+    let mut nonce_bytes = [0u8; 12];
+    rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let encrypted = cipher
+        .encrypt(nonce, plaintext.as_bytes())
+        .map_err(|e| ClientError::Protocol(format!("encrypt: {e}")))?;
+    Ok((
+        base64::engine::general_purpose::STANDARD.encode(encrypted),
+        base64::engine::general_purpose::STANDARD.encode(nonce_bytes),
+    ))
+}
+
+fn decrypt_field(
+    key: &[u8; 32],
+    item: &serde_json::Value,
+    encrypted_key: &str,
+    nonce_key: &str,
+) -> ClientResult<String> {
+    use aes_gcm::aead::{Aead, KeyInit};
+    use aes_gcm::Aes256Gcm;
+    use aes_gcm::Nonce;
+    let encrypted = item[encrypted_key]
+        .as_str()
+        .ok_or_else(|| ClientError::Protocol(format!("missing {encrypted_key}")))?;
+    let nonce_b64 = item[nonce_key]
+        .as_str()
+        .ok_or_else(|| ClientError::Protocol(format!("missing {nonce_key}")))?;
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| ClientError::Protocol(e.to_string()))?;
+    let ciphertext = base64::engine::general_purpose::STANDARD
+        .decode(encrypted)
+        .map_err(|e| ClientError::Protocol(format!("decode ciphertext: {e}")))?;
+    let nonce_bytes = base64::engine::general_purpose::STANDARD
+        .decode(nonce_b64)
+        .map_err(|e| ClientError::Protocol(format!("decode nonce: {e}")))?;
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let plaintext = cipher
+        .decrypt(nonce, ciphertext.as_ref())
+        .map_err(|e| ClientError::Protocol(format!("decrypt: {e}")))?;
+    String::from_utf8(plaintext).map_err(|e| ClientError::Protocol(e.to_string()))
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TemplateView {
+    pub id: String,
+    pub name: String,
+    pub category: String,
+    pub content: String,
+    pub sort_order: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SignatureView {
+    pub id: String,
+    pub name: String,
+    pub content: String,
+    pub is_html: bool,
+    pub is_default: bool,
+    pub alias_id: Option<String>,
 }

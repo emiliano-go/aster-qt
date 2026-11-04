@@ -1896,6 +1896,116 @@ impl ApiClient {
         Ok(())
     }
 
+    async fn get_json(&self, path: &str, access_token: &str) -> Result<serde_json::Value> {
+        let resp = self
+            .client
+            .get(format!("{}{}", self.base_url, path))
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    async fn post_json(
+        &self,
+        path: &str,
+        access_token: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let resp = self
+            .client
+            .post(format!("{}{}", self.base_url, path))
+            .bearer_auth(access_token)
+            .json(body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    async fn put_json(
+        &self,
+        path: &str,
+        access_token: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let resp = self
+            .client
+            .put(format!("{}{}", self.base_url, path))
+            .bearer_auth(access_token)
+            .json(body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    async fn delete_empty(&self, path: &str, access_token: &str) -> Result<()> {
+        let resp = self
+            .client
+            .delete(format!("{}{}", self.base_url, path))
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+        Ok(())
+    }
+
+    pub async fn list_templates(&self, access_token: &str) -> Result<serde_json::Value> {
+        self.get_json("/mail/v1/templates", access_token).await
+    }
+
+    pub async fn create_template(&self, access_token: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
+        self.post_json("/mail/v1/templates", access_token, body).await
+    }
+
+    pub async fn update_template(&self, access_token: &str, id: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
+        self.put_json(&format!("/mail/v1/templates/{}", urlencoding_path(id)), access_token, body).await
+    }
+
+    pub async fn delete_template(&self, access_token: &str, id: &str) -> Result<()> {
+        self.delete_empty(&format!("/mail/v1/templates/{}", urlencoding_path(id)), access_token).await
+    }
+
+    pub async fn list_signatures(&self, access_token: &str) -> Result<serde_json::Value> {
+        self.get_json("/mail/v1/signatures", access_token).await
+    }
+
+    pub async fn create_signature(&self, access_token: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
+        self.post_json("/mail/v1/signatures", access_token, body).await
+    }
+
+    pub async fn update_signature(&self, access_token: &str, id: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
+        self.put_json(&format!("/mail/v1/signatures/{}", urlencoding_path(id)), access_token, body).await
+    }
+
+    pub async fn delete_signature(&self, access_token: &str, id: &str) -> Result<()> {
+        self.delete_empty(&format!("/mail/v1/signatures/{}", urlencoding_path(id)), access_token).await
+    }
+
+    pub async fn set_default_signature(&self, access_token: &str, id: &str) -> Result<serde_json::Value> {
+        let resp = self
+            .client
+            .patch(format!("{}/mail/v1/signatures/{}/default", self.base_url, urlencoding_path(id)))
+            .bearer_auth(access_token)
+            .json(&serde_json::json!({}))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+        resp.json().await.map_err(BridgeError::from)
+    }
+
     pub async fn list_mail_rules(&self, access_token: &str) -> Result<serde_json::Value> {
         let resp = self
             .client

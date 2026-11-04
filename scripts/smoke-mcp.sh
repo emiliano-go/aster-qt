@@ -41,4 +41,6 @@ check tags_list
 check mailing_lists_list
 check gpg_status
 check mail_from_sender_list '{"sender":"a","limit":1}'
+check templates_list
+check signatures_list
 exit "$fail"

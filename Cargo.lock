@@ -190,6 +190,7 @@ dependencies = [
 name = "aster-client-core"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "ammonia",
  "anyhow",
  "aster-bridge-core",
@@ -199,6 +200,7 @@ dependencies = [
  "fs2",
  "mail-builder",
  "pulldown-cmark",
+ "rand 0.8.8",
  "rusqlite",
  "serde",
  "serde_json",

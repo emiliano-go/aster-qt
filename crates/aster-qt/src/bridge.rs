@@ -47,6 +47,8 @@ pub mod qobject {
         #[qproperty(QString, thread_json, cxx_name = "threadJson")]
         #[qproperty(QString, lists_json, cxx_name = "listsJson")]
         #[qproperty(QString, tags_json, cxx_name = "tagsJson")]
+        #[qproperty(QString, templates_json, cxx_name = "templatesJson")]
+        #[qproperty(QString, signatures_json, cxx_name = "signaturesJson")]
         #[qproperty(QString, outbox_json, cxx_name = "outboxJson")]
         #[qproperty(QString, folder_id, cxx_name = "folderId")]
         #[qproperty(bool, loading, cxx_name = "loading")]
@@ -79,6 +81,10 @@ pub mod qobject {
         #[qinvokable]
         #[cxx_name = "deleteFolder"]
         fn delete_folder(self: &Self, token: &QString);
+
+        #[qinvokable]
+        #[cxx_name = "deleteDraft"]
+        fn delete_draft(self: &Self, id: &QString);
 
         #[qinvokable]
         #[cxx_name = "emptyFolder"]
@@ -261,6 +267,7 @@ pub(crate) enum Command {
     ImportGpgKey,
     BatchAction { action: String, ids: Vec<String> },
     EmptyFolder(String),
+    DeleteDraft(String),
     CreateTag(String),
     DeleteTag(String),
     RenameFolder { token: String, name: String },
@@ -293,6 +300,8 @@ pub struct AppControllerRust {
     thread_json: QString,
     lists_json: QString,
     tags_json: QString,
+    templates_json: QString,
+    signatures_json: QString,
     outbox_json: QString,
     folder_id: QString,
     loading: bool,
@@ -340,6 +349,8 @@ impl Default for AppControllerRust {
             thread_json: "[]".into(),
             lists_json: "[]".into(),
             tags_json: "[]".into(),
+            templates_json: "[]".into(),
+            signatures_json: "[]".into(),
             outbox_json: "[]".into(),
             folder_id: "inbox".into(),
             loading: true,
@@ -626,6 +637,13 @@ impl qobject::AppController {
                         notify_result(&qt, result, "Folder deleted");
                         snapshot_needed = true;
                     }
+                    Command::DeleteDraft(id) => {
+                        let result = rt.block_on(async {
+                            runtime.delete_draft(&id).await.map_err(|e| e.to_string())
+                        });
+                        notify_result(&qt, result, "Draft deleted");
+                        snapshot_needed = false;
+                    }
                     Command::EmptyFolder(folder_label) => {
                         let result = rt.block_on(async {
                             runtime.empty_folder(&folder_label).await.map(|_| ()).map_err(|e| e.to_string())
@@ -858,6 +876,10 @@ impl qobject::AppController {
 
     pub fn delete_folder(self: &Self, token: &QString) {
         if let Some(tx) = &self.tx { let _ = tx.send(Command::DeleteFolder(token.to_string())); }
+    }
+
+    pub fn delete_draft(self: &Self, id: &QString) {
+        if let Some(tx) = &self.tx { let _ = tx.send(Command::DeleteDraft(id.to_string())); }
     }
 
     pub fn empty_folder(self: &Self, folder: &QString) {
@@ -1158,6 +1180,16 @@ async fn push_settings_data(
         .tags()
         .map(|value| serde_json::to_string(&value).unwrap_or_else(|_| "[]".into()))
         .unwrap_or_else(|_| "[]".into());
+    let templates = runtime
+        .server_templates()
+        .await
+        .map(|value| serde_json::to_string(&value).unwrap_or_else(|_| "[]".into()))
+        .unwrap_or_else(|_| "[]".into());
+    let signatures = runtime
+        .server_signatures()
+        .await
+        .map(|value| serde_json::to_string(&value).unwrap_or_else(|_| "[]".into()))
+        .unwrap_or_else(|_| "[]".into());
     let _ = qt.queue(move |mut q| {
         q.as_mut().set_rules_json(rules.into());
         q.as_mut().set_identities_json(identities.into());
@@ -1165,6 +1197,8 @@ async fn push_settings_data(
         q.as_mut().set_contacts_json(contacts.into());
         q.as_mut().set_gpg_json(gpg.into());
         q.as_mut().set_tags_json(tags.into());
+        q.as_mut().set_templates_json(templates.into());
+        q.as_mut().set_signatures_json(signatures.into());
     });
 }
 
@@ -1421,6 +1455,38 @@ async fn handle_rpc(
                 .await
                 .map_err(|e| e.to_string())?;
             Ok(serde_json::json!({ "folder_token": token, "rule_id": rule_id }))
+        }
+        "templates_list" => Ok(serde_json::to_value(
+            runtime.server_templates().await.map_err(|e| e.to_string())?,
+        ).map_err(|e| e.to_string())?),
+        "template_create" => {
+            let name = args.get("name").and_then(|v| v.as_str()).ok_or("name is required")?;
+            let category = args.get("category").and_then(|v| v.as_str()).unwrap_or("");
+            let content = args.get("content").and_then(|v| v.as_str()).ok_or("content is required")?;
+            Ok(serde_json::json!({"id": runtime.create_server_template(name, category, content).await.map_err(|e| e.to_string())?}))
+        }
+        "template_delete" => {
+            let id = args.get("id").and_then(|v| v.as_str()).ok_or("id is required")?;
+            runtime.delete_server_template(id).await.map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({"ok": true}))
+        }
+        "signatures_list" => Ok(serde_json::to_value(
+            runtime.server_signatures().await.map_err(|e| e.to_string())?,
+        ).map_err(|e| e.to_string())?),
+        "signature_create" => {
+            let name = args.get("name").and_then(|v| v.as_str()).ok_or("name is required")?;
+            let content = args.get("content").and_then(|v| v.as_str()).ok_or("content is required")?;
+            Ok(serde_json::json!({"id": runtime.create_server_signature(name, content).await.map_err(|e| e.to_string())?}))
+        }
+        "signature_delete" => {
+            let id = args.get("id").and_then(|v| v.as_str()).ok_or("id is required")?;
+            runtime.delete_server_signature(id).await.map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({"ok": true}))
+        }
+        "signature_set_default" => {
+            let id = args.get("id").and_then(|v| v.as_str()).ok_or("id is required")?;
+            runtime.set_default_signature(id).await.map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({"ok": true}))
         }
         "tags_list" => Ok(serde_json::to_value(
             runtime.tags().map_err(|e| e.to_string())?,

@@ -42,5 +42,8 @@
 - Sender action list via MCP.
 - Empty folder on an empty test folder.
 - Saved search controls render in the filter popup.
+- Server-synced template create/list/delete.
+- Server-synced signature create/list/delete.
+- Draft edit path compiles and reuses the composer.
 - Aster key imported into the real system gpg-agent and listed with `gpg --list-secret-keys`.
 - Light, dark, and custom themes across all dialogs.
