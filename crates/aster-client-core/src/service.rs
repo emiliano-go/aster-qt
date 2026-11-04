@@ -38,6 +38,8 @@ pub struct MessageView {
     pub has_attachments: bool,
     pub list_id: Option<String>,
     pub list_name: Option<String>,
+    pub list_unsubscribe: Option<String>,
+    pub list_unsubscribe_post: Option<String>,
     pub message_id: Option<String>,
     pub in_reply_to: Option<String>,
     pub references: Option<String>,
@@ -1147,6 +1149,14 @@ fn view_of(msg: &CachedMessage) -> MessageView {
             .or_else(|| {
                 infer_list_id(msg.recipients.as_deref()).map(|id| list_name_from_id(&id))
             }),
+        list_unsubscribe: meta
+            .get("list_unsubscribe")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        list_unsubscribe_post: meta
+            .get("list_unsubscribe_post")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
         message_id: meta
             .get("message_id")
             .and_then(|value| value.as_str())

@@ -1349,6 +1349,16 @@ async fn handle_rpc(
                 .map_err(|e| e.to_string())?;
             Ok(serde_json::json!({ "ok": true }))
         }
+        "mail_unsubscribe_info" => {
+            let id = args.get("id").and_then(|v| v.as_str()).ok_or("id is required")?;
+            let detail = runtime.message(id).map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({
+                "list_id": detail.message.list_id,
+                "list_name": detail.message.list_name,
+                "list_unsubscribe": detail.message.list_unsubscribe,
+                "list_unsubscribe_post": detail.message.list_unsubscribe_post
+            }))
+        }
         "mailing_list_archive" => {
             let list_id = args.get("list_id").and_then(|v| v.as_str()).ok_or("list_id is required")?;
             Ok(serde_json::json!({"archived": runtime.archive_mailing_list(list_id).await.map_err(|e| e.to_string())?}))

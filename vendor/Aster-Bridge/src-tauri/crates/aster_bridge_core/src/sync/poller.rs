@@ -1225,6 +1225,8 @@ struct PreparedMessage {
     recipients: Option<String>,
     list_id: Option<String>,
     list_name: Option<String>,
+    list_unsubscribe: Option<String>,
+    list_unsubscribe_post: Option<String>,
     date: Option<String>,
     body_text: Option<String>,
     is_html: bool,
@@ -1438,6 +1440,8 @@ fn prepare_mail_item(
     let (list_id, list_name) = envelope_header(&parsed, "list-id")
         .map(|value| parse_list_id(&value))
         .unwrap_or((None, None));
+    let list_unsubscribe = envelope_header(&parsed, "list-unsubscribe");
+    let list_unsubscribe_post = envelope_header(&parsed, "list-unsubscribe-post");
     let addresses = EnvelopeAddresses::from_envelope(&parsed);
     Prepared::Ready(PreparedMessage {
         subject,
@@ -1445,6 +1449,8 @@ fn prepare_mail_item(
         recipients,
         list_id,
         list_name,
+        list_unsubscribe,
+        list_unsubscribe_post,
         date,
         body_text,
         is_html,
@@ -1553,6 +1559,12 @@ fn commit_prepared(
     }
     if let Some(ref value) = prepared.list_name {
         raw_headers_map.insert("list_name".to_string(), serde_json::json!(value));
+    }
+    if let Some(ref value) = prepared.list_unsubscribe {
+        raw_headers_map.insert("list_unsubscribe".to_string(), serde_json::json!(value));
+    }
+    if let Some(ref value) = prepared.list_unsubscribe_post {
+        raw_headers_map.insert("list_unsubscribe_post".to_string(), serde_json::json!(value));
     }
     if prepared.unencrypted {
         raw_headers_map.insert(

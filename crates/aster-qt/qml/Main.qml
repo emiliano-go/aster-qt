@@ -23,6 +23,14 @@ ApplicationWindow {
     function c(key, fallback) { return th[key] !== undefined ? th[key] : fallback }
     function n(key, fallback) { return th[key] !== undefined ? th[key] : fallback }
 
+    function unsubscribeUrl(value) {
+        if (!value) return "";
+        var match = value.match(/<(https?:[^>]+|mailto:[^>]+)>/i);
+        if (match) return match[1];
+        match = value.match(/(https?:\/\/[^\s,]+|mailto:[^\s,]+)/i);
+        return match ? match[1] : "";
+    }
+
     function normId(value) {
         return (value || "").trim().replace(/^</, "").replace(/>$/, "");
     }
@@ -1835,6 +1843,14 @@ ApplicationWindow {
                         Layout.rightMargin: n("space-4", 16)
                         spacing: n("space-1", 4)
                         LinkText { visible: app.folderId === "drafts"; text: "Edit draft"; action: function() { root.openDraft() } }
+                        LinkText {
+                            visible: root.detail.list_unsubscribe && root.detail.list_unsubscribe.length > 0
+                            text: "Unsubscribe"
+                            action: function() {
+                                var url = root.unsubscribeUrl(root.detail.list_unsubscribe);
+                                if (url.length > 0) Qt.openUrlExternally(url);
+                            }
+                        }
                         IconButton { icon: "reply"; label: "Reply"; onClicked: root.openReply() }
                         IconButton { icon: "forward"; label: "Forward"; onClicked: root.openForward() }
                         Item { Layout.fillWidth: true }
