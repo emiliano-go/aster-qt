@@ -24,6 +24,13 @@ ApplicationWindow {
         }
     }
 
+    TextEdit {
+        id: clipboardHelper
+        visible: false
+        width: 0
+        height: 0
+    }
+
     readonly property var th: {
         try { return JSON.parse(app.tokensJson || "{}") } catch (e) { return {} }
     }
@@ -104,6 +111,50 @@ ApplicationWindow {
         for (var i = 0; i < root.threadOrdered.length; i++)
             if (root.threadOrdered[i].id === root.detail.id) return i;
         return -1;
+    }
+
+    function contactValue(contact, key) {
+        var vcard = String(contact.vcard || "");
+        var match = vcard.match(new RegExp("^" + key + "[^:]*:(.*)$", "mi"));
+        return match ? match[1].trim() : "";
+    }
+
+    function contactName(contact) {
+        return contactValue(contact, "FN") || contactValue(contact, "N") || contact.uid;
+    }
+
+    function contactEmail(contact) {
+        return contactValue(contact, "EMAIL");
+    }
+
+    function parseSearchQuery(value) {
+        var parsed = {
+            text: [], from: "", to: "", subject: "", in: "",
+            unread: false, read: false, starred: false, attachments: false,
+            before: "", after: ""
+        };
+        var parts = String(value || "").match(/(?:[^\s"]+|"[^"]*")+/g) || [];
+        for (var i = 0; i < parts.length; i++) {
+            var token = parts[i];
+            var lower = token.toLowerCase();
+            var split = lower.indexOf(":");
+            if (split > 0) {
+                var key = lower.substring(0, split);
+                var val = token.substring(split + 1).replace(/^"|"$/g, "");
+                if (key === "from") { parsed.from = val; continue; }
+                if (key === "to") { parsed.to = val; continue; }
+                if (key === "subject") { parsed.subject = val; continue; }
+                if (key === "in") { parsed.in = val; continue; }
+                if (key === "before") { parsed.before = val; continue; }
+                if (key === "after") { parsed.after = val; continue; }
+                if (key === "is" && val === "unread") { parsed.unread = true; continue; }
+                if (key === "is" && val === "read") { parsed.read = true; continue; }
+                if (key === "is" && val === "starred") { parsed.starred = true; continue; }
+                if (key === "has" && val === "attachment") { parsed.attachments = true; continue; }
+            }
+            parsed.text.push(lower);
+        }
+        return parsed;
     }
 
     function parse(text, fallback) {
@@ -220,10 +271,17 @@ ApplicationWindow {
     property bool sidebarVisible: width >= 860
     readonly property bool systemDark: Application.styleHints.colorScheme === Qt.Dark
     readonly property bool dark: !app.themeLight
+    readonly property string htmlDarkMode: settings.mail && settings.mail.html_dark_mode ? settings.mail.html_dark_mode : "auto"
+    readonly property bool htmlDarkBase: root.detail.is_html && root.detail.body_html_dark !== undefined
+        && (root.htmlDarkMode === "always" || (root.htmlDarkMode === "auto" && root.dark))
+    readonly property bool emailDark: root.detail.is_html
+        && (root.emailDarkOverrideId === root.detail.id ? root.emailDarkOverride : root.htmlDarkBase)
+    readonly property string emailHtml: root.emailDark ? (root.detail.body_html_dark || root.detail.body_html || "") : (root.detail.body_html || "")
     readonly property var settings: parse(app.settingsJson, {})
     readonly property var rulesData: parse(app.rulesJson, ({}))
     readonly property var rules: rulesData.rules || []
     readonly property var identities: parse(app.identitiesJson, [])
+    readonly property var aliases: parse(app.aliasesJson, [])
     readonly property var pgp: parse(app.pgpJson, ({}))
     readonly property var gpg: parse(app.gpgJson, ({}))
     readonly property var contacts: parse(app.contactsJson, [])
@@ -236,6 +294,7 @@ ApplicationWindow {
     readonly property var recipientKey: parse(app.recipientKeyJson, {})
     readonly property var diagnostics: parse(app.diagnosticsJson, {})
     readonly property var attachmentPreview: parse(app.attachmentPreviewJson, {})
+    readonly property var recipientStatuses: parse(app.recipientStatusJson, [])
     readonly property var activeList: {
         for (var i = 0; i < mailingLists.length; i++)
             if (mailingLists[i].list_id === root.listFilter) return mailingLists[i];
@@ -255,10 +314,23 @@ ApplicationWindow {
     property var recipientSuggestions: []
     property string replyInReplyTo: ""
     property string replyReferences: ""
+    property string emailDarkOverrideId: ""
+    property bool emailDarkOverride: false
+    property bool remoteLoading: false
+    property string exportFolder: "all"
+    property int remoteLoadingNonce: 0
     property string composeExpiresAt: ""
     property bool composeObscure: false
+    property string composePassword: ""
     property string contextMessageId: ""
     property string commandQuery: ""
+    property string folderContextToken: ""
+    property string folderContextName: ""
+    property string folderContextLabel: ""
+    property string aliasContextAddress: ""
+    property string aliasContextId: ""
+    property bool aliasContextPinned: false
+    property bool aliasContextEnabled: true
 
     ListModel {
         id: conditionModel
@@ -479,11 +551,22 @@ ApplicationWindow {
 
     readonly property var visibleMessages: {
         var out = [];
-        var q = root.query.trim().toLowerCase();
+        var parsed = root.parseSearchQuery(root.query);
+        var q = parsed.text.join(" ");
         for (var i = 0; i < root.messages.length; i++) {
             var m = root.messages[i];
             if (root.listFilter.length > 0 && m.list_id !== root.listFilter) continue;
             if (root.unreadOnly && m.is_read) continue;
+            if (parsed.unread && m.is_read) continue;
+            if (parsed.read && !m.is_read) continue;
+            if (parsed.starred && !m.is_starred) continue;
+            if (parsed.attachments && !m.has_attachments) continue;
+            if (parsed.in.length > 0 && (m.folder || "").toLowerCase().indexOf(parsed.in.toLowerCase()) === -1) continue;
+            if (parsed.from.length > 0 && (m.sender || "").toLowerCase().indexOf(parsed.from.toLowerCase()) === -1) continue;
+            if (parsed.to.length > 0 && (m.recipients || "").toLowerCase().indexOf(parsed.to.toLowerCase()) === -1) continue;
+            if (parsed.subject.length > 0 && (m.subject || "").toLowerCase().indexOf(parsed.subject.toLowerCase()) === -1) continue;
+            if (parsed.before.length > 0 && m.date && new Date(m.date) >= new Date(parsed.before)) continue;
+            if (parsed.after.length > 0 && m.date && new Date(m.date) <= new Date(parsed.after)) continue;
             if (q.length > 0) {
                 var hay = (m.sender + " " + m.subject + " " + m.preview).toLowerCase();
                 if (hay.indexOf(q) === -1) continue;
@@ -750,6 +833,21 @@ ApplicationWindow {
         composeBody.forceActiveFocus();
     }
 
+    function draftAsHtml(value) {
+        var text = String(value || "");
+        if (text.indexOf("<") !== -1) return text;
+        var escaped = text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+        return escaped.split("\n").map(function(line) { return line.length > 0 ? line : "<br>"; }).join("<br>");
+    }
+
+    function insertInlineImage(path) {
+        var name = String(path).split("/").pop();
+        var pos = composeBody.cursorPosition;
+        composeBody.insert(pos, "<img src=\"" + name + "\">");
+        composeBody.cursorPosition = pos + 1;
+        composeBody.forceActiveFocus();
+    }
+
     function insertRichLink(url, label) {
         var text = label && label.length > 0 ? label : url;
         var start = composeBody.cursorPosition;
@@ -821,6 +919,7 @@ ApplicationWindow {
         root.replyReferences = "";
         root.composeExpiresAt = "";
         root.composeObscure = false;
+        root.composePassword = "";
         root.composeFrom = root.defaultIdentityAddress();
         root.draftId = "";
         root.editingDraftId = "";
@@ -951,7 +1050,8 @@ ApplicationWindow {
             in_reply_to: root.replyInReplyTo,
             references: root.replyReferences,
             expires_at: root.composeExpiresAt,
-            obscure_subject: root.composeObscure
+            obscure_subject: root.composeObscure,
+            password: root.composePassword
         };
     }
 
@@ -970,7 +1070,7 @@ ApplicationWindow {
             app.deleteDraft(root.editingDraftId);
             root.editingDraftId = "";
         }
-        app.sendRichMessage(payload.from, payload.to, payload.cc, payload.bcc, payload.subject, payload.html || "", payload.plain || payload.body || "", JSON.stringify(payload.attachments), payload.in_reply_to || "", payload.references || "", payload.expires_at || "", payload.obscure_subject === true);
+        app.sendRichMessage(payload.from, payload.to, payload.cc, payload.bcc, payload.subject, payload.html || "", payload.plain || payload.body || "", JSON.stringify(payload.attachments), payload.in_reply_to || "", payload.references || "", payload.expires_at || "", payload.obscure_subject === true, payload.password || "");
         root.composeOpen = false;
     }
 
@@ -1020,7 +1120,7 @@ ApplicationWindow {
         composeCc.text = "";
         composeBcc.text = "";
         composeSubject.text = root.detail.subject || "";
-        composeBody.text = root.detail.body || "";
+        composeBody.text = root.draftAsHtml(root.detail.body || "");
         root.composeAttachments = [];
         root.composeOpen = true;
     }
@@ -1099,10 +1199,46 @@ ApplicationWindow {
     Shortcut { sequence: "Ctrl+,"; onActivated: root.openSettings("appearance") }
 
     Timer {
+        id: remoteLoadTimeout
+        property int nonce: 0
+        interval: 15000
+        repeat: false
+        onTriggered: if (nonce === root.remoteLoadingNonce) root.remoteLoading = false
+    }
+
+    Timer {
+        id: recipientStatusTimer
+        interval: 600
+        repeat: false
+        onTriggered: app.checkRecipientKeys(composeTo.text + "," + composeCc.text + "," + composeBcc.text)
+    }
+
+    Timer {
         id: draftTimer
         interval: 1500
         repeat: false
         onTriggered: root.saveDraftNow()
+    }
+
+    FileDialog {
+        id: imageDialog
+        title: "Insert image"
+        fileMode: FileDialog.OpenFile
+        nameFilters: ["Images (*.png *.jpg *.jpeg *.gif *.webp *.svg)"]
+        onAccepted: {
+            var path = root.localPath(selectedFile);
+            root.composeAttachments = root.composeAttachments.concat([path]);
+            root.insertInlineImage(path);
+        }
+    }
+
+    FileDialog {
+        id: exportDialog
+        title: "Export mail"
+        fileMode: FileDialog.SaveFile
+        defaultSuffix: "mbox"
+        nameFilters: ["Mailbox (*.mbox)"]
+        onAccepted: app.exportMailbox(root.exportFolder, root.localPath(selectedFile))
     }
 
     FileDialog {
@@ -1119,11 +1255,32 @@ ApplicationWindow {
 
     Component.onCompleted: {
         app.applySystemDark(root.systemDark);
+        app.checkSystemTheme();
         app.boot();
     }
 
     Connections {
+        target: Application.styleHints
+        function onColorSchemeChanged() {
+            app.applySystemDark(Application.styleHints.colorScheme === Qt.Dark)
+        }
+    }
+
+    Timer {
+        interval: 2000
+        repeat: true
+        running: app.themeMode === "system"
+        onTriggered: app.checkSystemTheme()
+    }
+
+    Connections {
         target: app
+        function onSelectedJsonChanged() {
+            if (root.detail && root.detail.remote_content_loaded === true) {
+                root.remoteLoading = false;
+                root.remoteLoadingNonce += 1;
+            }
+        }
         function onReadyChanged() {
             if (app.ready) app.loadSettingsData();
         }
@@ -1338,6 +1495,62 @@ ApplicationWindow {
         MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.settingsTab = tab }
     }
 
+    component MailMenuItem: MenuItem {
+        id: menuItem
+        property string menuIcon: ""
+        implicitHeight: 34
+        contentItem: Item {
+            implicitWidth: 212
+            implicitHeight: 34
+            RowLayout {
+                anchors.fill: parent
+                anchors.leftMargin: n("space-3", 12)
+                anchors.rightMargin: n("space-3", 12)
+                spacing: n("space-2", 8)
+                Icon {
+                    name: menuItem.menuIcon
+                    size: n("icon-small", 16)
+                    color: c("muted", "#a8ece7de")
+                    visible: menuItem.menuIcon.length > 0
+                    Layout.alignment: Qt.AlignVCenter
+                }
+                Text {
+                    text: menuItem.text
+                    color: menuItem.enabled ? c("text", "#ece7de") : c("muted", "#a8ece7de")
+                    font.family: c("font-family", "Inter")
+                    font.pixelSize: n("font-size-body", 14)
+                    font.weight: n("font-weight-medium", 500)
+                    verticalAlignment: Text.AlignVCenter
+                    elide: Text.ElideRight
+                    Layout.fillWidth: true
+                }
+            }
+        }
+        background: Rectangle {
+            implicitWidth: 212
+            radius: n("radius-control", 2)
+            color: menuItem.highlighted ? c("selected", "#3d2e323a") : "transparent"
+        }
+    }
+
+    component MailMenuSeparator: MenuSeparator {
+        id: menuSeparator
+        implicitHeight: 5
+        topPadding: 0
+        bottomPadding: 0
+        leftPadding: 0
+        rightPadding: 0
+        contentItem: Rectangle {
+            height: 1
+            color: c("border", "#171b1e23")
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.leftMargin: n("space-2", 8)
+            anchors.rightMargin: n("space-2", 8)
+        }
+        background: Item {}
+    }
+
     component SettingsTitle: Text {
         color: c("text", "#ece7de")
         font.family: c("font-family", "Inter")
@@ -1428,7 +1641,17 @@ ApplicationWindow {
         MouseArea {
             anchors.fill: parent
             cursorShape: Qt.PointingHandCursor
-            onClicked: folderRow.activate()
+            acceptedButtons: Qt.LeftButton | Qt.RightButton
+            onClicked: function(mouse) {
+                if (mouse.button === Qt.RightButton) {
+                    root.folderContextToken = folderRow.folder.token || "";
+                    root.folderContextName = folderRow.folder.name || folderRow.folder.folder_label;
+                    root.folderContextLabel = folderRow.folder.folder_label;
+                    folderContextMenu.popup();
+                } else {
+                    folderRow.activate();
+                }
+            }
         }
     }
 
@@ -2061,6 +2284,66 @@ ApplicationWindow {
 
                     Rectangle {
                         Layout.fillWidth: true
+                        implicitHeight: 28
+                        radius: n("radius-control", 2)
+                        activeFocusOnTab: true
+                        Accessible.role: Accessible.Button
+                        Accessible.name: "Contacts"
+                        color: contactsHover.hovered ? c("hover", "#2e2e323a") : "transparent"
+                        HoverHandler { id: contactsHover }
+                        RowLayout {
+                            anchors.fill: parent
+                            anchors.leftMargin: n("space-2", 8)
+                            anchors.rightMargin: n("space-3", 12)
+                            spacing: n("space-2", 8)
+                            Icon { name: "inbox"; size: n("icon-body", 16); color: c("muted", "#a8ece7de") }
+                            Text { text: "Contacts"; color: c("text", "#ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-body", 14); Layout.fillWidth: true }
+                            Text { text: root.contacts.length > 0 ? root.contacts.length : ""; color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-small", 12) }
+                        }
+                        MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: contactsViewPopup.open() }
+                    }
+                    Rectangle {
+                        Layout.fillWidth: true
+                        implicitHeight: 28
+                        radius: n("radius-control", 2)
+                        activeFocusOnTab: true
+                        Accessible.role: Accessible.Button
+                        Accessible.name: "Calendar"
+                        color: calendarHover.hovered ? c("hover", "#2e2e323a") : "transparent"
+                        HoverHandler { id: calendarHover }
+                        RowLayout {
+                            anchors.fill: parent
+                            anchors.leftMargin: n("space-2", 8)
+                            anchors.rightMargin: n("space-3", 12)
+                            spacing: n("space-2", 8)
+                            Icon { name: "clock"; size: n("icon-body", 16); color: c("muted", "#a8ece7de") }
+                            Text { text: "Calendar"; color: c("text", "#ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-body", 14); Layout.fillWidth: true }
+                        }
+                        MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: Qt.openUrlExternally("https://calendar.astermail.org") }
+                    }
+                    Rectangle {
+                        Layout.fillWidth: true
+                        implicitHeight: 28
+                        radius: n("radius-control", 2)
+                        activeFocusOnTab: true
+                        Accessible.role: Accessible.Button
+                        Accessible.name: "Subscriptions"
+                        color: subsHover.hovered ? c("hover", "#2e2e323a") : "transparent"
+                        HoverHandler { id: subsHover }
+                        RowLayout {
+                            anchors.fill: parent
+                            anchors.leftMargin: n("space-2", 8)
+                            anchors.rightMargin: n("space-3", 12)
+                            spacing: n("space-2", 8)
+                            Icon { name: "tag"; size: n("icon-body", 16); color: c("muted", "#a8ece7de") }
+                            Text { text: "Subscriptions"; color: c("text", "#ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-body", 14); Layout.fillWidth: true }
+                            Text { text: root.mailingLists.length > 0 ? root.mailingLists.length : ""; color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-small", 12) }
+                        }
+                        MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: subscriptionsViewPopup.open() }
+                    }
+
+                    Rectangle {
+                        Layout.fillWidth: true
                         Layout.preferredHeight: 1
                         Layout.topMargin: n("space-2", 8)
                         Layout.bottomMargin: n("space-2", 8)
@@ -2229,7 +2512,7 @@ ApplicationWindow {
                     }
 
                     Text {
-                        visible: root.identities.length > 1
+                        visible: root.aliases.length > 0
                         text: "Aliases"
                         color: c("muted", "#a8ece7de")
                         font.family: c("font-family", "Inter")
@@ -2239,7 +2522,7 @@ ApplicationWindow {
                         Layout.leftMargin: n("space-2", 8)
                     }
                     Repeater {
-                        model: root.identities.length > 1 ? root.identities : []
+                        model: root.aliases
                         delegate: Rectangle {
                             readonly property string aliasView: "alias:" + modelData.address
                             Layout.fillWidth: true
@@ -2253,22 +2536,36 @@ ApplicationWindow {
                             Keys.onSpacePressed: app.openMailbox(aliasView)
                             Keys.onReturnPressed: app.openMailbox(aliasView)
                             color: app.folderId === aliasView ? c("selected", "#3d2e323a") : "transparent"
-                            Text {
-                                anchors.verticalCenter: parent.verticalCenter
-                                anchors.left: parent.left
+                            RowLayout {
+                                anchors.fill: parent
                                 anchors.leftMargin: n("space-3", 12)
-                                anchors.right: parent.right
                                 anchors.rightMargin: n("space-3", 12)
-                                text: modelData.address
-                                color: c("text-2", "#dbebe7de")
-                                font.family: c("font-family", "Inter")
-                                font.pixelSize: n("font-size-small", 12)
-                                elide: Text.ElideRight
+                                spacing: n("space-1", 4)
+                                Text {
+                                    text: modelData.address
+                                    color: modelData.enabled ? c("text-2", "#dbebe7de") : c("muted", "#a8ece7de")
+                                    font.family: c("font-family", "Inter")
+                                    font.pixelSize: n("font-size-small", 12)
+                                    elide: Text.ElideRight
+                                    Layout.fillWidth: true
+                                }
+                                Icon { name: "pin"; size: 11; color: c("accent-text", "#e7a97f"); visible: modelData.pinned === true }
                             }
                             MouseArea {
                                 anchors.fill: parent
                                 cursorShape: Qt.PointingHandCursor
-                                onClicked: app.openMailbox(aliasView)
+                                acceptedButtons: Qt.LeftButton | Qt.RightButton
+                                onClicked: function(mouse) {
+                                    if (mouse.button === Qt.RightButton) {
+                                        root.aliasContextAddress = modelData.address;
+                                        root.aliasContextId = modelData.id;
+                                        root.aliasContextPinned = modelData.pinned === true;
+                                        root.aliasContextEnabled = modelData.enabled === true;
+                                        aliasContextMenu.popup();
+                                    } else {
+                                        app.openMailbox(aliasView);
+                                    }
+                                }
                             }
                         }
                     }
@@ -2725,6 +3022,14 @@ ApplicationWindow {
                             onClicked: app.printMessage(root.detail.id)
                         }
                         IconButton {
+                            icon: root.emailDark ? "sun" : "moon"
+                            label: root.emailDark ? "Use light email view" : "Use dark email view"
+                            onClicked: {
+                                root.emailDarkOverrideId = root.detail.id;
+                                root.emailDarkOverride = !root.emailDark;
+                            }
+                        }
+                        IconButton {
                             icon: "archive"
                             label: "Archive"
                             onClicked: app.archiveMessage(root.detail.id)
@@ -3012,6 +3317,7 @@ ApplicationWindow {
                                 Layout.fillWidth: true
                                 Layout.preferredHeight: visible ? bannerRow.implicitHeight + n("space-3", 12) * 2 : 0
                                 visible: root.detail.external_content && root.detail.external_content.blocked_count > 0
+                                    && root.detail.remote_content_loaded !== true
                                 radius: n("radius-control", 2)
                                 color: c("card", "#23262c")
                                 border.width: n("border-width", 1)
@@ -3033,9 +3339,25 @@ ApplicationWindow {
                                         text: "Details"
                                         action: function() { externalDetailsPopup.open() }
                                     }
+                                    Text {
+                                        visible: root.remoteLoading
+                                        text: "Loading images…"
+                                        color: c("muted", "#a8ece7de")
+                                        font.family: c("font-family", "Inter")
+                                        font.pixelSize: n("font-size-small", 12)
+                                    }
                                     LinkText {
+                                        visible: !root.remoteLoading
                                         text: "Load images"
-                                        action: function() { app.loadRemoteContent(root.detail.id) }
+                                        action: function() {
+                                            if (root.remoteLoading) return;
+                                            root.remoteLoading = true;
+                                            root.remoteLoadingNonce += 1;
+                                            var nonce = root.remoteLoadingNonce;
+                                            app.loadRemoteContent(root.detail.id);
+                                            remoteLoadTimeout.nonce = nonce;
+                                            remoteLoadTimeout.restart();
+                                        }
                                     }
                                 }
                             }
@@ -3067,12 +3389,12 @@ ApplicationWindow {
                             Rectangle {
                                 id: mailCard
                                 readonly property bool bodyIsHtml: root.detail.is_html && (root.detail.body_html || "").length > 0
-                                readonly property string bodyText: bodyIsHtml ? (root.detail.body_html || "") : (root.detail.body || "")
+                                readonly property string bodyText: bodyIsHtml ? root.emailHtml : (root.detail.body || "")
 
                                 Layout.fillWidth: true
                                 Layout.preferredHeight: Math.max(340, Math.min(720, readerFlick.height - 220))
                                 radius: n("radius-card", 6)
-                                color: mailCard.bodyIsHtml ? c("html-mail-bg", "#ffffff") : c("surface", "#1b1e23")
+                                color: mailCard.bodyIsHtml ? (root.emailDark ? c("surface", "#121212") : c("html-mail-bg", "#ffffff")) : c("surface", "#1b1e23")
                                 clip: true
 
                                 Flickable {
@@ -3096,7 +3418,7 @@ ApplicationWindow {
                                         readOnly: true
                                         selectByMouse: true
                                         wrapMode: TextEdit.Wrap
-                                        color: mailCard.bodyIsHtml ? "#1c1b19" : c("text", "#ece7de")
+                                        color: mailCard.bodyIsHtml ? (root.emailDark ? c("text", "#e5e5e5") : "#1c1b19") : c("text", "#ece7de")
                                         selectionColor: c("selection", "#59d98e5c")
                                         selectedTextColor: c("text", "#ece7de")
                                         font.family: mailCard.bodyIsHtml ? c("font-mail", "Inter") : c("font-mono", "JetBrains Mono")
@@ -3452,6 +3774,33 @@ ApplicationWindow {
                                     spacing: n("space-3", 12)
                                     SettingsTitle { text: "Mail" }
                                     SettingsSubtitle { text: "Sync and reading preferences." }
+                                    RowLayout {
+                                        Layout.fillWidth: true
+                                        spacing: n("space-2", 8)
+                                        Text { text: "HTML email dark mode"; color: c("text", "#ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-small", 12); Layout.fillWidth: true }
+                                        ModeChip { label: "Off"; active: root.htmlDarkMode === "off"; onClicked: app.applySettings(JSON.stringify({ mail: { html_dark_mode: "off" } })) }
+                                        ModeChip { label: "Auto"; active: root.htmlDarkMode === "auto"; onClicked: app.applySettings(JSON.stringify({ mail: { html_dark_mode: "auto" } })) }
+                                        ModeChip { label: "Always"; active: root.htmlDarkMode === "always"; onClicked: app.applySettings(JSON.stringify({ mail: { html_dark_mode: "always" } })) }
+                                    }
+                                    RowLayout {
+                                        Layout.fillWidth: true
+                                        ColumnLayout { spacing: 2; Layout.fillWidth: true
+                                            Text { text: "Dim images in dark email"; color: c("text", "#ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-small", 12); font.weight: n("font-weight-medium", 500) }
+                                            Text { text: "Reduce bright images when HTML email dark mode is active."; color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-micro", 11); wrapMode: Text.WordWrap; Layout.fillWidth: true }
+                                        }
+                                        Toggle {
+                                            testId: "settings-html-dark-dim-images"
+                                            checked: root.settings.mail ? root.settings.mail.html_dark_dim_images !== false : true
+                                            onToggled: app.applySettings(JSON.stringify({ mail: { html_dark_dim_images: !checked } }))
+                                        }
+                                    }
+                                    RowLayout {
+                                        Layout.fillWidth: true
+                                        spacing: n("space-3", 12)
+                                        Text { text: "Export mail"; color: c("text", "#ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-small", 12); Layout.fillWidth: true }
+                                        LinkText { text: "Export this view"; action: function() { root.exportFolder = app.folderId; exportDialog.open() } }
+                                        LinkText { text: "Export all mail"; action: function() { root.exportFolder = "all"; exportDialog.open() } }
+                                    }
                                     RowLayout {
                                         Layout.fillWidth: true
                                         ColumnLayout { spacing: 2; Layout.fillWidth: true
@@ -3825,6 +4174,34 @@ ApplicationWindow {
                                             }
                                         }
                                     }
+                                    Text { text: "Email aliases"; color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-micro", 11); font.weight: n("font-weight-medium", 500); Layout.topMargin: n("space-2", 8) }
+                                    RowLayout {
+                                        Layout.fillWidth: true
+                                        spacing: n("space-2", 8)
+                                        SettingsField { id: newAliasLocal; Layout.fillWidth: true; placeholder: "local part"; testId: "settings-new-alias-local" }
+                                        SettingsField { id: newAliasDomain; Layout.preferredWidth: 190; placeholder: "domain"; testId: "settings-new-alias-domain" }
+                                        SettingsField { id: newAliasDisplay; Layout.preferredWidth: 140; placeholder: "display name"; testId: "settings-new-alias-display" }
+                                        LinkText { text: "Create alias"; action: function() { app.createAlias(newAliasLocal.text, newAliasDomain.text, newAliasDisplay.text) } }
+                                    }
+                                    Repeater {
+                                        model: root.aliases
+                                        delegate: RowLayout {
+                                            Layout.fillWidth: true
+                                            spacing: n("space-2", 8)
+                                            Text {
+                                                text: (modelData.pinned ? "Pinned · " : "") + modelData.address + (modelData.enabled ? "" : " · disabled")
+                                                color: modelData.enabled ? c("text-2", "#dbebe7de") : c("muted", "#a8ece7de")
+                                                font.family: c("font-family", "Inter")
+                                                font.pixelSize: n("font-size-small", 12)
+                                                Layout.fillWidth: true
+                                                elide: Text.ElideRight
+                                            }
+                                            LinkText { text: modelData.pinned ? "Unpin" : "Pin"; action: function() { app.toggleAliasPin(modelData.id) } }
+                                            LinkText { text: modelData.enabled ? "Disable" : "Enable"; action: function() { app.setAliasEnabled(modelData.id, !modelData.enabled) } }
+                                            LinkText { text: "Delete"; action: function() { app.deleteAlias(modelData.id) } }
+                                        }
+                                    }
+                                    Text { visible: root.aliases.length === 0; text: "No aliases yet."; color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-micro", 11) }
                                     Text { text: "Tags"; color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-micro", 11); font.weight: n("font-weight-medium", 500); Layout.topMargin: n("space-2", 8) }
                                     RowLayout {
                                         Layout.fillWidth: true
@@ -4411,7 +4788,37 @@ ApplicationWindow {
                     Layout.fillWidth: true
                     placeholder: "To, comma separated"
                     testId: "compose-to"
-                    onEdited: root.updateRecipientSuggestions(value)
+                    onEdited: { root.updateRecipientSuggestions(value); recipientStatusTimer.restart(); }
+                }
+                Flow {
+                    visible: root.recipientStatuses.length > 0
+                    Layout.fillWidth: true
+                    spacing: n("space-1", 4)
+                    Repeater {
+                        model: root.recipientStatuses
+                        delegate: Rectangle {
+                            implicitWidth: statusRow.implicitWidth + n("space-2", 8) * 2
+                            implicitHeight: 22
+                            radius: n("radius-control", 2)
+                            color: c("card", "#23262c")
+                            RowLayout {
+                                id: statusRow
+                                anchors.centerIn: parent
+                                spacing: n("space-1", 4)
+                                Icon {
+                                    name: modelData.status === "key" || modelData.status === "internal" ? "shield" : "junk"
+                                    size: n("icon-small", 12)
+                                    color: modelData.status === "key" || modelData.status === "internal" ? c("trust-verified", "#7fae83") : c("trust-warning", "#d9b36a")
+                                }
+                                Text {
+                                    text: modelData.address + " · " + (modelData.status === "key" ? "key" : modelData.status === "internal" ? "Aster" : modelData.status === "missing" ? "no key" : "unknown")
+                                    color: c("muted", "#a8ece7de")
+                                    font.family: c("font-family", "Inter")
+                                    font.pixelSize: n("font-size-micro", 11)
+                                }
+                            }
+                        }
+                    }
                 }
                 ColumnLayout {
                     visible: root.recipientSuggestions.length > 0
@@ -4482,6 +4889,7 @@ ApplicationWindow {
                     LinkText { text: "Underline"; action: function() { root.toggleRichFont("underline") } }
                     LinkText { text: "Strike"; action: function() { root.toggleRichFont("strikeout") } }
                     LinkText { text: "Link"; action: function() { composeLinkPopup.open() } }
+                    LinkText { text: "Image"; action: function() { imageDialog.open() } }
                     LinkText { text: "Emoji"; action: function() { emojiPopup.open() } }
                     Item { Layout.fillWidth: true }
                     Text {
@@ -4584,6 +4992,12 @@ ApplicationWindow {
                         checked: root.composeObscure
                         onToggled: root.composeObscure = !checked
                     }
+                }
+                SettingsField {
+                    Layout.fillWidth: true
+                    placeholder: "Message password (optional)"
+                    testId: "compose-password"
+                    onEdited: root.composePassword = value
                 }
                 RowLayout {
                     Layout.fillWidth: true
@@ -4928,19 +5342,27 @@ ApplicationWindow {
 
     Menu {
         id: messageContextMenu
-        MenuItem { text: "Open"; onTriggered: { if (root.contextMessageId) { root.readerOpen = true; app.selectMessage(root.contextMessageId) } } }
-        MenuSeparator {}
-        MenuItem { text: "Mark read"; onTriggered: app.setRead(root.contextMessageId, true) }
-        MenuItem { text: "Mark unread"; onTriggered: app.setRead(root.contextMessageId, false) }
-        MenuItem { text: "Star"; onTriggered: app.setStarred(root.contextMessageId, true) }
-        MenuItem { text: "Unstar"; onTriggered: app.setStarred(root.contextMessageId, false) }
-        MenuItem { text: "Pin"; onTriggered: app.setPinned(root.contextMessageId, true) }
-        MenuItem { text: "Unpin"; onTriggered: app.setPinned(root.contextMessageId, false) }
-        MenuSeparator {}
-        MenuItem { text: "Archive"; onTriggered: app.archiveMessage(root.contextMessageId) }
-        MenuItem { text: "Spam"; onTriggered: app.setSpam(root.contextMessageId, true) }
-        MenuItem { text: "Restore"; onTriggered: app.restoreMessage(root.contextMessageId) }
-        MenuItem { text: "Trash"; onTriggered: app.trashMessage(root.contextMessageId) }
+        padding: n("space-1", 4)
+        background: Rectangle {
+            implicitWidth: 220
+            color: c("menu", "#23262c")
+            border.width: n("border-width", 1)
+            border.color: c("border-strong", "#292e323a")
+            radius: n("radius-panel", 8)
+        }
+        MailMenuItem { menuIcon: "inbox"; text: "Open"; onTriggered: { if (root.contextMessageId) { root.readerOpen = true; app.selectMessage(root.contextMessageId) } } }
+        MailMenuSeparator {}
+        MailMenuItem { menuIcon: "check"; text: "Mark read"; onTriggered: app.setRead(root.contextMessageId, true) }
+        MailMenuItem { menuIcon: "inbox"; text: "Mark unread"; onTriggered: app.setRead(root.contextMessageId, false) }
+        MailMenuItem { menuIcon: "star"; text: "Star"; onTriggered: app.setStarred(root.contextMessageId, true) }
+        MailMenuItem { menuIcon: "star"; text: "Unstar"; onTriggered: app.setStarred(root.contextMessageId, false) }
+        MailMenuItem { menuIcon: "pin"; text: "Pin"; onTriggered: app.setPinned(root.contextMessageId, true) }
+        MailMenuItem { menuIcon: "pin"; text: "Unpin"; onTriggered: app.setPinned(root.contextMessageId, false) }
+        MailMenuSeparator {}
+        MailMenuItem { menuIcon: "archive"; text: "Archive"; onTriggered: app.archiveMessage(root.contextMessageId) }
+        MailMenuItem { menuIcon: "junk"; text: "Spam"; onTriggered: app.setSpam(root.contextMessageId, true) }
+        MailMenuItem { menuIcon: "refresh"; text: "Restore"; onTriggered: app.restoreMessage(root.contextMessageId) }
+        MailMenuItem { menuIcon: "trash"; text: "Trash"; onTriggered: app.trashMessage(root.contextMessageId) }
     }
 
     Popup {
@@ -5076,6 +5498,215 @@ ApplicationWindow {
                         anchors.fill: parent
                         cursorShape: Qt.PointingHandCursor
                         onClicked: root.runCommand(modelData.action)
+                    }
+                }
+            }
+        }
+    }
+
+    Menu {
+        id: aliasContextMenu
+        padding: n("space-1", 4)
+        background: Rectangle {
+            implicitWidth: 220
+            color: c("menu", "#23262c")
+            border.width: n("border-width", 1)
+            border.color: c("border-strong", "#292e323a")
+            radius: n("radius-panel", 8)
+        }
+        MailMenuItem {
+            text: "Copy address"
+            onTriggered: {
+                clipboardHelper.text = root.aliasContextAddress;
+                clipboardHelper.selectAll();
+                clipboardHelper.copy();
+            }
+        }
+        MailMenuItem {
+            text: "Open mail"
+            onTriggered: app.openMailbox("alias:" + root.aliasContextAddress)
+        }
+        MailMenuItem {
+            menuIcon: "pin"
+            text: root.aliasContextPinned ? "Unpin" : "Pin"
+            visible: root.aliasContextId.length > 0
+            onTriggered: app.toggleAliasPin(root.aliasContextId)
+        }
+        MailMenuItem {
+            menuIcon: "shield"
+            text: root.aliasContextEnabled ? "Disable" : "Enable"
+            visible: root.aliasContextId.length > 0
+            onTriggered: app.setAliasEnabled(root.aliasContextId, !root.aliasContextEnabled)
+        }
+        MailMenuSeparator {}
+        MailMenuItem { menuIcon: "settings"; text: "Manage aliases"; onTriggered: root.openSettings("aliases") }
+    }
+
+    Menu {
+        id: folderContextMenu
+        padding: n("space-1", 4)
+        background: Rectangle {
+            implicitWidth: 220
+            color: c("menu", "#23262c")
+            border.width: n("border-width", 1)
+            border.color: c("border-strong", "#292e323a")
+            radius: n("radius-panel", 8)
+        }
+        MailMenuItem { menuIcon: "folder"; text: "Open"; onTriggered: app.openMailbox(root.folderContextLabel) }
+        MailMenuSeparator {}
+        MailMenuItem { menuIcon: "plus"; text: "New mailbox"; onTriggered: root.openSettings("aliases") }
+        MailMenuItem { menuIcon: "drafts"; visible: root.folderContextToken.length > 0; text: "Rename"; onTriggered: { folderRenameField.text = root.folderContextName; folderRenamePopup.open() } }
+        MailMenuItem { menuIcon: "forward"; visible: root.folderContextToken.length > 0; text: "Move"; onTriggered: folderMovePopup.open() }
+        MailMenuItem { menuIcon: "trash"; visible: root.folderContextToken.length > 0; text: "Delete"; onTriggered: app.deleteFolder(root.folderContextToken) }
+    }
+
+    Popup {
+        id: folderRenamePopup
+        width: 340
+        height: 150
+        modal: true
+        focus: true
+        anchors.centerIn: Overlay.overlay
+        background: Rectangle { color: c("menu", "#23262c"); border.width: n("border-width", 1); border.color: c("border-strong", "#292e323a"); radius: n("radius-panel", 8) }
+        ColumnLayout {
+            anchors.fill: parent
+            anchors.margins: n("space-4", 16)
+            spacing: n("space-2", 8)
+            Text { text: "Rename mailbox"; color: c("text", "#ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-title", 16); font.weight: n("font-weight-semibold", 600) }
+            SettingsField { id: folderRenameField; Layout.fillWidth: true; placeholder: "New name"; testId: "folder-context-rename" }
+            RowLayout {
+                Layout.fillWidth: true
+                Item { Layout.fillWidth: true }
+                LinkText { text: "Cancel"; action: function() { folderRenamePopup.close() } }
+                LinkText { text: "Save"; action: function() { app.renameFolder(root.folderContextToken, folderRenameField.text); folderRenamePopup.close() } }
+            }
+        }
+    }
+
+    Popup {
+        id: folderMovePopup
+        width: 340
+        height: 150
+        modal: true
+        focus: true
+        anchors.centerIn: Overlay.overlay
+        background: Rectangle { color: c("menu", "#23262c"); border.width: n("border-width", 1); border.color: c("border-strong", "#292e323a"); radius: n("radius-panel", 8) }
+        ColumnLayout {
+            anchors.fill: parent
+            anchors.margins: n("space-4", 16)
+            spacing: n("space-2", 8)
+            Text { text: "Move mailbox"; color: c("text", "#ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-title", 16); font.weight: n("font-weight-semibold", 600) }
+            SettingsField { id: folderMoveField; Layout.fillWidth: true; placeholder: "Parent token (blank = root)"; testId: "folder-context-move" }
+            RowLayout {
+                Layout.fillWidth: true
+                Item { Layout.fillWidth: true }
+                LinkText { text: "Cancel"; action: function() { folderMovePopup.close() } }
+                LinkText { text: "Move"; action: function() { app.moveFolder(root.folderContextToken, folderMoveField.text); folderMovePopup.close() } }
+            }
+        }
+    }
+
+    Popup {
+        id: contactsViewPopup
+        width: 620
+        height: 620
+        modal: true
+        focus: true
+        anchors.centerIn: Overlay.overlay
+        background: Rectangle { color: c("menu", "#23262c"); border.width: n("border-width", 1); border.color: c("border-strong", "#292e323a"); radius: n("radius-panel", 8) }
+        ColumnLayout {
+            anchors.fill: parent
+            anchors.margins: n("space-4", 16)
+            spacing: n("space-2", 8)
+            RowLayout {
+                Layout.fillWidth: true
+                Text { text: "Contacts"; color: c("text", "#ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-title", 16); font.weight: n("font-weight-semibold", 600); Layout.fillWidth: true }
+                LinkText { text: "Manage"; action: function() { contactsViewPopup.close(); root.openSettings("contacts") } }
+                IconButton { icon: "close"; label: "Close contacts"; onClicked: contactsViewPopup.close() }
+            }
+            Text { visible: root.contacts.length === 0; text: "No contacts yet."; color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-small", 12) }
+            ListView {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                clip: true
+                model: root.contacts
+                spacing: 2
+                ScrollBar.vertical: MailScrollBar {}
+                delegate: Rectangle {
+                    width: ListView.view.width
+                    height: 52
+                    radius: n("radius-control", 2)
+                    color: contactHover.hovered ? c("hover", "#2e2e323a") : c("card", "#23262c")
+                    HoverHandler { id: contactHover }
+                    RowLayout {
+                        anchors.fill: parent
+                        anchors.margins: n("space-3", 12)
+                        spacing: n("space-3", 12)
+                        Rectangle {
+                            width: 30; height: 30; radius: 15
+                            color: c("accent-button", "#d98e5c")
+                            Text { anchors.centerIn: parent; text: root.contactName(modelData).substring(0, 1).toUpperCase(); color: c("accent-ink", "#171717"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-small", 12); font.weight: n("font-weight-semibold", 600) }
+                        }
+                        ColumnLayout {
+                            Layout.fillWidth: true
+                            spacing: 1
+                            Text { text: root.contactName(modelData); color: c("text", "#ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-small", 12); font.weight: n("font-weight-semibold", 600); elide: Text.ElideRight; Layout.fillWidth: true }
+                            Text { text: root.contactEmail(modelData); color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-micro", 11); elide: Text.ElideRight; Layout.fillWidth: true }
+                        }
+                        LinkText {
+                            text: "Compose"
+                            action: function() { contactsViewPopup.close(); root.openCompose(); composeTo.text = root.contactEmail(modelData); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Popup {
+        id: subscriptionsViewPopup
+        width: 620
+        height: 620
+        modal: true
+        focus: true
+        anchors.centerIn: Overlay.overlay
+        background: Rectangle { color: c("menu", "#23262c"); border.width: n("border-width", 1); border.color: c("border-strong", "#292e323a"); radius: n("radius-panel", 8) }
+        ColumnLayout {
+            anchors.fill: parent
+            anchors.margins: n("space-4", 16)
+            spacing: n("space-2", 8)
+            RowLayout {
+                Layout.fillWidth: true
+                Text { text: "Subscriptions"; color: c("text", "#ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-title", 16); font.weight: n("font-weight-semibold", 600); Layout.fillWidth: true }
+                IconButton { icon: "close"; label: "Close subscriptions"; onClicked: subscriptionsViewPopup.close() }
+            }
+            Text { visible: root.mailingLists.length === 0; text: "No mailing lists found."; color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-small", 12) }
+            ListView {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                clip: true
+                model: root.mailingLists
+                spacing: 2
+                ScrollBar.vertical: MailScrollBar {}
+                delegate: Rectangle {
+                    width: ListView.view.width
+                    height: 56
+                    radius: n("radius-control", 2)
+                    color: subHover.hovered ? c("hover", "#2e2e323a") : c("card", "#23262c")
+                    HoverHandler { id: subHover }
+                    RowLayout {
+                        anchors.fill: parent
+                        anchors.margins: n("space-3", 12)
+                        spacing: n("space-3", 12)
+                        Icon { name: "tag"; size: n("icon-body", 16); color: c("muted", "#a8ece7de") }
+                        ColumnLayout {
+                            Layout.fillWidth: true
+                            spacing: 1
+                            Text { text: modelData.name || modelData.list_id; color: c("text", "#ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-small", 12); font.weight: n("font-weight-semibold", 600); elide: Text.ElideRight; Layout.fillWidth: true }
+                            Text { text: modelData.list_id + " · " + modelData.total + " messages" + (modelData.unread > 0 ? " · " + modelData.unread + " unread" : ""); color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-micro", 11); elide: Text.ElideRight; Layout.fillWidth: true }
+                        }
+                        LinkText { text: "Open"; action: function() { subscriptionsViewPopup.close(); root.listFilter = modelData.list_id; app.openMailbox("inbox"); } }
+                        LinkText { text: "Archive all"; action: function() { app.archiveMailingList(modelData.list_id) } }
                     }
                 }
             }

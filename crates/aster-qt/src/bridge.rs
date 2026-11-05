@@ -54,6 +54,8 @@ pub mod qobject {
         #[qproperty(QString, diagnostics_json, cxx_name = "diagnosticsJson")]
         #[qproperty(QString, view_counts_json, cxx_name = "viewCountsJson")]
         #[qproperty(QString, attachment_preview_json, cxx_name = "attachmentPreviewJson")]
+        #[qproperty(QString, recipient_status_json, cxx_name = "recipientStatusJson")]
+        #[qproperty(QString, aliases_json, cxx_name = "aliasesJson")]
         #[qproperty(QString, folder_id, cxx_name = "folderId")]
         #[qproperty(bool, loading, cxx_name = "loading")]
         #[qproperty(bool, ready, cxx_name = "ready")]
@@ -329,6 +331,22 @@ pub mod qobject {
         fn run_rule(self: &Self, id: &QString);
 
         #[qinvokable]
+        #[cxx_name = "createAlias"]
+        fn create_alias(self: &Self, local_part: &QString, domain: &QString, display_name: &QString);
+
+        #[qinvokable]
+        #[cxx_name = "deleteAlias"]
+        fn delete_alias(self: &Self, id: &QString);
+
+        #[qinvokable]
+        #[cxx_name = "toggleAliasPin"]
+        fn toggle_alias_pin(self: &Self, id: &QString);
+
+        #[qinvokable]
+        #[cxx_name = "setAliasEnabled"]
+        fn set_alias_enabled(self: &Self, id: &QString, enabled: bool);
+
+        #[qinvokable]
         #[cxx_name = "routeAlias"]
         fn route_alias(self: &Self, alias: &QString, mailbox: &QString);
 
@@ -365,6 +383,10 @@ pub mod qobject {
         );
 
         #[qinvokable]
+        #[cxx_name = "checkRecipientKeys"]
+        fn check_recipient_keys(self: &Self, addresses: &QString);
+
+        #[qinvokable]
         #[cxx_name = "sendAdvancedMessage"]
         fn send_advanced_message(
             self: &Self,
@@ -397,7 +419,12 @@ pub mod qobject {
             references: &QString,
             expires_at: &QString,
             obscure_subject: bool,
+            expiry_password: &QString,
         );
+
+        #[qinvokable]
+        #[cxx_name = "exportMailbox"]
+        fn export_mailbox(self: &Self, folder: &QString, path: &QString);
 
         #[qinvokable]
         #[cxx_name = "saveAttachment"]
@@ -448,6 +475,10 @@ pub mod qobject {
         fn apply_system_dark(self: Pin<&mut Self>, dark: bool);
 
         #[qinvokable]
+        #[cxx_name = "checkSystemTheme"]
+        fn check_system_theme(self: Pin<&mut Self>);
+
+        #[qinvokable]
         #[cxx_name = "refreshThemes"]
         fn refresh_themes(self: Pin<&mut Self>);
 
@@ -488,6 +519,10 @@ pub(crate) enum Command {
     ReorderRules(Vec<String>),
     DeleteRule(String),
     RunRule(String),
+    CreateAlias { local_part: String, domain: String, display_name: String },
+    DeleteAlias(String),
+    ToggleAliasPin(String),
+    SetAliasEnabled(String, bool),
     RouteAlias(String, String),
     CreateMailbox(String),
     SendMessage {
@@ -510,6 +545,7 @@ pub(crate) enum Command {
         in_reply_to: String,
         references: String,
     },
+    CheckRecipientKeys(Vec<String>),
     SendAdvancedMessage {
         from: String,
         to: String,
@@ -536,6 +572,7 @@ pub(crate) enum Command {
         references: String,
         expires_at: String,
         obscure_subject: bool,
+        expiry_password: String,
     },
     Rpc {
         tool: String,
@@ -595,6 +632,7 @@ pub(crate) enum Command {
     SaveAttachment { id: String, seq: i64 },
     PreviewAttachment { id: String, seq: i64 },
     SaveAllAttachments(String),
+    ExportMailbox { folder: String, path: String },
 }
 
 pub struct AppControllerRust {
@@ -629,6 +667,8 @@ pub struct AppControllerRust {
     diagnostics_json: QString,
     view_counts_json: QString,
     attachment_preview_json: QString,
+    recipient_status_json: QString,
+    aliases_json: QString,
     folder_id: QString,
     loading: bool,
     ready: bool,
@@ -682,6 +722,8 @@ impl Default for AppControllerRust {
             diagnostics_json: "{}".into(),
             view_counts_json: "{}".into(),
             attachment_preview_json: "{}".into(),
+            recipient_status_json: "[]".into(),
+            aliases_json: "[]".into(),
             folder_id: "inbox".into(),
             loading: true,
             ready: false,
@@ -958,6 +1000,46 @@ impl qobject::AppController {
                         rt.block_on(push_settings_data(&runtime, &qt));
                         snapshot_needed = false;
                     }
+                    Command::CreateAlias { local_part, domain, display_name } => {
+                        let result = rt.block_on(async {
+                            runtime
+                                .create_alias(
+                                    &local_part,
+                                    &domain,
+                                    if display_name.is_empty() { None } else { Some(&display_name) },
+                                )
+                                .await
+                                .map(|_| ())
+                                .map_err(|e| e.to_string())
+                        });
+                        notify_result(&qt, result, "Alias created");
+                        rt.block_on(push_settings_data(&runtime, &qt));
+                        snapshot_needed = false;
+                    }
+                    Command::DeleteAlias(id) => {
+                        let result = rt.block_on(async {
+                            runtime.delete_alias(&id).await.map_err(|e| e.to_string())
+                        });
+                        notify_result(&qt, result, "Alias deleted");
+                        rt.block_on(push_settings_data(&runtime, &qt));
+                        snapshot_needed = false;
+                    }
+                    Command::ToggleAliasPin(id) => {
+                        let result = rt.block_on(async {
+                            runtime.toggle_alias_pin(&id).await.map(|_| ()).map_err(|e| e.to_string())
+                        });
+                        notify_result(&qt, result, "Alias pin updated");
+                        rt.block_on(push_settings_data(&runtime, &qt));
+                        snapshot_needed = false;
+                    }
+                    Command::SetAliasEnabled(id, enabled) => {
+                        let result = rt.block_on(async {
+                            runtime.set_alias_enabled(&id, enabled).await.map(|_| ()).map_err(|e| e.to_string())
+                        });
+                        notify_result(&qt, result, if enabled { "Alias enabled" } else { "Alias disabled" });
+                        rt.block_on(push_settings_data(&runtime, &qt));
+                        snapshot_needed = false;
+                    }
                     Command::RouteAlias(alias, mailbox) => {
                         let result = rt.block_on(async {
                             runtime
@@ -1068,6 +1150,19 @@ impl qobject::AppController {
                         notify_result(&qt, result, "Message queued for sending");
                         snapshot_needed = false;
                     }
+                    Command::CheckRecipientKeys(addresses) => {
+                        match rt.block_on(runtime.recipient_key_statuses(&addresses)) {
+                            Ok(value) => {
+                                let json = value.to_string();
+                                let _ = qt.queue(move |mut q| q.as_mut().set_recipient_status_json(json.into()));
+                            }
+                            Err(err) => {
+                                let message = err.to_string();
+                                let _ = qt.queue(move |mut q| q.as_mut().set_toast_text(message.into()));
+                            }
+                        }
+                        snapshot_needed = false;
+                    }
                     Command::SendAdvancedMessage {
                         from,
                         to,
@@ -1130,6 +1225,7 @@ impl qobject::AppController {
                         references,
                         expires_at,
                         obscure_subject,
+                        expiry_password,
                     } => {
                         let result = rt.block_on(async {
                             let parse = |value: String| -> Vec<String> {
@@ -1161,6 +1257,7 @@ impl qobject::AppController {
                                     if references.is_empty() { None } else { Some(&references) },
                                     if expires_at.is_empty() { None } else { Some(&expires_at) },
                                     obscure_subject,
+                                    if expiry_password.is_empty() { None } else { Some(&expiry_password) },
                                 )
                                 .await
                                 .map_err(|e| e.to_string())
@@ -1191,6 +1288,18 @@ impl qobject::AppController {
                                 let _ = qt.queue(move |mut q| q.as_mut().set_toast_text(message.into()));
                             }
                         }
+                        snapshot_needed = false;
+                    }
+                    Command::ExportMailbox { folder, path } => {
+                        let result = runtime
+                            .export_mailbox(&folder, std::path::Path::new(&path))
+                            .map(|count| format!("Exported {count} message(s)"))
+                            .map_err(|e| e.to_string());
+                        let message = match &result {
+                            Ok(text) => text.clone(),
+                            Err(err) => err.clone(),
+                        };
+                        let _ = qt.queue(move |mut q| q.as_mut().set_toast_text(message.into()));
                         snapshot_needed = false;
                     }
                     Command::SaveAllAttachments(id) => {
@@ -1739,6 +1848,34 @@ impl qobject::AppController {
         }
     }
 
+    pub fn create_alias(self: &Self, local_part: &QString, domain: &QString, display_name: &QString) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Command::CreateAlias {
+                local_part: local_part.to_string(),
+                domain: domain.to_string(),
+                display_name: display_name.to_string(),
+            });
+        }
+    }
+
+    pub fn delete_alias(self: &Self, id: &QString) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Command::DeleteAlias(id.to_string()));
+        }
+    }
+
+    pub fn toggle_alias_pin(self: &Self, id: &QString) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Command::ToggleAliasPin(id.to_string()));
+        }
+    }
+
+    pub fn set_alias_enabled(self: &Self, id: &QString, enabled: bool) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Command::SetAliasEnabled(id.to_string(), enabled));
+        }
+    }
+
     pub fn route_alias(self: &Self, alias: &QString, mailbox: &QString) {
         if let Some(tx) = &self.tx {
             let _ = tx.send(Command::RouteAlias(
@@ -2016,6 +2153,15 @@ impl qobject::AppController {
         self.as_mut().set_gpg_json(json.into());
     }
 
+    pub fn export_mailbox(self: &Self, folder: &QString, path: &QString) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Command::ExportMailbox {
+                folder: folder.to_string(),
+                path: path.to_string(),
+            });
+        }
+    }
+
     pub fn save_all_attachments(self: &Self, id: &QString) {
         if let Some(tx) = &self.tx {
             let _ = tx.send(Command::SaveAllAttachments(id.to_string()));
@@ -2052,6 +2198,19 @@ impl qobject::AppController {
                 in_reply_to: in_reply_to.to_string(),
                 references: references.to_string(),
             });
+        }
+    }
+
+    pub fn check_recipient_keys(self: &Self, addresses: &QString) {
+        if let Some(tx) = &self.tx {
+            let addresses = addresses
+                .to_string()
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect();
+            let _ = tx.send(Command::CheckRecipientKeys(addresses));
         }
     }
 
@@ -2100,6 +2259,7 @@ impl qobject::AppController {
         references: &QString,
         expires_at: &QString,
         obscure_subject: bool,
+        expiry_password: &QString,
     ) {
         if let Some(tx) = &self.tx {
             let _ = tx.send(Command::SendRichMessage {
@@ -2115,6 +2275,7 @@ impl qobject::AppController {
                 references: references.to_string(),
                 expires_at: expires_at.to_string(),
                 obscure_subject,
+                expiry_password: expiry_password.to_string(),
             });
         }
     }
@@ -2186,6 +2347,13 @@ impl qobject::AppController {
         self.as_mut().set_system_dark(dark);
         if self.theme_mode.to_string() == "system" {
             self.as_mut().refresh_active_theme();
+        }
+    }
+
+    pub fn check_system_theme(mut self: Pin<&mut Self>) {
+        let dark = system_theme_is_dark();
+        if dark != self.system_dark {
+            self.as_mut().apply_system_dark(dark);
         }
     }
 
@@ -2270,6 +2438,57 @@ impl qobject::AppController {
         self.as_mut().set_theme_light(light);
         self.as_mut().set_tokens_json(tokens.into());
     }
+}
+
+fn system_theme_is_dark() -> bool {
+    if let Ok(value) = std::env::var("GTK_THEME") {
+        let value = value.to_ascii_lowercase();
+        if value.contains("dark") {
+            return true;
+        }
+        if value.contains("light") {
+            return false;
+        }
+    }
+    if let Ok(output) = std::process::Command::new("gsettings")
+        .args(["get", "org.gnome.desktop.interface", "gtk-theme"])
+        .output()
+    {
+        let value = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
+        if value.contains("dark") {
+            return true;
+        }
+        if value.contains("light") {
+            return false;
+        }
+    }
+    if let Ok(output) = std::process::Command::new("gsettings")
+        .args(["get", "org.gnome.desktop.interface", "color-scheme"])
+        .output()
+    {
+        let value = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
+        if value.contains("prefer-dark") || value.contains("dark") {
+            return true;
+        }
+        if value.contains("prefer-light") || value.contains("light") {
+            return false;
+        }
+    }
+    for command in ["kreadconfig6", "kreadconfig5"] {
+        if let Ok(output) = std::process::Command::new(command)
+            .args(["--file", "kdeglobals", "--group", "General", "--key", "ColorScheme"])
+            .output()
+        {
+            let value = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
+            if value.contains("dark") {
+                return true;
+            }
+            if value.contains("light") {
+                return false;
+            }
+        }
+    }
+    false
 }
 
 fn active_id(mode: &str, light: &str, dark: &str, system_dark: bool) -> String {
@@ -2373,6 +2592,12 @@ async fn push_settings_data(
     let identities = serde_json::to_string(&runtime.send_identities().await)
         .unwrap_or_else(|_| "[]".into());
     let _ = qt.queue(move |mut q| q.as_mut().set_identities_json(identities.into()));
+    let aliases = runtime
+        .aliases()
+        .await
+        .map(|value| serde_json::to_string(&value).unwrap_or_else(|_| "[]".into()))
+        .unwrap_or_else(|_| "[]".into());
+    let _ = qt.queue(move |mut q| q.as_mut().set_aliases_json(aliases.into()));
     let rules = runtime
         .rules()
         .await
@@ -2468,6 +2693,24 @@ async fn handle_rpc(
             Ok(serde_json::to_value(
                 runtime
                     .messages(folder, limit, 0)
+                    .map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?)
+        }
+        "mail_export" => {
+            let folder = args.get("folder").and_then(|value| value.as_str()).ok_or("folder is required")?;
+            let path = args.get("path").and_then(|value| value.as_str()).ok_or("path is required")?;
+            let count = runtime
+                .export_mailbox(folder, std::path::Path::new(path))
+                .map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({ "exported": count }))
+        }
+        "mail_get_remote" => {
+            let id = args.get("id").and_then(|value| value.as_str()).ok_or("id is required")?;
+            Ok(serde_json::to_value(
+                runtime
+                    .message_with_remote_content(id)
+                    .await
                     .map_err(|e| e.to_string())?,
             )
             .map_err(|e| e.to_string())?)
