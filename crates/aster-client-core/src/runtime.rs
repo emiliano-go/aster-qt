@@ -65,6 +65,7 @@ pub struct ClientRuntime {
     broadcaster: broadcast::Sender<StateChange>,
     sync_tx: mpsc::Sender<SyncTrigger>,
     pub(crate) outbox_tx: mpsc::Sender<i64>,
+    pub(crate) remote_details: std::sync::Mutex<std::collections::HashMap<String, crate::service::MessageDetail>>,
     workers: Vec<JoinHandle<()>>,
     _lock: File,
 }
@@ -202,6 +203,7 @@ impl ClientRuntime {
             broadcaster,
             sync_tx,
             outbox_tx,
+            remote_details: std::sync::Mutex::new(std::collections::HashMap::new()),
             workers,
             _lock: lock,
         })

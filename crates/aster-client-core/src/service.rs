@@ -101,6 +101,8 @@ pub struct MessageDetail {
     pub body: String,
     pub is_html: bool,
     pub body_html: String,
+    pub body_html_dark: Option<String>,
+    pub remote_content_loaded: bool,
     pub external_content: ExternalContentReport,
     pub sender_unverified: bool,
     pub not_end_to_end_encrypted: bool,
@@ -326,12 +328,20 @@ impl ClientRuntime {
     }
 
     pub fn message(&self, id: &str) -> ClientResult<MessageDetail> {
+        if let Some(cached) = self
+            .remote_details
+            .lock()
+            .ok()
+            .and_then(|details| details.get(id).cloned())
+        {
+            return Ok(cached);
+        }
         let msg = self
             .db()
             .get_cached_message(id)
             .map_err(ClientError::Storage)?
             .ok_or_else(|| ClientError::Protocol(format!("message not found: {}", id)))?;
-        self.build_detail(msg, None)
+        self.build_detail(msg, None, false)
     }
 
     pub async fn message_with_remote_content(&self, id: &str) -> ClientResult<MessageDetail> {
@@ -348,13 +358,34 @@ impl ClientRuntime {
             body
         };
         let body_html = safe_body_html(&rewritten, is_html, true);
-        self.build_detail(msg, Some(body_html))
+        let detail = self.build_detail(msg, Some(body_html), true)?;
+        if let Ok(mut details) = self.remote_details.lock() {
+            details.insert(id.to_string(), detail.clone());
+        }
+        Ok(detail)
+    }
+
+    fn write_email_image(&self, content_type: &str, data: &[u8]) -> Option<String> {
+        let dir = self.data_dir().join("email-images");
+        std::fs::create_dir_all(&dir).ok()?;
+        let ext = match content_type.split(';').next().unwrap_or_default() {
+            "image/jpeg" => "jpg",
+            "image/gif" => "gif",
+            "image/webp" => "webp",
+            "image/svg+xml" => "svg",
+            _ => "png",
+        };
+        let name = format!("{}.{}", uuid::Uuid::new_v4().simple(), ext);
+        let path = dir.join(name);
+        std::fs::write(&path, data).ok()?;
+        Some(format!("file://{}", path.display()))
     }
 
     fn build_detail(
         &self,
         msg: CachedMessage,
         body_html_override: Option<String>,
+        remote_content_loaded: bool,
     ) -> ClientResult<MessageDetail> {
         let id = msg.aster_id.clone();
         let attachments = self
@@ -385,8 +416,12 @@ impl ClientRuntime {
                     if part.data.is_empty() {
                         continue;
                     }
-                    let encoded = base64::engine::general_purpose::STANDARD.encode(&part.data);
-                    let data_url = format!("data:{};base64,{}", part.content_type, encoded);
+                    let data_url = self
+                        .write_email_image(&part.content_type, &part.data)
+                        .unwrap_or_else(|| {
+                            let encoded = base64::engine::general_purpose::STANDARD.encode(&part.data);
+                            format!("data:{};base64,{}", part.content_type, encoded)
+                        });
                     body_html = body_html.replace(
                         &format!("cid:{}", content_id.trim_matches(['<', '>'])),
                         &data_url,
@@ -394,6 +429,15 @@ impl ClientRuntime {
                 }
             }
         }
+        let settings = crate::settings::load(self.data_dir());
+        let dark_mode = crate::settings::string(&settings, &["mail", "html_dark_mode"], "auto");
+        let dim_images = crate::settings::boolean(&settings, &["mail", "html_dark_dim_images"], true);
+        let body_html_dark = if is_html && dark_mode != "off" {
+            let cache = self.data_dir().join("email-dark-images");
+            Some(crate::email_dark::darken_html(&body_html, dim_images, Some(&cache)))
+        } else {
+            None
+        };
         let meta: serde_json::Value = msg
             .raw_headers
             .as_deref()
@@ -405,6 +449,8 @@ impl ClientRuntime {
             body,
             is_html,
             body_html,
+            body_html_dark,
+            remote_content_loaded,
             external_content,
             sender_unverified: aster_bridge_core::message_render::sender_unverified(&meta),
             not_end_to_end_encrypted: aster_bridge_core::message_render::not_end_to_end_encrypted(&meta),
@@ -779,6 +825,7 @@ impl ClientRuntime {
         references: Option<&str>,
         expires_at: Option<&str>,
         obscure_subject: bool,
+        expiry_password: Option<&str>,
     ) -> ClientResult<()> {
         if to.is_empty() && cc.is_empty() && bcc.is_empty() {
             return Err(ClientError::Protocol("add at least one recipient".into()));
@@ -815,6 +862,9 @@ impl ClientRuntime {
         }
         if obscure_subject {
             payload["obscure_subject"] = serde_json::json!(true);
+        }
+        if let Some(value) = expiry_password.filter(|value| !value.is_empty()) {
+            payload["expiry_password"] = serde_json::json!(value);
         }
         self.client()
             .send_mail(&token, &payload)
@@ -1434,6 +1484,41 @@ impl ClientRuntime {
             "address": address,
             "fingerprint": aster_bridge_core::crypto::recipient_trust::format_fingerprint(&fingerprint),
         }))
+    }
+
+    pub async fn recipient_key_statuses(
+        &self,
+        addresses: &[String],
+    ) -> ClientResult<serde_json::Value> {
+        let (token, username) = {
+            let session = self.session().read().await;
+            (session.access_token.to_string(), session.username.clone())
+        };
+        let mut out = Vec::new();
+        for address in addresses {
+            let address = address.trim();
+            if address.is_empty() {
+                continue;
+            }
+            if aster_bridge_core::crypto::internal_send::is_internal_address(address) {
+                out.push(serde_json::json!({ "address": address, "status": "internal" }));
+                continue;
+            }
+            let status = match aster_bridge_core::crypto::recipient_trust::fetch_recipient_account_key(
+                self.client(),
+                &token,
+                &username,
+                address,
+            )
+            .await
+            {
+                Ok(Some(_)) => "key",
+                Ok(None) => "missing",
+                Err(_) => "unknown",
+            };
+            out.push(serde_json::json!({ "address": address, "status": status }));
+        }
+        Ok(serde_json::Value::Array(out))
     }
 
     pub async fn recipient_key_accept(
@@ -2108,6 +2193,96 @@ impl ClientRuntime {
         Ok(path)
     }
 
+    pub fn export_mailbox(&self, folder: &str, path: &std::path::Path) -> ClientResult<usize> {
+        let rows = if folder == "all" {
+            self.db()
+                .list_message_meta_for_view("all")
+                .map_err(ClientError::Storage)?
+        } else {
+            self.db()
+                .list_message_meta_for_view(folder)
+                .map_err(ClientError::Storage)?
+        };
+        let mut out = String::new();
+        let mut count = 0;
+        for row in rows {
+            let meta: serde_json::Value = row
+                .raw_headers
+                .as_deref()
+                .and_then(|raw| serde_json::from_str(raw).ok())
+                .unwrap_or(serde_json::Value::Null);
+            let is_html = meta.get("is_html").and_then(|value| value.as_bool()).unwrap_or(false);
+            let body = row.body_text.clone().unwrap_or_default();
+            let plain = if is_html { strip_html_tags(&body) } else { body.clone() };
+            let mut builder = MessageBuilder::new();
+            builder = builder.from(Address::new_address(None::<String>, row.sender.clone().unwrap_or_default()));
+            builder = builder.subject(row.subject.clone().unwrap_or_default());
+            if let Some(value) = row.recipients.as_deref() {
+                let recipients: Vec<Address> = value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| Address::new_address(None::<String>, value.to_string()))
+                    .collect();
+                if !recipients.is_empty() {
+                    builder = builder.to(Address::new_list(recipients));
+                }
+            }
+            if let Some(value) = meta.get("cc").and_then(|value| value.as_str()) {
+                let cc: Vec<Address> = value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| Address::new_address(None::<String>, value.to_string()))
+                    .collect();
+                if !cc.is_empty() {
+                    builder = builder.cc(Address::new_list(cc));
+                }
+            }
+            if let Some(value) = meta.get("message_id").and_then(|value| value.as_str()) {
+                builder = builder.message_id(value.to_string());
+            }
+            if let Some(value) = meta.get("in_reply_to").and_then(|value| value.as_str()) {
+                builder = builder.in_reply_to(value.to_string());
+            }
+            if let Some(value) = meta.get("references").and_then(|value| value.as_str()) {
+                builder = builder.references(value.to_string());
+            }
+            if let Ok(attachments) = self.db().get_message_attachments(&row.aster_id) {
+                for attachment in attachments {
+                    builder = builder.attachment(attachment.content_type, attachment.name, attachment.data);
+                }
+            }
+            builder = builder.text_body(plain);
+            if is_html {
+                builder = builder.html_body(body);
+            }
+            let raw = builder
+                .write_to_vec()
+                .map_err(|e| ClientError::Protocol(format!("export message: {e}")))?;
+            let from_line = format!(
+                "From {} {}\n",
+                row.sender.clone().unwrap_or_else(|| "unknown@invalid".into()),
+                row.date.clone().unwrap_or_default()
+            );
+            out.push_str(&from_line);
+            let message = String::from_utf8_lossy(&raw);
+            for line in message.split_inclusive('\n') {
+                if line.starts_with("From ") {
+                    out.push('>');
+                }
+                out.push_str(line);
+            }
+            if !out.ends_with("\n") {
+                out.push('\n');
+            }
+            out.push('\n');
+            count += 1;
+        }
+        std::fs::write(path, out).map_err(|e| ClientError::Storage(e.to_string()))?;
+        Ok(count)
+    }
+
     pub fn save_all_attachments(&self, id: &str) -> ClientResult<Vec<std::path::PathBuf>> {
         let seqs: Vec<i64> = self
             .db()
@@ -2121,6 +2296,135 @@ impl ClientRuntime {
             saved.push(self.save_attachment(id, seq)?);
         }
         Ok(saved)
+    }
+
+    pub async fn aliases(&self) -> ClientResult<Vec<AliasView>> {
+        let (token, passphrase, storage_keys) = {
+            let session = self.session().read().await;
+            (
+                session.access_token.to_string(),
+                session.vault_passphrase.clone(),
+                session.ratchet_recovery.storage_keys.clone(),
+            )
+        };
+        let keys = aster_bridge_core::crypto::alias::storage_key_candidates(&passphrase, &storage_keys);
+        let aliases = self
+            .client()
+            .list_all_aliases(&token)
+            .await
+            .map_err(ClientError::from_bridge)?;
+        let mut out = Vec::new();
+        for alias in aliases {
+            let Ok(local_part) = aster_bridge_core::crypto::alias::decrypt_alias_local_part(
+                &keys,
+                &alias.encrypted_local_part,
+                &alias.local_part_nonce,
+                alias.is_random,
+            ) else {
+                continue;
+            };
+            let display_name = match (&alias.encrypted_display_name, &alias.display_name_nonce) {
+                (Some(enc), Some(nonce)) => {
+                    aster_bridge_core::crypto::alias::decrypt_display_name(&keys, enc, nonce).ok()
+                }
+                _ => None,
+            };
+            out.push(AliasView {
+                id: alias.id,
+                address: format!("{}@{}", local_part, alias.domain),
+                display_name,
+                enabled: alias.is_enabled,
+                pinned: alias.is_pinned.unwrap_or(false),
+                random: alias.is_random,
+            });
+        }
+        out.sort_by(|a, b| b.pinned.cmp(&a.pinned).then_with(|| a.address.cmp(&b.address)));
+        Ok(out)
+    }
+
+    pub async fn create_alias(
+        &self,
+        local_part: &str,
+        domain: &str,
+        display_name: Option<&str>,
+    ) -> ClientResult<String> {
+        let (token, passphrase, storage_keys) = {
+            let session = self.session().read().await;
+            (
+                session.access_token.to_string(),
+                session.vault_passphrase.clone(),
+                session.ratchet_recovery.storage_keys.clone(),
+            )
+        };
+        let keys = aster_bridge_core::crypto::alias::storage_key_candidates(&passphrase, &storage_keys);
+        let key = keys.first().ok_or_else(|| ClientError::Session("alias keys are not unlocked".into()))?;
+        let normalized = local_part.trim().to_lowercase().replace('.', "");
+        let alias_hash = aster_bridge_core::crypto::alias::compute_alias_hash(key, &normalized, domain);
+        let routing_hash = {
+            use base64::Engine as _;
+            use sha2::Digest as _;
+            base64::engine::general_purpose::STANDARD.encode(
+                sha2::Sha256::digest(format!("{}@{}", normalized, domain).as_bytes()),
+            )
+        };
+        let (encrypted_local_part, local_part_nonce) =
+            aster_bridge_core::crypto::alias::encrypt_alias_field(key, &normalized)
+                .map_err(|e| ClientError::Protocol(format!("encrypt alias: {e}")))?;
+        let mut body = serde_json::json!({
+            "encrypted_local_part": encrypted_local_part,
+            "local_part_nonce": local_part_nonce,
+            "alias_address_hash": alias_hash,
+            "routing_address_hash": routing_hash,
+            "domain": domain,
+        });
+        if let Some(name) = display_name.filter(|value| !value.trim().is_empty()) {
+            let (encrypted, nonce) =
+                aster_bridge_core::crypto::alias::encrypt_alias_field(key, name.trim())
+                    .map_err(|e| ClientError::Protocol(format!("encrypt alias name: {e}")))?;
+            body["encrypted_display_name"] = serde_json::json!(encrypted);
+            body["display_name_nonce"] = serde_json::json!(nonce);
+        }
+        let response = self
+            .client()
+            .create_alias(&token, &body)
+            .await
+            .map_err(ClientError::from_bridge)?;
+        aster_bridge_core::auth::session::refresh_send_identities(self.session(), self.client()).await;
+        response
+            .get("id")
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| ClientError::Protocol("alias response had no id".into()))
+    }
+
+    pub async fn delete_alias(&self, id: &str) -> ClientResult<()> {
+        let token = self.access_token().await;
+        self.client()
+            .delete_alias(&token, id)
+            .await
+            .map_err(ClientError::from_bridge)?;
+        aster_bridge_core::auth::session::refresh_send_identities(self.session(), self.client()).await;
+        Ok(())
+    }
+
+    pub async fn toggle_alias_pin(&self, id: &str) -> ClientResult<serde_json::Value> {
+        let token = self.access_token().await;
+        self.client()
+            .toggle_alias_pin(&token, id)
+            .await
+            .map_err(ClientError::from_bridge)
+    }
+
+    pub async fn set_alias_enabled(
+        &self,
+        id: &str,
+        enabled: bool,
+    ) -> ClientResult<serde_json::Value> {
+        let token = self.access_token().await;
+        self.client()
+            .set_alias_enabled(&token, id, enabled)
+            .await
+            .map_err(ClientError::from_bridge)
     }
 
     pub async fn send_identities(&self) -> Vec<SendIdentityView> {
@@ -2468,6 +2772,16 @@ pub struct SendIdentityView {
     pub kind: String,
     pub display_name: Option<String>,
     pub is_default: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AliasView {
+    pub id: String,
+    pub address: String,
+    pub display_name: Option<String>,
+    pub enabled: bool,
+    pub pinned: bool,
+    pub random: bool,
 }
 
 
@@ -2821,6 +3135,20 @@ fn safe_body_html(body: &str, is_html: bool, allow_images: bool) -> String {
     let source = if allow_images { body.to_string() } else { neutralized_html(body) };
     let inlined = css_inline::inline(&source).unwrap_or(source);
     builder.clean(&inlined).to_string()
+}
+
+fn strip_html_tags(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_tag = false;
+    for ch in text.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+    out
 }
 
 fn escape_html(text: &str) -> String {

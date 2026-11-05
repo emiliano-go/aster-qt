@@ -20,6 +20,8 @@ pub fn defaults() -> Value {
             "poll_interval_secs": 30,
             "full_history": true,
             "preview_lines": 1,
+            "html_dark_mode": "auto",
+            "html_dark_dim_images": true,
             "saved_searches": []
         },
         "security": {

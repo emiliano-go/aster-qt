@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 pub mod compose;
+pub mod email_dark;
 pub mod config;
 pub mod error;
 pub mod rules;
