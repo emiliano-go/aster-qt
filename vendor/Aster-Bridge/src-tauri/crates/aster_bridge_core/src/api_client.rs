@@ -692,6 +692,8 @@ pub struct AliasResponse {
     pub domain: String,
     pub is_enabled: bool,
     pub is_random: bool,
+    #[serde(default)]
+    pub is_pinned: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2525,6 +2527,90 @@ impl ApiClient {
         }
 
         Ok(aliases)
+    }
+
+    pub async fn create_alias(
+        &self,
+        access_token: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let resp = self
+            .client
+            .post(format!("{}/addresses/v1/aliases", self.base_url))
+            .bearer_auth(access_token)
+            .json(body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn delete_alias(
+        &self,
+        access_token: &str,
+        alias_id: &str,
+    ) -> Result<()> {
+        let resp = self
+            .client
+            .delete(format!(
+                "{}/addresses/v1/aliases/{}",
+                self.base_url,
+                urlencoding_path(alias_id)
+            ))
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+        Ok(())
+    }
+
+    pub async fn toggle_alias_pin(
+        &self,
+        access_token: &str,
+        alias_id: &str,
+    ) -> Result<serde_json::Value> {
+        let resp = self
+            .client
+            .post(format!(
+                "{}/addresses/v1/aliases/{}/pin",
+                self.base_url,
+                urlencoding_path(alias_id)
+            ))
+            .bearer_auth(access_token)
+            .json(&serde_json::json!({}))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn set_alias_enabled(
+        &self,
+        access_token: &str,
+        alias_id: &str,
+        enabled: bool,
+    ) -> Result<serde_json::Value> {
+        let resp = self
+            .client
+            .patch(format!(
+                "{}/addresses/v1/aliases/{}",
+                self.base_url,
+                urlencoding_path(alias_id)
+            ))
+            .bearer_auth(access_token)
+            .json(&serde_json::json!({ "is_enabled": enabled }))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+        resp.json().await.map_err(BridgeError::from)
     }
 
     pub async fn list_domains(&self, access_token: &str) -> Result<DomainListResponse> {

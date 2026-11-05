@@ -130,6 +130,18 @@ pub fn storage_key_candidates(
 
 // Mirrors decrypt_alias (aliases.ts): random aliases store the local part as
 // plain base64; non-random aliases store AES-GCM(derived_key, nonce, local_part).
+pub fn encrypt_alias_field(derived_key: &[u8; 32], value: &str) -> Result<(String, String)> {
+    use rand_core::{OsRng, RngCore};
+    let mut nonce_bytes = [0u8; 12];
+    OsRng.fill_bytes(&mut nonce_bytes);
+    let cipher = Aes256Gcm::new_from_slice(derived_key)
+        .map_err(|e| BridgeError::Crypto(format!("alias cipher init: {}", e)))?;
+    let ciphertext = cipher
+        .encrypt(Nonce::from_slice(&nonce_bytes), value.as_bytes())
+        .map_err(|_| BridgeError::Crypto("alias field encrypt failed".to_string()))?;
+    Ok((STANDARD.encode(ciphertext), STANDARD.encode(nonce_bytes)))
+}
+
 pub fn decrypt_alias_local_part(
     derived_keys: &[Zeroizing<[u8; 32]>],
     encrypted_local_part: &str,
