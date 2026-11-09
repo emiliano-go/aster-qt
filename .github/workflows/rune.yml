@@ -1,0 +1,28 @@
+name: Rune UI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.99.1
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: System deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev libvulkan1 mesa-vulkan-drivers
+      - name: Format
+        run: cargo fmt -p aster-rune -p aster-mailhtml -- --check
+      - name: Clippy
+        run: cargo clippy -p aster-rune -p aster-mailhtml --no-deps --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test -p aster-rune -p aster-mailhtml
+      - name: Headless snapshot
+        run: cargo run -q -p aster-rune -- --snap /tmp/rune-demo.png --scene demo --size 1440x900

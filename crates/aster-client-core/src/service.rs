@@ -1751,11 +1751,30 @@ impl ClientRuntime {
     }
 
     pub async fn move_messages(&self, ids: &[String], folder_token: &str) -> ClientResult<()> {
+        match folder_token {
+            "archive" => return self.archive_messages(ids).await,
+            "trash" => return self.trash_messages(ids).await,
+            "spam" => return self.set_spam(ids, true).await,
+            _ => {}
+        }
         let token = self.access_token().await;
         self.client()
             .move_to_folder(&token, ids, folder_token)
             .await
             .map_err(ClientError::from_bridge)
+    }
+
+    /// Archives messages with the metadata flag; the API rejects system folder
+    /// names as label tokens.
+    pub async fn archive_messages(&self, ids: &[String]) -> ClientResult<()> {
+        let token = self.access_token().await;
+        for id in ids {
+            self.client()
+                .set_mailbox_flags(&token, id, serde_json::json!({ "is_archived": true }))
+                .await
+                .map_err(ClientError::from_bridge)?;
+        }
+        Ok(())
     }
 
     pub async fn set_read(&self, ids: &[String], read: bool) -> ClientResult<()> {
@@ -1915,7 +1934,14 @@ impl ClientRuntime {
     }
 
     pub async fn trash_messages(&self, ids: &[String]) -> ClientResult<()> {
-        self.move_messages(ids, "trash").await
+        let token = self.access_token().await;
+        for id in ids {
+            self.client()
+                .set_mailbox_flags(&token, id, serde_json::json!({ "is_trashed": true }))
+                .await
+                .map_err(ClientError::from_bridge)?;
+        }
+        Ok(())
     }
 
     pub async fn set_spam(&self, ids: &[String], spam: bool) -> ClientResult<()> {
@@ -1941,7 +1967,7 @@ impl ClientRuntime {
                 .set_mailbox_flags(
                     &token,
                     id,
-                    serde_json::json!({ "is_trashed": false, "is_spam": false }),
+                    serde_json::json!({ "is_trashed": false, "is_spam": false, "is_archived": false }),
                 )
                 .await
                 .map_err(ClientError::from_bridge)?;

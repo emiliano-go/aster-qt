@@ -8,7 +8,10 @@ Aster Qt runs the bridge engine in process. It opens the local encrypted mail ca
 
 Early preview. It already signs in to a real Aster account, syncs mail, shows mailboxes and messages, renders message bodies, reads themes from CSS, and exposes server side mail rules and alias routing in Settings.
 
-Not finished yet: compose and send, contacts, PGP key management, MCP server, packaging, and the full visual rule builder.
+Not finished yet: packaging and the full visual rule builder. The Rune UI
+(`crates/aster-rune`) covers mail, HTML rendering, compose/send/schedule, reader
+actions, search/filters, settings, MCP and dialogs; Qt remains the default until
+the cutover gates pass.
 
 ## Features
 
@@ -65,7 +68,27 @@ On Debian or Ubuntu:
 sudo apt install rustc cargo cmake ninja-build qt6-base-dev qt6-declarative-dev libssl-dev
 ```
 
-## Build
+## Rune UI preview
+
+`crates/aster-rune` is the Rune rewrite of the Qt Quick UI. It shares the same
+service layer, data directory, themes, MCP endpoint and security model. Qt stays
+the default until the parity checklist in `docs/RUNE-MIGRATION.md` is signed off.
+
+```bash
+cargo build -p aster-rune
+scripts/run-aster-rune.sh
+```
+
+Headless snapshots and scripts (same renderer, virtual clock):
+
+```bash
+cargo run -p aster-rune -- --snap /tmp/shell.png --scene demo --size 1440x900
+cargo run -p aster-rune -- --scene demo --script scripts/rune/search.json --frames 60 --tree /tmp/tree.json
+```
+
+Rune headless rendering needs a Vulkan ICD; on Arch install `vulkan-swrast`.
+
+## Build (Qt, current default)
 
 ```bash
 cargo build -p aster-qt

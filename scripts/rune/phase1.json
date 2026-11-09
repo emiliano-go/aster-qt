@@ -1,0 +1,5 @@
+{"events": [
+  {"t": 0.10, "type": "tap", "key": "view-starred", "hold": 0.03},
+  {"t": 0.20, "type": "tap", "key": "message-m3", "hold": 0.03},
+  {"t": 0.30, "type": "key", "name": "x"}
+]}

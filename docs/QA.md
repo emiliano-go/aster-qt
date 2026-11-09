@@ -84,3 +84,61 @@ Suites: `smoke`, `mcp`, `folders`, `search`, `reader`, `thread`, `compose`,
 - Server templates and signatures list in Settings and are preferred by the composer.
 - Aster key imported into the real system gpg-agent and listed with `gpg --list-secret-keys`.
 - Light, dark, and custom themes across all dialogs.
+
+## Rune UI (migration, parallel to Qt until Phase 7)
+
+Requirements: Rust 1.99, a Vulkan ICD (`vulkan-swrast` on Arch for headless).
+
+```sh
+cargo build -p aster-rune
+cargo test -p aster-rune -p aster-mailhtml
+cargo clippy -p aster-rune -p aster-mailhtml --no-deps --all-targets -- -D warnings
+scripts/run-aster-rune.sh
+```
+
+Headless checks (same renderer, virtual clock):
+
+```sh
+cargo run -p aster-rune -- --snap /tmp/shell.png --scene demo --size 1440x900
+cargo run -p aster-rune -- --scene compose --tree /tmp/compose.json
+cargo run -p aster-rune -- --scene compose --script scripts/rune/compose.json --frames 30 --tree /tmp/sent.json
+ASTER_MAILHTML_FIXTURE=/tmp/real-mail.html cargo test -p aster-mailhtml
+```
+
+Scenes: `demo`, `fixture`, `compose`, `command`, `menu`, `settings`,
+`settings-mail`, `settings-rules`, `settings-aliases`, `settings-contacts`,
+`settings-security`, `settings-mcp`, `settings-diagnostics`.
+
+MCP: the server writes `<data>/mcp.json` when `aster-rune` starts. Permanent
+delete from MCP is blocked until the Rune confirmation flow lands; use the
+message menu.
+
+## Rune button + backend sweep (2026-11-09)
+
+Rune tooling only: `--scene`, `--tree`, `--script`, `--snap`.
+
+- `scripts/rune/qa_buttons.py` taps every visible button/link/menu item in every
+  scene (demo, compose, command, menu, filters, snooze, delete, preview, outbox
+  and all eight settings tabs). First sweep: **906 controls, 0 failures** (no
+  panics/timeouts). A second pass with longer overlay settling is used to review
+  controls whose tree is unchanged.
+- MCP read/write checks against the live account: status, mailboxes, identities,
+  mail list/search/get/get-remote/export, read/star/pin toggles, snooze/
+  unsnooze, archive/trash/restore, spam/restore, attachment list/save/fetch,
+  mailing lists, rules create/update/reorder/delete, contacts save/delete, tags
+  create/assign/remove/delete, folders create/rename/move/delete, mailbox create/
+  delete, templates/signatures create/delete, schedule/cancel, queued send/undo,
+  recipient key, GPG and PGP status, PGP key info. All passed.
+- Fixed a backend bug found by the sweep: archive and trash used system folder
+  names as label tokens (`bulk/labels` rejects them). `move_messages` now maps
+  `archive`/`trash`/`spam` to the `is_archived`/`is_trashed`/`is_spam` metadata
+  flags; restore clears all three.
+- Real send test: MCP `mail_send` to `e@emiliano-go.com` queued and delivered;
+  the message appears in both Sent and Inbox. Test data (rules, tags, contacts,
+  folders, mailbox, template, signature, scheduled and queued messages) was
+  created and deleted/cancelled; MCP settings were restored.
+- Toast feedback was missing from the Rune shell; validation and action results
+  now render as a bottom-center toast above the status bar and expire after four
+  seconds (verified by creating a rule with no condition).
+- Settings/sidebar rows now expose `button` roles and stable `nav-*` keys so the
+  headless script runner can target them.

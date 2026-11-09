@@ -1,0 +1,4 @@
+{"events": [
+  {"t": 0.10, "type": "tap", "key": "search", "hold": 0.03},
+  {"t": 0.20, "type": "type", "text": "is:unread"}
+]}
