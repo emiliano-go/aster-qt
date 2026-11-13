@@ -601,6 +601,13 @@ async fn handle_rpc(
             .unwrap_or_default()
     };
     match tool {
+        "__revision" => {
+            let revision: u64 = runtime
+                .db()
+                .with_conn(|conn| conn.query_row("SELECT total_changes()", [], |row| row.get::<_, u64>(0)))
+                .map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({ "revision": revision }))
+        }
         "status" => Ok(serde_json::to_value(runtime.status().await).map_err(|e| e.to_string())?),
         "mailboxes_list" => Ok(serde_json::to_value(
             runtime.mailboxes().map_err(|e| e.to_string())?,

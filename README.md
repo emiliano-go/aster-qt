@@ -165,6 +165,8 @@ aster-mcp
 
 The bridge reads `mcp.json` and proxies MCP JSON-RPC to the running app. Tools cover status, mailboxes, aliases, mail listing, search, reading, moving, read state, stars, trash, rules, mailbox creation, alias routing, and sync.
 
+The server is shared by the Qt and Rune front-ends (`crates/aster-mcp`). It negotiates MCP protocol versions `2024-11-05` through `2025-06-18`, publishes read-only/destructive/idempotent annotations, and exposes resources (`aster://status`, `aster://mailboxes`, `aster://settings`, `aster://themes`, `aster://revision`, `aster://mail/{id}`, `aster://thread/{id}`) and prompt templates. Mutations accept `expectedRevision` (from `_meta.revision` or `aster://revision`) and return `REVISION_CONFLICT` when stale. The HTTP endpoint rejects non-local `Origin` headers.
+
 Permanent delete is intentionally gated. The MCP tool opens a confirmation dialog in the Aster Qt window, and deletion only proceeds after the user types `delete` and confirms. If the app is not running, MCP is unavailable.
 
 ## Local data and secrets

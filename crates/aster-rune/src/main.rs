@@ -8,7 +8,6 @@ mod action;
 mod bridge;
 mod demo;
 mod icons;
-mod mcp;
 mod notify_linux;
 mod state;
 mod theme;
@@ -60,7 +59,26 @@ fn main() {
     if !rune::is_headless() {
         let actions = bridge::start(handle.clone());
         let data_dir = aster_client_core::ClientConfig::default().data_dir;
-        crate::mcp::start(actions.clone(), data_dir);
+        aster_mcp::start(
+            data_dir,
+            "aster-rune",
+            env!("CARGO_PKG_VERSION"),
+            {
+                let tx = actions.clone();
+                move |tool: &str, args: serde_json::Value| {
+                    let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+                    tx.send(crate::action::Action::Rpc {
+                        tool: tool.to_string(),
+                        args,
+                        reply: reply_tx,
+                    })
+                    .map_err(|_| "mail engine is not running".to_string())?;
+                    reply_rx
+                        .recv_timeout(std::time::Duration::from_secs(180))
+                        .map_err(|_| "tool timed out".to_string())?
+                }
+            },
+        );
         handle.update(move |state, _| state.actions = Some(actions));
     }
     app.run();

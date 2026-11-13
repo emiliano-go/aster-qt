@@ -12,9 +12,9 @@ cxx-qt = "0.10"
 cxx-qt-lib = { version = "0.10", features = ["qt_full"] }
 aster-theme = { path = "../aster-theme" }
 aster-client-core = { workspace = true }
+aster-mcp = { path = "../aster-mcp" }
 serde_json = { workspace = true }
 tokio = { workspace = true }
-tiny_http = "0.12"
 uuid = { version = "1", features = ["v4"] }
 tracing = { workspace = true }
 

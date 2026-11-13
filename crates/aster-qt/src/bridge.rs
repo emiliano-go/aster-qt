@@ -749,7 +749,26 @@ impl qobject::AppController {
         let pending = self.pending_delete.clone();
         let mcp_dir = PathBuf::from(self.data_dir.to_string());
         let rpc_dir = PathBuf::from(self.data_dir.to_string());
-        crate::mcp::start(tx.clone(), mcp_dir);
+        aster_mcp::start(
+            mcp_dir,
+            "aster-qt",
+            env!("CARGO_PKG_VERSION"),
+            {
+                let tx = tx.clone();
+                move |tool: &str, args: serde_json::Value| {
+                    let (reply_tx, reply_rx) = mpsc::channel();
+                    tx.send(Command::Rpc {
+                        tool: tool.to_string(),
+                        args,
+                        reply: reply_tx,
+                    })
+                    .map_err(|_| "mail engine is not running".to_string())?;
+                    reply_rx
+                        .recv_timeout(std::time::Duration::from_secs(180))
+                        .map_err(|_| "tool timed out".to_string())?
+                }
+            },
+        );
 
         thread::spawn(move || {
             let rt = match tokio::runtime::Builder::new_multi_thread()
@@ -2671,6 +2690,13 @@ async fn handle_rpc(
             .unwrap_or_default()
     };
     match tool {
+        "__revision" => {
+            let revision: u64 = runtime
+                .db()
+                .with_conn(|conn| conn.query_row("SELECT total_changes()", [], |row| row.get::<_, u64>(0)))
+                .map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({ "revision": revision }))
+        }
         "status" => Ok(serde_json::to_value(runtime.status().await).map_err(|e| e.to_string())?),
         "mailboxes_list" => Ok(serde_json::to_value(
             runtime.mailboxes().map_err(|e| e.to_string())?,

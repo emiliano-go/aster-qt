@@ -412,8 +412,14 @@ dependencies = [
 name = "aster-mcp"
 version = "0.1.0"
 dependencies = [
+ "aster-theme",
+ "serde",
  "serde_json",
+ "tempfile",
+ "tiny_http",
+ "tracing",
  "ureq",
+ "uuid",
 ]
 
 [[package]]
@@ -421,13 +427,13 @@ name = "aster-qt"
 version = "0.1.0"
 dependencies = [
  "aster-client-core",
+ "aster-mcp",
  "aster-theme",
  "cxx",
  "cxx-qt",
  "cxx-qt-build",
  "cxx-qt-lib",
  "serde_json",
- "tiny_http",
  "tokio",
  "tracing",
  "uuid",
@@ -439,12 +445,12 @@ version = "0.1.0"
 dependencies = [
  "aster-client-core",
  "aster-mailhtml",
+ "aster-mcp",
  "aster-theme",
  "chrono",
  "rune",
  "rune-kit",
  "serde_json",
- "tiny_http",
  "tokio",
  "tracing",
  "uuid",

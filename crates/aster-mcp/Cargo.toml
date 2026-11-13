@@ -3,8 +3,16 @@ name = "aster-mcp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "MCP stdio bridge for the Aster Qt app"
+description = "Shared MCP server for Aster front-ends"
 
 [dependencies]
+serde = { workspace = true }
 serde_json = { workspace = true }
+tiny_http = "0.12"
+uuid = { version = "1", features = ["v4"] }
+tracing = { workspace = true }
+aster-theme = { path = "../aster-theme" }
 ureq = { version = "2", features = ["json"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
