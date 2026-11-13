@@ -760,7 +760,6 @@ ApplicationWindow {
     }
 
     function selectThreadMessage(id) {
-        root.threadListOpen = false;
         app.selectMessage(id);
     }
 
