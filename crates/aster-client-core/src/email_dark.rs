@@ -7,7 +7,6 @@ use std::path::Path;
 use base64::Engine as _;
 use sha2::{Digest, Sha256};
 
-const DARK_SURFACE: &str = "#121212";
 const DARK_INK: &str = "#e5e5e5";
 const DARK_LINK: &str = "#7cc4ff";
 const DARK_BORDER: &str = "#374151";
@@ -16,7 +15,7 @@ pub fn darken_html(html: &str, dim_images: bool, cache_dir: Option<&Path>) -> St
     let mut image_cache: HashMap<String, String> = HashMap::new();
     let transformed = rewrite_html(html, dim_images, cache_dir, &mut image_cache);
     format!(
-        "<div style=\"background-color:{DARK_SURFACE};color:{DARK_INK};font-family:Inter,system-ui,sans-serif\">{transformed}</div>"
+        "<div style=\"color:{DARK_INK};font-family:Inter,system-ui,sans-serif\">{transformed}</div>"
     )
 }
 
@@ -27,12 +26,12 @@ fn rewrite_html(
     cache: &mut HashMap<String, String>,
 ) -> String {
     use lol_html::{element, rewrite_str, RewriteStrSettings};
-    let mut out = rewrite_str(
+    let out = rewrite_str(
         html,
         RewriteStrSettings {
             element_content_handlers: vec![
                 element!("body", |el| {
-                    el.set_attribute("style", &format!("background-color:{DARK_SURFACE};color:{DARK_INK};margin:0"))
+                    el.set_attribute("style", &format!("color:{DARK_INK};margin:0"))
                         .ok();
                     Ok(())
                 }),
@@ -83,9 +82,6 @@ fn rewrite_html(
         },
     )
     .unwrap_or_else(|_| html.to_string());
-    if !out.contains("background-color") {
-        out = format!("<div style=\"background-color:{DARK_SURFACE};color:{DARK_INK}\">{out}</div>");
-    }
     out
 }
 
@@ -251,6 +247,7 @@ mod tests {
         );
         assert!(out.contains(DARK_INK));
         assert!(!out.contains("#ffffff"));
+        assert!(!out.contains("background-color"));
     }
 
     #[test]

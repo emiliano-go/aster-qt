@@ -63,19 +63,23 @@ ApplicationWindow {
         var current = message;
         var depth = 0;
         var walked = false;
+        var hasParentRef = false;
         while (current && depth < 24) {
             var parentId = normId(current.in_reply_to);
             if (!parentId && current.references) {
                 var refs = current.references.split(/\s+/).filter(function(v) { return v.length > 0; });
                 if (refs.length > 0) parentId = normId(refs[refs.length - 1]);
             }
-            var parent = parentId ? byId[parentId] : null;
+            if (!parentId) break;
+            hasParentRef = true;
+            var parent = byId[parentId];
             if (!parent || parent === current) break;
             current = parent;
             walked = true;
             depth += 1;
         }
         if (walked && current && current.message_id) return normId(current.message_id);
+        if (!hasParentRef && message.message_id) return normId(message.message_id);
         return subjectKey(message.subject) || (current && current.message_id) || message.id;
     }
 
@@ -2908,6 +2912,7 @@ ApplicationWindow {
                         Layout.fillHeight: true
                         visible: !app.loading && root.groupedMessages.length > 0
                         clip: true
+                        boundsBehavior: Flickable.StopAtBounds
                         model: root.groupedMessages
                         flickDeceleration: 4000
                         maximumFlickVelocity: 8000
@@ -3079,6 +3084,7 @@ ApplicationWindow {
                         Layout.fillHeight: true
                         visible: root.detail.id !== undefined && root.detail.id !== ""
                         clip: true
+                        boundsBehavior: Flickable.StopAtBounds
                         contentWidth: width
                         contentHeight: readerColumn.implicitHeight + n("space-6", 32)
                         ScrollBar.vertical: MailScrollBar {}
@@ -3274,7 +3280,7 @@ ApplicationWindow {
 
                             Rectangle {
                                 Layout.fillWidth: true
-                                Layout.preferredHeight: Math.min(240, root.threadOrdered.length * 48 + n("space-2", 8))
+                                Layout.preferredHeight: visible ? threadList.contentHeight + n("space-1", 4) * 2 : 0
                                 visible: root.threadListOpen && root.threadOrdered.length > 1
                                 radius: n("radius-control", 2)
                                 color: c("surface", "#1b1e23")
@@ -3286,9 +3292,10 @@ ApplicationWindow {
                                     anchors.fill: parent
                                     anchors.margins: n("space-1", 4)
                                     clip: true
+                                    interactive: false
+                                    boundsBehavior: Flickable.StopAtBounds
                                     model: root.threadOrdered
                                     spacing: 2
-                                    ScrollBar.vertical: MailScrollBar {}
                                     onVisibleChanged: {
                                         if (visible) {
                                             currentIndex = root.threadIndex >= 0 ? root.threadIndex : 0;
@@ -3714,6 +3721,7 @@ ApplicationWindow {
                             Layout.fillWidth: true
                             Layout.fillHeight: true
                             clip: true
+                            boundsBehavior: Flickable.StopAtBounds
                             contentWidth: width
                             contentHeight: settingsContent.implicitHeight + n("space-5", 24) * 2
                             ScrollBar.vertical: MailScrollBar {}
@@ -3773,7 +3781,7 @@ ApplicationWindow {
                                     visible: root.settingsTab === "mail"
                                     spacing: n("space-3", 12)
                                     SettingsTitle { text: "Mail" }
-                                    SettingsSubtitle { text: "Sync and reading preferences." }
+                                    SettingsSubtitle { text: "Sync, reading and compose preferences." }
                                     RowLayout {
                                         Layout.fillWidth: true
                                         spacing: n("space-2", 8)
@@ -3833,7 +3841,6 @@ ApplicationWindow {
                                             }
                                         }
                                     }
-                                }
 
                                     Text { text: "Signature"; color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-micro", 11); font.weight: n("font-weight-medium", 500); Layout.topMargin: n("space-2", 8) }
                                     Rectangle {
@@ -3977,6 +3984,7 @@ ApplicationWindow {
                                         }
                                     }
                                     LinkText { text: "Archive newsletters"; action: function() { app.archiveNewsletters() } }
+                                }
 
                                 // Rules
                                 ColumnLayout {
@@ -5315,6 +5323,7 @@ ApplicationWindow {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
                 clip: true
+                boundsBehavior: Flickable.StopAtBounds
                 contentWidth: width
                 contentHeight: previewText.contentHeight
                 ScrollBar.vertical: MailScrollBar {}
@@ -5398,6 +5407,7 @@ ApplicationWindow {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
                 clip: true
+                boundsBehavior: Flickable.StopAtBounds
                 model: root.detail.external_content ? root.detail.external_content.blocked_items : []
                 spacing: 4
                 ScrollBar.vertical: MailScrollBar {}
@@ -5477,6 +5487,7 @@ ApplicationWindow {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
                 clip: true
+                boundsBehavior: Flickable.StopAtBounds
                 model: root.commandItems
                 currentIndex: 0
                 delegate: Rectangle {
@@ -5631,6 +5642,7 @@ ApplicationWindow {
                 clip: true
                 model: root.contacts
                 spacing: 2
+                boundsBehavior: Flickable.StopAtBounds
                 ScrollBar.vertical: MailScrollBar {}
                 delegate: Rectangle {
                     width: ListView.view.width
@@ -5687,6 +5699,7 @@ ApplicationWindow {
                 clip: true
                 model: root.mailingLists
                 spacing: 2
+                boundsBehavior: Flickable.StopAtBounds
                 ScrollBar.vertical: MailScrollBar {}
                 delegate: Rectangle {
                     width: ListView.view.width
@@ -5880,6 +5893,7 @@ ApplicationWindow {
                 Layout.fillHeight: true
                 model: root.outboxItems
                 clip: true
+                boundsBehavior: Flickable.StopAtBounds
                 spacing: n("space-1", 4)
                 ScrollBar.vertical: MailScrollBar {}
                 delegate: Rectangle {
