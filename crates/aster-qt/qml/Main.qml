@@ -327,6 +327,16 @@ ApplicationWindow {
     property bool composeObscure: false
     property string composePassword: ""
     property string contextMessageId: ""
+    property string readerContextSelection: ""
+    property string readerContextLink: ""
+    property int composerContextStart: 0
+    property int composerContextEnd: 0
+    property string composerContextSelection: ""
+    property string composerContextLink: ""
+    property var fieldContextTarget: null
+    property int fieldContextStart: 0
+    property int fieldContextEnd: 0
+    property string fieldContextSelection: ""
     property string commandQuery: ""
     property string folderContextToken: ""
     property string folderContextName: ""
@@ -861,6 +871,66 @@ ApplicationWindow {
         composeBody.forceActiveFocus();
     }
 
+    function copyToClipboard(value) {
+        var text = String(value || "");
+        if (text.length === 0) return;
+        clipboardHelper.text = text;
+        clipboardHelper.selectAll();
+        clipboardHelper.copy();
+    }
+
+    function linkAtPosition(edit, x, y) {
+        if (!edit) return "";
+        var anchor = edit.linkAt ? edit.linkAt(x, y) : "";
+        if (anchor && anchor.length > 0) return anchor;
+        if (edit.textFormat !== TextEdit.PlainText) return "";
+        var position = edit.positionAt(x, y);
+        if (position < 0) return "";
+        var source = edit.text || "";
+        var start = position;
+        var end = position;
+        while (start > 0 && !/\s/.test(source.charAt(start - 1))) start--;
+        while (end < source.length && !/\s/.test(source.charAt(end))) end++;
+        var token = source.substring(start, end);
+        token = token.replace(/^[<(\[]+/, "").replace(/[)\]>.,;:!?]+$/, "");
+        if (/^(https?:\/\/|mailto:)/i.test(token)) return token;
+        if (/^www\./i.test(token)) return "https://" + token;
+        return "";
+    }
+
+    function composeSelectionText() {
+        return root.composerContextSelection.length > 0 ? root.composerContextSelection : composeBody.selectedText;
+    }
+
+    function deleteComposeSelection() {
+        var start = root.composerContextStart;
+        var end = root.composerContextEnd;
+        if (start >= end) return;
+        composeBody.remove(start, end);
+        root.composerContextStart = composeBody.cursorPosition;
+        root.composerContextEnd = composeBody.cursorPosition;
+        root.composerContextSelection = "";
+        composeBody.forceActiveFocus();
+    }
+
+    function fieldSelectionText() {
+        if (root.fieldContextSelection.length > 0) return root.fieldContextSelection;
+        return root.fieldContextTarget ? root.fieldContextTarget.selectedText : "";
+    }
+
+    function deleteFieldSelection() {
+        var target = root.fieldContextTarget;
+        if (!target) return;
+        var start = root.fieldContextStart;
+        var end = root.fieldContextEnd;
+        if (start >= end) return;
+        target.remove(start, end);
+        root.fieldContextStart = target.cursorPosition;
+        root.fieldContextEnd = target.cursorPosition;
+        root.fieldContextSelection = "";
+        target.forceActiveFocus();
+    }
+
     function wrapComposeSelection(before, after) {
         var start = composeBody.selectionStart;
         var end = composeBody.selectionEnd;
@@ -1297,6 +1367,60 @@ ApplicationWindow {
         onTriggered: app.refreshMail()
     }
 
+    component PressArea: MouseArea {
+        id: pressArea
+        property Item pressTarget: parent
+        property real pressScale: 0.97
+        anchors.fill: parent
+        cursorShape: Qt.PointingHandCursor
+        NumberAnimation {
+            id: pressAnimation
+            target: pressArea.pressTarget
+            property: "scale"
+            duration: n("motion-fast", 110)
+            easing.type: Easing.OutCubic
+        }
+        function settle() {
+            if (!pressArea.pressTarget) return;
+            pressAnimation.stop();
+            pressAnimation.to = 1.0;
+            pressAnimation.start();
+        }
+        onPressedChanged: {
+            if (!pressArea.pressTarget) return;
+            pressAnimation.stop();
+            pressAnimation.to = pressed ? pressArea.pressScale : 1.0;
+            pressAnimation.start();
+        }
+        onCanceled: settle()
+        onEnabledChanged: if (!enabled) settle()
+        onVisibleChanged: if (!visible) settle()
+    }
+
+    component MailMenu: Menu {
+        padding: n("space-1", 4)
+        transformOrigin: Item.TopLeft
+        enter: Transition {
+            ParallelAnimation {
+                NumberAnimation { property: "opacity"; from: 0; to: 1; duration: n("motion-medium", 180); easing.type: Easing.OutQuint }
+                NumberAnimation { property: "scale"; from: 0.95; to: 1; duration: n("motion-medium", 180); easing.type: Easing.OutQuint }
+            }
+        }
+        exit: Transition {
+            ParallelAnimation {
+                NumberAnimation { property: "opacity"; to: 0; duration: n("motion-fast", 110); easing.type: Easing.InCubic }
+                NumberAnimation { property: "scale"; to: 0.97; duration: n("motion-fast", 110); easing.type: Easing.InCubic }
+            }
+        }
+        background: Rectangle {
+            implicitWidth: 220
+            color: c("menu", "#23262c")
+            border.width: n("border-width", 1)
+            border.color: c("border-strong", "#292e323a")
+            radius: n("radius-panel", 8)
+        }
+    }
+
 
     component ModeChip: Rectangle {
         property string label
@@ -1325,11 +1449,7 @@ ApplicationWindow {
             font.pixelSize: n("font-size-small", 12)
             font.weight: parent.active ? n("font-weight-semibold", 600) : n("font-weight-medium", 500)
         }
-        MouseArea {
-            anchors.fill: parent
-            cursorShape: Qt.PointingHandCursor
-            onClicked: parent.clicked()
-        }
+        PressArea { pressScale: 0.96; onClicked: parent.clicked() }
     }
 
     component ThemeRow: Rectangle {
@@ -1378,11 +1498,7 @@ ApplicationWindow {
                 font.pixelSize: n("font-size-micro", 11)
             }
         }
-        MouseArea {
-            anchors.fill: parent
-            cursorShape: Qt.PointingHandCursor
-            onClicked: themeRow.activate()
-        }
+        PressArea { pressScale: 0.99; onClicked: themeRow.activate() }
     }
 
 
@@ -1406,15 +1522,31 @@ ApplicationWindow {
         border.width: checked ? 0 : n("border-width", 1)
         border.color: c("border-strong", "#292e323a")
         Rectangle {
+            id: toggleKnob
+            property bool moving: false
             width: 18
             height: 18
             radius: n("radius-small", 1)
             y: 2
             x: parent.checked ? parent.width - 20 : 2
             color: parent.checked ? c("accent-ink", "#171717") : c("muted", "#a8ece7de")
-            Behavior on x { NumberAnimation { duration: n("motion-fast", 110); easing.type: Easing.OutCubic } }
+            scaleX: moving ? 1.12 : 1
+            scaleY: moving ? 0.89 : 1
+            Behavior on x { NumberAnimation { duration: n("motion-fast", 110); easing.type: Easing.InOutCubic } }
+            Behavior on scaleX { NumberAnimation { duration: n("motion-fast", 110); easing.type: Easing.OutCubic } }
+            Behavior on scaleY { NumberAnimation { duration: n("motion-fast", 110); easing.type: Easing.OutCubic } }
         }
-        MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: parent.toggled() }
+        onCheckedChanged: {
+            if (!toggleKnob || !toggleStretch) return;
+            toggleKnob.moving = true;
+            toggleStretch.restart();
+        }
+        Timer {
+            id: toggleStretch
+            interval: n("motion-press", 140)
+            onTriggered: toggleKnob.moving = false
+        }
+        PressArea { pressScale: 0.95; onClicked: parent.toggled() }
     }
 
     component SettingsField: Rectangle {
@@ -1448,6 +1580,16 @@ ApplicationWindow {
             font.pixelSize: n("font-size-small", 12)
             clip: true
             onTextChanged: fieldRoot.edited(text)
+            TapHandler {
+                acceptedButtons: Qt.RightButton
+                onSingleTapped: function(point) {
+                    root.fieldContextTarget = field;
+                    root.fieldContextSelection = field.selectedText || "";
+                    root.fieldContextStart = field.selectionStart;
+                    root.fieldContextEnd = field.selectionEnd;
+                    fieldContextMenu.popup(field, point.position.x, point.position.y);
+                }
+            }
             Text {
                 anchors.fill: parent
                 verticalAlignment: Text.AlignVCenter
@@ -1495,7 +1637,7 @@ ApplicationWindow {
                 Layout.fillWidth: true
             }
         }
-        MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.settingsTab = tab }
+        PressArea { pressScale: 0.99; onClicked: root.settingsTab = tab }
     }
 
     component MailMenuItem: MenuItem {
@@ -1534,6 +1676,8 @@ ApplicationWindow {
             radius: n("radius-control", 2)
             color: menuItem.highlighted ? c("selected", "#3d2e323a") : "transparent"
         }
+        scale: menuItem.down ? 0.985 : 1
+        Behavior on scale { NumberAnimation { duration: n("motion-fast", 110); easing.type: Easing.OutCubic } }
     }
 
     component MailMenuSeparator: MenuSeparator {
@@ -1583,7 +1727,9 @@ ApplicationWindow {
         color: c("accent-text", "#e7a97f")
         font.family: c("font-family", "Inter")
         font.pixelSize: n("font-size-small", 12)
-        MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: action() }
+        opacity: linkPress.pressed ? 0.68 : 1
+        Behavior on opacity { NumberAnimation { duration: n("motion-fast", 110); easing.type: Easing.OutCubic } }
+        PressArea { id: linkPress; pressScale: 0.97; onClicked: action() }
     }
 
     component FolderRow: Rectangle {
@@ -1641,9 +1787,8 @@ ApplicationWindow {
                 Layout.alignment: Qt.AlignVCenter
             }
         }
-        MouseArea {
-            anchors.fill: parent
-            cursorShape: Qt.PointingHandCursor
+        PressArea {
+            pressScale: 0.99
             acceptedButtons: Qt.LeftButton | Qt.RightButton
             onClicked: function(mouse) {
                 if (mouse.button === Qt.RightButton) {
@@ -1691,11 +1836,7 @@ ApplicationWindow {
         ToolTip.delay: 500
         Keys.onSpacePressed: iconButton.clicked()
         Keys.onReturnPressed: iconButton.clicked()
-        MouseArea {
-            anchors.fill: parent
-            cursorShape: Qt.PointingHandCursor
-            onClicked: iconButton.clicked()
-        }
+        PressArea { pressScale: 0.96; onClicked: iconButton.clicked() }
     }
 
     component MailScrollBar: ScrollBar {
@@ -1745,11 +1886,7 @@ ApplicationWindow {
             color: c("accent-ink", "#171717")
             visible: box.checked
         }
-        MouseArea {
-            anchors.fill: parent
-            cursorShape: Qt.PointingHandCursor
-            onClicked: box.toggled()
-        }
+        PressArea { pressScale: 0.86; onClicked: box.toggled() }
     }
 
     component MessageRow: Rectangle {
@@ -1801,7 +1938,7 @@ ApplicationWindow {
                     border.width: n("border-width", 1)
                     border.color: c("border-strong", "#292e323a")
                     Icon { anchors.centerIn: parent; name: "check"; size: 12; color: c("accent-ink", "#171717"); visible: root.selectedIds.indexOf(row.item.id) >= 0 }
-                    MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.toggleSelected(row.item.id) }
+                    PressArea { pressScale: 0.85; onClicked: root.toggleSelected(row.item.id) }
                 }
                 Text {
                     text: row.item && row.item.sender ? row.item.sender : "Unknown sender"
@@ -1898,9 +2035,8 @@ ApplicationWindow {
                 }
             }
         }
-        MouseArea {
-            anchors.fill: parent
-            cursorShape: Qt.PointingHandCursor
+        PressArea {
+            pressScale: 0.995
             acceptedButtons: Qt.LeftButton | Qt.RightButton
             onClicked: function(mouse) {
                 if (mouse.button === Qt.RightButton) {
@@ -1974,11 +2110,7 @@ ApplicationWindow {
                 Layout.alignment: Qt.AlignVCenter
             }
         }
-        MouseArea {
-            anchors.fill: parent
-            cursorShape: Qt.PointingHandCursor
-            onClicked: root.selectThreadMessage(threadRow.item.id)
-        }
+        PressArea { pressScale: 0.995; onClicked: root.selectThreadMessage(threadRow.item.id) }
     }
 
     ColumnLayout {
@@ -2142,7 +2274,7 @@ ApplicationWindow {
                                 Layout.alignment: Qt.AlignVCenter
                             }
                         }
-                        MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.openCompose() }
+                        PressArea { pressScale: 0.96; onClicked: root.openCompose() }
                     }
                 }
             }
@@ -2260,9 +2392,8 @@ ApplicationWindow {
                                 Layout.alignment: Qt.AlignVCenter
                             }
                         }
-                        MouseArea {
-                            anchors.fill: parent
-                            cursorShape: Qt.PointingHandCursor
+                        PressArea {
+                            pressScale: 0.99
                             onClicked: root.toggleIdentityPopup()
                         }
                     }
@@ -2303,7 +2434,7 @@ ApplicationWindow {
                             Text { text: "Contacts"; color: c("text", "#ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-body", 14); Layout.fillWidth: true }
                             Text { text: root.contacts.length > 0 ? root.contacts.length : ""; color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-small", 12) }
                         }
-                        MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: contactsViewPopup.open() }
+                        PressArea { pressScale: 0.99; onClicked: contactsViewPopup.open() }
                     }
                     Rectangle {
                         Layout.fillWidth: true
@@ -2322,7 +2453,7 @@ ApplicationWindow {
                             Icon { name: "clock"; size: n("icon-body", 16); color: c("muted", "#a8ece7de") }
                             Text { text: "Calendar"; color: c("text", "#ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-body", 14); Layout.fillWidth: true }
                         }
-                        MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: Qt.openUrlExternally("https://calendar.astermail.org") }
+                        PressArea { pressScale: 0.99; onClicked: Qt.openUrlExternally("https://calendar.astermail.org") }
                     }
                     Rectangle {
                         Layout.fillWidth: true
@@ -2342,7 +2473,7 @@ ApplicationWindow {
                             Text { text: "Subscriptions"; color: c("text", "#ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-body", 14); Layout.fillWidth: true }
                             Text { text: root.mailingLists.length > 0 ? root.mailingLists.length : ""; color: c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-small", 12) }
                         }
-                        MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: subscriptionsViewPopup.open() }
+                        PressArea { pressScale: 0.99; onClicked: subscriptionsViewPopup.open() }
                     }
 
                     Rectangle {
@@ -2391,9 +2522,8 @@ ApplicationWindow {
                                 Layout.alignment: Qt.AlignVCenter
                             }
                         }
-                        MouseArea {
-                            anchors.fill: parent
-                            cursorShape: Qt.PointingHandCursor
+                        PressArea {
+                            pressScale: 0.99
                             onClicked: root.openSettings("aliases")
                         }
                     }
@@ -2438,9 +2568,8 @@ ApplicationWindow {
                             font.family: c("font-family", "Inter")
                             font.pixelSize: n("font-size-small", 12)
                         }
-                        MouseArea {
-                            anchors.fill: parent
-                            cursorShape: Qt.PointingHandCursor
+                        PressArea {
+                            pressScale: 0.99
                             onClicked: root.listFilter = ""
                         }
                     }
@@ -2485,9 +2614,8 @@ ApplicationWindow {
                                     font.pixelSize: n("font-size-micro", 11)
                                 }
                             }
-                            MouseArea {
-                                anchors.fill: parent
-                                cursorShape: Qt.PointingHandCursor
+                            PressArea {
+                                pressScale: 0.99
                                 onClicked: activate()
                             }
                         }
@@ -2554,9 +2682,8 @@ ApplicationWindow {
                                 }
                                 Icon { name: "pin"; size: 11; color: c("accent-text", "#e7a97f"); visible: modelData.pinned === true }
                             }
-                            MouseArea {
-                                anchors.fill: parent
-                                cursorShape: Qt.PointingHandCursor
+                            PressArea {
+                                pressScale: 0.99
                                 acceptedButtons: Qt.LeftButton | Qt.RightButton
                                 onClicked: function(mouse) {
                                     if (mouse.button === Qt.RightButton) {
@@ -2603,9 +2730,8 @@ ApplicationWindow {
                             font.family: c("font-family", "Inter")
                             font.pixelSize: n("font-size-small", 12)
                         }
-                        MouseArea {
-                            anchors.fill: parent
-                            cursorShape: Qt.PointingHandCursor
+                        PressArea {
+                            pressScale: 0.99
                             onClicked: { root.tagFilter = ""; if (app.folderId.indexOf("tag:") === 0) app.openMailbox("all"); }
                         }
                     }
@@ -2646,9 +2772,8 @@ ApplicationWindow {
                                     font.pixelSize: n("font-size-micro", 11)
                                 }
                             }
-                            MouseArea {
-                                anchors.fill: parent
-                                cursorShape: Qt.PointingHandCursor
+                            PressArea {
+                                pressScale: 0.99
                                 onClicked: { root.tagFilter = modelData.tag_token; app.openMailbox(tagView); }
                             }
                         }
@@ -2700,7 +2825,7 @@ ApplicationWindow {
                                 font.pixelSize: n("font-size-small", 12)
                                 elide: Text.ElideRight
                             }
-                            MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.applySavedSearch(modelData) }
+                            PressArea { pressScale: 0.99; onClicked: root.applySavedSearch(modelData) }
                         }
                     }
                     Text {
@@ -2811,7 +2936,7 @@ ApplicationWindow {
                                 Keys.onSpacePressed: root.unreadOnly = !root.unreadOnly
                                 color: root.unreadOnly ? c("selected", "#3d2e323a") : "transparent"
                                 Icon { anchors.centerIn: parent; name: "inbox"; size: n("icon-small", 16); color: root.unreadOnly ? c("accent-text", "#e7a97f") : c("muted", "#a8ece7de") }
-                                MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.unreadOnly = !root.unreadOnly }
+                                PressArea { pressScale: 0.9; onClicked: root.unreadOnly = !root.unreadOnly }
                             }
                             IconButton {
                                 icon: "check"
@@ -3220,9 +3345,8 @@ ApplicationWindow {
                                             }
                                             Icon { name: "close"; size: 10; color: c("muted", "#a8ece7de") }
                                         }
-                                        MouseArea {
-                                            anchors.fill: parent
-                                            cursorShape: Qt.PointingHandCursor
+                                        PressArea {
+                                            pressScale: 0.96
                                             onClicked: {
                                                 root.tagTargetIds = [root.detail.id];
                                                 root.toggleTag(modelData);
@@ -3423,6 +3547,7 @@ ApplicationWindow {
                                         textFormat: mailCard.bodyIsHtml ? TextEdit.RichText : TextEdit.PlainText
                                         readOnly: true
                                         selectByMouse: true
+                                        persistentSelection: true
                                         wrapMode: TextEdit.Wrap
                                         color: mailCard.bodyIsHtml ? (root.emailDark ? c("text", "#e5e5e5") : "#1c1b19") : c("text", "#ece7de")
                                         selectionColor: c("selection", "#59d98e5c")
@@ -3432,6 +3557,14 @@ ApplicationWindow {
                                         onLinkActivated: function(link) {
                                             if (link && (link.indexOf("http") === 0 || link.indexOf("mailto:") === 0))
                                                 Qt.openUrlExternally(link);
+                                        }
+                                        TapHandler {
+                                            acceptedButtons: Qt.RightButton
+                                            onSingleTapped: function(point) {
+                                                root.readerContextSelection = mailBody.selectedText || "";
+                                                root.readerContextLink = root.linkAtPosition(mailBody, point.position.x, point.position.y);
+                                                readerContextMenu.popup(mailBody, point.position.x, point.position.y);
+                                            }
                                         }
                                         Accessible.role: Accessible.StaticText
                                         Accessible.name: "Message body"
@@ -3499,9 +3632,8 @@ ApplicationWindow {
                                                 action: function() { app.saveAttachment(root.detail.id, modelData.seq) }
                                             }
                                         }
-                                        MouseArea {
-                                            anchors.fill: parent
-                                            cursorShape: Qt.PointingHandCursor
+                                        PressArea {
+                                            pressScale: 0.97
                                             onClicked: {
                                                 app.previewAttachment(root.detail.id, modelData.seq);
                                                 attachmentPreviewPopup.open();
@@ -3618,7 +3750,12 @@ ApplicationWindow {
         color: c("surface-strong", "#2e323a")
         border.width: n("border-width", 1)
         border.color: c("border-strong", "#292e323a")
-        visible: root.toastVisible && app.toastText.length > 0
+        transformOrigin: Item.Bottom
+        opacity: root.toastVisible ? 1 : 0
+        scale: root.toastVisible ? 1 : 0.97
+        visible: (root.toastVisible && app.toastText.length > 0) || opacity > 0.01
+        Behavior on opacity { NumberAnimation { duration: n("motion-medium", 180); easing.type: Easing.OutCubic } }
+        Behavior on scale { NumberAnimation { duration: n("motion-medium", 180); easing.type: Easing.OutCubic } }
         Text {
             id: toastContent
             anchors.centerIn: parent
@@ -4667,7 +4804,7 @@ ApplicationWindow {
                         color: cancelHover.hovered ? c("hover", "#2e2e323a") : "transparent"
                         HoverHandler { id: cancelHover }
                         Text { anchors.centerIn: parent; text: "Cancel"; color: c("text-2", "#dbebe7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-small", 12) }
-                        MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: cancelDelete() }
+                        PressArea { pressScale: 0.96; onClicked: cancelDelete() }
                     }
                     Rectangle {
                         implicitWidth: 96
@@ -4690,11 +4827,7 @@ ApplicationWindow {
                         opacity: root.deleteConfirmWord.toLowerCase() === "delete" ? 1.0 : 0.5
                         HoverHandler { id: deleteHover }
                         Text { anchors.centerIn: parent; text: "Delete"; color: root.deleteConfirmWord.toLowerCase() === "delete" ? c("accent-ink", "#171717") : c("muted", "#a8ece7de"); font.family: c("font-family", "Inter"); font.pixelSize: n("font-size-small", 12); font.weight: n("font-weight-semibold", 600) }
-                        MouseArea {
-                            anchors.fill: parent
-                            cursorShape: Qt.PointingHandCursor
-                            onClicked: confirmDelete()
-                        }
+                        PressArea { pressScale: 0.96; onClicked: confirmDelete() }
                     }
                 }
             }
@@ -4852,9 +4985,8 @@ ApplicationWindow {
                                 elide: Text.ElideRight
                                 width: parent.width - n("space-6", 32)
                             }
-                            MouseArea {
-                                anchors.fill: parent
-                                cursorShape: Qt.PointingHandCursor
+                            PressArea {
+                                pressScale: 0.99
                                 onClicked: root.applyRecipientSuggestion(modelData.address)
                             }
                         }
@@ -4935,6 +5067,16 @@ ApplicationWindow {
                         background: null
                         font.family: c("font-mail", "Inter")
                         font.pixelSize: n("font-size-small", 12)
+                        TapHandler {
+                            acceptedButtons: Qt.RightButton
+                            onSingleTapped: function(point) {
+                                root.composerContextStart = composeBody.selectionStart;
+                                root.composerContextEnd = composeBody.selectionEnd;
+                                root.composerContextSelection = composeBody.selectedText || "";
+                                root.composerContextLink = root.linkAtPosition(composeBody, point.position.x, point.position.y);
+                                composeContextMenu.popup(composeBody, point.position.x, point.position.y);
+                            }
+                        }
                     }
                 }
                 Flow {
@@ -4966,9 +5108,8 @@ ApplicationWindow {
                                 }
                                 Icon { name: "close"; size: 12; color: c("muted", "#a8ece7de") }
                             }
-                            MouseArea {
-                                anchors.fill: parent
-                                cursorShape: Qt.PointingHandCursor
+                            PressArea {
+                                pressScale: 0.97
                                 onClicked: {
                                     var next = root.composeAttachments.slice();
                                     next.splice(index, 1);
@@ -5052,11 +5193,7 @@ ApplicationWindow {
                             font.pixelSize: n("font-size-small", 12)
                             font.weight: n("font-weight-semibold", 600)
                         }
-                        MouseArea {
-                            anchors.fill: parent
-                            cursorShape: Qt.PointingHandCursor
-                            onClicked: send()
-                        }
+                        PressArea { pressScale: 0.96; onClicked: send() }
                     }
                 }
             }
@@ -5173,9 +5310,8 @@ ApplicationWindow {
                             }
                         }
                     }
-                    MouseArea {
-                        anchors.fill: parent
-                        cursorShape: Qt.PointingHandCursor
+                    PressArea {
+                        pressScale: 0.99
                         onClicked: root.useIdentity(modelData.address)
                     }
                 }
@@ -5268,11 +5404,7 @@ ApplicationWindow {
                         color: emojiHover.hovered ? c("hover", "#2e2e323a") : "transparent"
                         HoverHandler { id: emojiHover }
                         Text { anchors.centerIn: parent; text: modelData; font.pixelSize: 18 }
-                        MouseArea {
-                            anchors.fill: parent
-                            cursorShape: Qt.PointingHandCursor
-                            onClicked: { root.insertComposeText(modelData); emojiPopup.close(); }
-                        }
+                        PressArea { pressScale: 0.9; onClicked: { root.insertComposeText(modelData); emojiPopup.close(); } }
                     }
                 }
             }
@@ -5348,16 +5480,8 @@ ApplicationWindow {
         }
     }
 
-    Menu {
+    MailMenu {
         id: messageContextMenu
-        padding: n("space-1", 4)
-        background: Rectangle {
-            implicitWidth: 220
-            color: c("menu", "#23262c")
-            border.width: n("border-width", 1)
-            border.color: c("border-strong", "#292e323a")
-            radius: n("radius-panel", 8)
-        }
         MailMenuItem { menuIcon: "inbox"; text: "Open"; onTriggered: { if (root.contextMessageId) { root.readerOpen = true; app.selectMessage(root.contextMessageId) } } }
         MailMenuSeparator {}
         MailMenuItem { menuIcon: "check"; text: "Mark read"; onTriggered: app.setRead(root.contextMessageId, true) }
@@ -5371,6 +5495,157 @@ ApplicationWindow {
         MailMenuItem { menuIcon: "junk"; text: "Spam"; onTriggered: app.setSpam(root.contextMessageId, true) }
         MailMenuItem { menuIcon: "refresh"; text: "Restore"; onTriggered: app.restoreMessage(root.contextMessageId) }
         MailMenuItem { menuIcon: "trash"; text: "Trash"; onTriggered: app.trashMessage(root.contextMessageId) }
+    }
+
+    MailMenu {
+        id: readerContextMenu
+        MailMenuItem {
+            menuIcon: "copy"
+            text: "Copy"
+            enabled: root.readerContextSelection.length > 0
+            onTriggered: root.copyToClipboard(root.readerContextSelection)
+        }
+        MailMenuItem {
+            text: "Select all"
+            enabled: mailBody.length > 0
+            onTriggered: mailBody.selectAll()
+        }
+        MailMenuSeparator { visible: root.readerContextLink.length > 0 }
+        MailMenuItem {
+            menuIcon: "copy"
+            text: "Copy link"
+            visible: root.readerContextLink.length > 0
+            onTriggered: root.copyToClipboard(root.readerContextLink)
+        }
+        MailMenuItem {
+            text: "Open link"
+            visible: root.readerContextLink.length > 0
+            onTriggered: {
+                if (/^(https?:\/\/|mailto:)/i.test(root.readerContextLink))
+                    Qt.openUrlExternally(root.readerContextLink);
+            }
+        }
+    }
+
+    MailMenu {
+        id: composeContextMenu
+        MailMenuItem {
+            text: "Undo"
+            enabled: composeBody.canUndo
+            onTriggered: { composeBody.forceActiveFocus(); composeBody.undo(); }
+        }
+        MailMenuItem {
+            text: "Redo"
+            enabled: composeBody.canRedo
+            onTriggered: { composeBody.forceActiveFocus(); composeBody.redo(); }
+        }
+        MailMenuSeparator {}
+        MailMenuItem {
+            text: "Cut"
+            enabled: root.composeSelectionText().length > 0
+            onTriggered: {
+                root.copyToClipboard(root.composeSelectionText());
+                root.deleteComposeSelection();
+            }
+        }
+        MailMenuItem {
+            menuIcon: "copy"
+            text: "Copy"
+            enabled: root.composeSelectionText().length > 0
+            onTriggered: root.copyToClipboard(root.composeSelectionText())
+        }
+        MailMenuItem {
+            text: "Paste"
+            enabled: composeBody.canPaste
+            onTriggered: { composeBody.forceActiveFocus(); composeBody.paste(); }
+        }
+        MailMenuItem {
+            text: "Delete"
+            enabled: root.composeSelectionText().length > 0
+            onTriggered: root.deleteComposeSelection()
+        }
+        MailMenuSeparator {}
+        MailMenuItem {
+            text: "Select all"
+            enabled: composeBody.length > 0
+            onTriggered: { composeBody.forceActiveFocus(); composeBody.selectAll(); }
+        }
+        MailMenuSeparator { visible: root.composerContextLink.length > 0 }
+        MailMenuItem {
+            menuIcon: "copy"
+            text: "Copy link"
+            visible: root.composerContextLink.length > 0
+            onTriggered: root.copyToClipboard(root.composerContextLink)
+        }
+        MailMenuItem {
+            text: "Open link"
+            visible: root.composerContextLink.length > 0
+            onTriggered: {
+                if (/^(https?:\/\/|mailto:)/i.test(root.composerContextLink))
+                    Qt.openUrlExternally(root.composerContextLink);
+            }
+        }
+    }
+
+    MailMenu {
+        id: fieldContextMenu
+        MailMenuItem {
+            text: "Undo"
+            enabled: root.fieldContextTarget !== null && root.fieldContextTarget.canUndo
+            onTriggered: {
+                if (!root.fieldContextTarget) return;
+                root.fieldContextTarget.forceActiveFocus();
+                root.fieldContextTarget.undo();
+            }
+        }
+        MailMenuItem {
+            text: "Redo"
+            enabled: root.fieldContextTarget !== null && root.fieldContextTarget.canRedo
+            onTriggered: {
+                if (!root.fieldContextTarget) return;
+                root.fieldContextTarget.forceActiveFocus();
+                root.fieldContextTarget.redo();
+            }
+        }
+        MailMenuSeparator {}
+        MailMenuItem {
+            text: "Cut"
+            enabled: root.fieldSelectionText().length > 0
+            onTriggered: {
+                root.copyToClipboard(root.fieldSelectionText());
+                root.deleteFieldSelection();
+            }
+        }
+        MailMenuItem {
+            menuIcon: "copy"
+            text: "Copy"
+            enabled: root.fieldSelectionText().length > 0
+            onTriggered: root.copyToClipboard(root.fieldSelectionText())
+        }
+        MailMenuItem {
+            text: "Paste"
+            enabled: root.fieldContextTarget !== null && root.fieldContextTarget.canPaste
+            onTriggered: {
+                if (!root.fieldContextTarget) return;
+                root.fieldContextTarget.forceActiveFocus();
+                root.fieldContextTarget.paste();
+            }
+        }
+        MailMenuItem {
+            text: "Delete"
+            enabled: root.fieldSelectionText().length > 0
+            onTriggered: root.deleteFieldSelection()
+        }
+        MailMenuSeparator {}
+        MailMenuItem {
+            text: "Select all"
+            enabled: root.fieldContextTarget !== null && root.fieldContextTarget.length > 0
+            onTriggered: {
+                if (!root.fieldContextTarget) return;
+                root.fieldContextTarget.forceActiveFocus();
+                root.fieldContextTarget.selectAll();
+            }
+        }
     }
 
     Popup {
@@ -5504,26 +5779,14 @@ ApplicationWindow {
                         font.family: c("font-family", "Inter")
                         font.pixelSize: n("font-size-small", 12)
                     }
-                    MouseArea {
-                        anchors.fill: parent
-                        cursorShape: Qt.PointingHandCursor
-                        onClicked: root.runCommand(modelData.action)
-                    }
+                    PressArea { pressScale: 0.99; onClicked: root.runCommand(modelData.action) }
                 }
             }
         }
     }
 
-    Menu {
+    MailMenu {
         id: aliasContextMenu
-        padding: n("space-1", 4)
-        background: Rectangle {
-            implicitWidth: 220
-            color: c("menu", "#23262c")
-            border.width: n("border-width", 1)
-            border.color: c("border-strong", "#292e323a")
-            radius: n("radius-panel", 8)
-        }
         MailMenuItem {
             text: "Copy address"
             onTriggered: {
@@ -5552,16 +5815,8 @@ ApplicationWindow {
         MailMenuItem { menuIcon: "settings"; text: "Manage aliases"; onTriggered: root.openSettings("aliases") }
     }
 
-    Menu {
+    MailMenu {
         id: folderContextMenu
-        padding: n("space-1", 4)
-        background: Rectangle {
-            implicitWidth: 220
-            color: c("menu", "#23262c")
-            border.width: n("border-width", 1)
-            border.color: c("border-strong", "#292e323a")
-            radius: n("radius-panel", 8)
-        }
         MailMenuItem { menuIcon: "folder"; text: "Open"; onTriggered: app.openMailbox(root.folderContextLabel) }
         MailMenuSeparator {}
         MailMenuItem { menuIcon: "plus"; text: "New mailbox"; onTriggered: root.openSettings("aliases") }
