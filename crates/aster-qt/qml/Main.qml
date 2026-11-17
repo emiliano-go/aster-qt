@@ -1530,11 +1530,15 @@ ApplicationWindow {
             y: 2
             x: parent.checked ? parent.width - 20 : 2
             color: parent.checked ? c("accent-ink", "#171717") : c("muted", "#a8ece7de")
-            scaleX: moving ? 1.12 : 1
-            scaleY: moving ? 0.89 : 1
             Behavior on x { NumberAnimation { duration: n("motion-fast", 110); easing.type: Easing.InOutCubic } }
-            Behavior on scaleX { NumberAnimation { duration: n("motion-fast", 110); easing.type: Easing.OutCubic } }
-            Behavior on scaleY { NumberAnimation { duration: n("motion-fast", 110); easing.type: Easing.OutCubic } }
+            transform: Scale {
+                origin.x: toggleKnob.width / 2
+                origin.y: toggleKnob.height / 2
+                xScale: toggleKnob.moving ? 1.12 : 1
+                yScale: toggleKnob.moving ? 0.89 : 1
+                Behavior on xScale { NumberAnimation { duration: n("motion-fast", 110); easing.type: Easing.OutCubic } }
+                Behavior on yScale { NumberAnimation { duration: n("motion-fast", 110); easing.type: Easing.OutCubic } }
+            }
         }
         onCheckedChanged: {
             if (!toggleKnob || !toggleStretch) return;
