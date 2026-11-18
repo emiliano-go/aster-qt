@@ -2951,6 +2951,17 @@ async fn handle_rpc(
             if ids.is_empty() {
                 return Err("ids is required".into());
             }
+            if args
+                .get("__runtime_approved")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                runtime
+                    .delete_messages_permanent(&ids)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                return Ok(serde_json::json!({ "ok": true }));
+            }
             let token = uuid::Uuid::new_v4().to_string();
             let (tx, rx) = std::sync::mpsc::channel();
             {

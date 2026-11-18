@@ -391,6 +391,18 @@ pub fn start(handle: AppHandle<AppState>) -> Sender<Action> {
                                 let _ = reply.send(Err("ids is required".into()));
                                 continue;
                             }
+                            if args
+                                .get("__runtime_approved")
+                                .and_then(serde_json::Value::as_bool)
+                                .unwrap_or(false)
+                            {
+                                let result = match rt.block_on(runtime.delete_messages_permanent(&ids)) {
+                                    Ok(()) => Ok(serde_json::json!({ "ok": true })),
+                                    Err(err) => Err(err.to_string()),
+                                };
+                                let _ = reply.send(result);
+                                continue;
+                            }
                             let token = uuid::Uuid::new_v4().to_string();
                             if let Ok(mut guard) = pending_delete_worker.lock() {
                                 *guard = Some((token.clone(), ids.clone(), reply));

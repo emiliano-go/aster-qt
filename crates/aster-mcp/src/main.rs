@@ -25,10 +25,13 @@ fn main() {
             .ok()
             .and_then(|value| value.get("id").cloned())
             .unwrap_or(Value::Null);
-        let response = match ureq::post(&config.url)
+        let mut request = ureq::post(&config.url)
             .set("Authorization", &format!("Bearer {}", config.token))
-            .set("Content-Type", "application/json")
-            .send_string(&line)
+            .set("Content-Type", "application/json");
+        if let Some(runtime_approval) = config.runtime_approval.as_deref() {
+            request = request.set("X-Aster-Runtime-Approval", runtime_approval);
+        }
+        let response = match request.send_string(&line)
         {
             Ok(response) => response.into_string().unwrap_or_default(),
             Err(err) => serde_json::to_string(&json!({
@@ -46,6 +49,7 @@ fn main() {
 struct Config {
     url: String,
     token: String,
+    runtime_approval: Option<String>,
 }
 
 fn load_config() -> Option<Config> {
@@ -55,6 +59,7 @@ fn load_config() -> Option<Config> {
     Some(Config {
         url: value.get("url")?.as_str()?.to_string(),
         token: value.get("token")?.as_str()?.to_string(),
+        runtime_approval: std::env::var("ASTER_MCP_RUNTIME_APPROVAL").ok(),
     })
 }
 

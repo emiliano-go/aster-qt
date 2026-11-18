@@ -148,7 +148,8 @@ fn handle_http(state: &State, mut request: Request, token: &str) {
         let _ = request.respond(Response::from_string("").with_status_code(202));
         return;
     }
-    let response = match handle(state, &message) {
+    let runtime_approved = header(&request, "x-aster-runtime-approval").is_some();
+    let response = match handle_with(state, &message, runtime_approved) {
         Some(response) => response,
         None => {
             let _ = request.respond(Response::from_string("").with_status_code(202));
@@ -169,7 +170,16 @@ fn header(request: &Request, name: &str) -> Option<String> {
         .map(|header| header.value.as_str().to_string())
 }
 
+#[cfg(test)]
 fn handle(state: &State, message: &Value) -> Option<Value> {
+    handle_with(state, message, false)
+}
+
+fn handle_with(
+    state: &State,
+    message: &Value,
+    runtime_approved: bool,
+) -> Option<Value> {
     let id = message.get("id").cloned()?;
     let method = message.get("method").and_then(Value::as_str).unwrap_or("");
     let params = message.get("params").cloned().unwrap_or_else(|| json!({}));
@@ -177,7 +187,7 @@ fn handle(state: &State, message: &Value) -> Option<Value> {
         "initialize" => Ok(initialize(state, &params)),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({ "tools": tools() })),
-        "tools/call" => call_tool(state, &params),
+        "tools/call" => call_tool(state, &params, runtime_approved),
         "resources/list" => Ok(json!({ "resources": resource_list() })),
         "resources/templates/list" => Ok(json!({ "resourceTemplates": resource_templates() })),
         "resources/read" => read_resource(state, &params),
@@ -211,15 +221,22 @@ fn initialize(state: &State, params: &Value) -> Value {
     })
 }
 
-fn call_tool(state: &State, params: &Value) -> Result<Value, String> {
+fn call_tool(
+    state: &State,
+    params: &Value,
+    runtime_approved: bool,
+) -> Result<Value, String> {
     let name = params
         .get("name")
         .and_then(Value::as_str)
         .ok_or("tool name is required")?;
-    let args = params
+    let mut args = params
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
+    if runtime_approved && name == "mail_delete" {
+        args["__runtime_approved"] = json!(true);
+    }
     let mutating = is_mutating(name);
     if mutating {
         if let Some(expected) = expected_revision(params, &args) {
@@ -477,7 +494,7 @@ fn raw_tools() -> Vec<Value> {
         { "name": "mail_scheduled_cancel", "description": "Cancel a scheduled message.", "inputSchema": { "type": "object", "properties": { "id": { "type": "string" } }, "required": ["id"] } },
         { "name": "mail_spam", "description": "Mark messages as spam or not spam.", "inputSchema": { "type": "object", "properties": { "ids": { "type": "array", "items": { "type": "string" } }, "spam": { "type": "boolean" } }, "required": ["ids", "spam"] } },
         { "name": "mail_restore", "description": "Restore messages from Trash or Spam.", "inputSchema": { "type": "object", "properties": { "ids": { "type": "array", "items": { "type": "string" } } }, "required": ["ids"] } },
-        { "name": "mail_delete", "description": "Permanently delete messages. Always requires explicit confirmation in the Aster Qt UI.", "inputSchema": { "type": "object", "properties": { "ids": { "type": "array", "items": { "type": "string" } } }, "required": ["ids"] } },
+        { "name": "mail_delete", "description": "Permanently delete messages. The MCP client must obtain explicit user approval before calling this destructive tool.", "inputSchema": { "type": "object", "properties": { "ids": { "type": "array", "items": { "type": "string" } } }, "required": ["ids"] } },
         { "name": "rules_list", "description": "List server side mail rules.", "inputSchema": { "type": "object", "properties": {} } },
         { "name": "rules_create", "description": "Create a server side mail rule.", "inputSchema": { "type": "object", "properties": { "rule": { "type": "object" } }, "required": ["rule"] } },
         { "name": "rules_delete", "description": "Delete a mail rule.", "inputSchema": { "type": "object", "properties": { "id": { "type": "string" } }, "required": ["id"] } },
@@ -885,6 +902,40 @@ mod tests {
         )
         .unwrap();
         assert_eq!(second["result"]["_meta"]["revision"], 2);
+    }
+
+    #[test]
+    fn runtime_approval_marks_delete_calls_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = State {
+            data_dir: dir.path().to_path_buf(),
+            call: Arc::new(|tool: &str, args: Value| {
+                Ok(if tool == "__revision" {
+                    json!({ "revision": 0 })
+                } else {
+                    json!({ "tool": tool, "args": args })
+                })
+            }),
+            revision: AtomicU64::new(0),
+            server_name: "test",
+            server_version: "0",
+        };
+        let delete = json!({ "name": "mail_delete", "arguments": { "ids": ["a"] } });
+        let approved = call_tool(&state, &delete, true).unwrap();
+        assert_eq!(
+            approved["structuredContent"]["args"]["__runtime_approved"],
+            true
+        );
+        let unapproved = call_tool(&state, &delete, false).unwrap();
+        assert!(unapproved["structuredContent"]["args"]
+            .get("__runtime_approved")
+            .is_none());
+
+        let star = json!({ "name": "mail_star", "arguments": {} });
+        let marked = call_tool(&state, &star, true).unwrap();
+        assert!(marked["structuredContent"]["args"]
+            .get("__runtime_approved")
+            .is_none());
     }
 
     #[test]
