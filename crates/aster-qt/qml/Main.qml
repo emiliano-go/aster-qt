@@ -257,7 +257,12 @@ ApplicationWindow {
     property bool threadListOpen: false
     property var aliasSelection: []
     property string composeFrom: ""
+    property string draftId: ""
+    property bool draftDirty: false
     property string editingDraftId: ""
+    property bool composeMinimized: false
+    property real composeCardX: -1
+    property real composeCardY: -1
     property bool sendUndoVisible: false
     property string pendingQueueId: ""
     property var pendingSend: null
@@ -559,9 +564,20 @@ ApplicationWindow {
             root.activeIdentity = root.defaultIdentityAddress();
     }
     onComposeOpenChanged: {
-        if (composeOpen && root.composeFrom.length === 0)
-            root.composeFrom = root.defaultIdentityAddress();
+        if (composeOpen) {
+            root.composeMinimized = false;
+            if (root.composeFrom.length === 0)
+                root.composeFrom = root.defaultIdentityAddress();
+            if (root.composeCardX < 0 || root.composeCardY < 0)
+                root.placeComposeCard();
+            else
+                root.clampComposeCard();
+        } else {
+            root.composeMinimized = false;
+        }
     }
+    onWidthChanged: if (root.composeOpen) root.clampComposeCard()
+    onHeightChanged: if (root.composeOpen) root.clampComposeCard()
 
     readonly property var visibleMessages: {
         var out = [];
@@ -978,6 +994,7 @@ ApplicationWindow {
 
     function closeCompose() {
         if (root.composeOpen) root.saveDraftNow();
+        root.composeMinimized = false;
         root.composeOpen = false;
     }
 
@@ -1036,6 +1053,28 @@ ApplicationWindow {
         outboxPopup.close();
         root.resetCompose();
         root.composeOpen = true;
+    }
+
+    function clampComposeCard() {
+        if (!root.composeOpen || root.composeMinimized) return;
+        var margin = n("space-4", 16);
+        var minY = n("topbar-height", 56) + n("space-2", 8);
+        var maxX = Math.max(margin, root.width - composePanel.width - margin);
+        var maxY = Math.max(minY, root.height - composePanel.height - n("statusbar-height", 30) - n("space-2", 8));
+        root.composeCardX = Math.max(margin, Math.min(maxX, root.composeCardX));
+        root.composeCardY = Math.max(minY, Math.min(maxY, root.composeCardY));
+        composePanel.x = root.composeCardX;
+        composePanel.y = root.composeCardY;
+    }
+
+    function placeComposeCard() {
+        var margin = n("space-4", 16);
+        root.composeCardX = Math.max(margin, root.width - composePanel.width - margin - n("space-5", 24));
+        root.composeCardY = Math.max(
+            n("topbar-height", 56) + n("space-2", 8),
+            root.height - composePanel.height - n("statusbar-height", 30) - n("space-4", 16)
+        );
+        root.clampComposeCard();
     }
 
     function replySubject(subject) {
@@ -3772,6 +3811,7 @@ ApplicationWindow {
 
     Rectangle {
         anchors.fill: parent
+        z: 20
         color: c("overlay", "#8c000000")
         visible: root.settingsOpen
         MouseArea {
@@ -4685,6 +4725,7 @@ ApplicationWindow {
 
     Rectangle {
         anchors.fill: parent
+        z: 20
         color: c("overlay", "#8c000000")
         visible: root.unsubConfirmOpen
         MouseArea {
@@ -4717,6 +4758,7 @@ ApplicationWindow {
 
     Rectangle {
         anchors.fill: parent
+        z: 20
         color: c("overlay", "#8c000000")
         visible: root.emptyConfirmOpen
         MouseArea {
@@ -4749,6 +4791,7 @@ ApplicationWindow {
 
     Rectangle {
         anchors.fill: parent
+        z: 20
         color: c("overlay", "#8c000000")
         visible: root.deleteConfirmOpen
         MouseArea {
@@ -4839,29 +4882,27 @@ ApplicationWindow {
     }
 
     Rectangle {
-        anchors.fill: parent
-        color: c("overlay", "#8c000000")
-        visible: root.composeOpen
-        MouseArea {
+        id: composePanel
+        z: 10
+        x: root.composeCardX
+        y: root.composeCardY
+        width: Math.min(root.width - 80, 760)
+        height: Math.min(root.height - 100, 640)
+        visible: root.composeOpen && !root.composeMinimized
+        radius: n("radius-panel", 8)
+        color: c("surface", "#1b1e23")
+        border.width: n("border-width", 1)
+        border.color: c("border-strong", "#292e323a")
+        ColumnLayout {
             anchors.fill: parent
-            onClicked: root.composeOpen = false
-            onWheel: function(wheel) { wheel.accepted = true }
-        }
-        Rectangle {
-            width: Math.min(root.width - 80, 760)
-            height: Math.min(root.height - 80, 640)
-            anchors.centerIn: parent
-            radius: n("radius-panel", 8)
-            color: c("surface", "#1b1e23")
-            border.width: n("border-width", 1)
-            border.color: c("border-strong", "#292e323a")
-            MouseArea { anchors.fill: parent }
-            ColumnLayout {
-                anchors.fill: parent
-                anchors.margins: n("space-5", 24)
-                spacing: n("space-3", 12)
+            anchors.margins: n("space-5", 24)
+            spacing: n("space-3", 12)
+            Rectangle {
+                Layout.fillWidth: true
+                Layout.preferredHeight: 32
+                color: "transparent"
                 RowLayout {
-                    Layout.fillWidth: true
+                    anchors.fill: parent
                     Text {
                         text: "New message"
                         color: c("text", "#ece7de")
@@ -4876,8 +4917,42 @@ ApplicationWindow {
                         font.family: c("font-mono", "JetBrains Mono")
                         font.pixelSize: n("font-size-micro", 11)
                     }
+                    Rectangle {
+                        id: composeMoveHandle
+                        Layout.preferredWidth: 24
+                        Layout.preferredHeight: 22
+                        radius: n("radius-control", 2)
+                        color: moveHover.hovered || composeMoveArea.pressed ? c("hover", "#2e2e323a") : "transparent"
+                        HoverHandler { id: moveHover }
+                        Icon {
+                            anchors.centerIn: parent
+                            name: "grip"
+                            size: 14
+                            color: moveHover.hovered ? c("text", "#ece7de") : c("text-2", "#dbebe7de")
+                        }
+                        MouseArea {
+                            id: composeMoveArea
+                            anchors.fill: parent
+                            cursorShape: Qt.SizeAllCursor
+                            drag.target: composePanel
+                            drag.axis: Drag.XAndYAxis
+                            drag.minimumX: n("space-4", 16)
+                            drag.maximumX: Math.max(n("space-4", 16), root.width - composePanel.width - n("space-4", 16))
+                            drag.minimumY: n("topbar-height", 56) + n("space-2", 8)
+                            drag.maximumY: Math.max(n("topbar-height", 56) + n("space-2", 8), root.height - composePanel.height - n("statusbar-height", 30) - n("space-2", 8))
+                            onReleased: {
+                                root.composeCardX = composePanel.x;
+                                root.composeCardY = composePanel.y;
+                            }
+                        }
+                        ToolTip.visible: moveHover.hovered
+                        ToolTip.text: "Move composer"
+                        ToolTip.delay: 400
+                    }
+                    IconButton { icon: "chevronDown"; label: "Minimize composer"; onClicked: root.composeMinimized = true }
                     IconButton { icon: "close"; label: "Close composer"; onClicked: root.closeCompose() }
                 }
+            }
                 RowLayout {
                     Layout.fillWidth: true
                     spacing: n("space-2", 8)
@@ -5201,6 +5276,71 @@ ApplicationWindow {
                     }
                 }
             }
+    }
+
+    Rectangle {
+        id: composeDock
+        z: 10
+        visible: root.composeOpen && root.composeMinimized
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
+        anchors.rightMargin: n("space-4", 16)
+        anchors.bottomMargin: n("statusbar-height", 30) + n("space-4", 16)
+        width: Math.min(420, root.width - n("space-6", 32))
+        height: 52
+        radius: n("radius-panel", 8)
+        color: c("surface-strong", "#2e323a")
+        border.width: n("border-width", 1)
+        border.color: c("border-strong", "#292e323a")
+        PressArea {
+            pressScale: 0.99
+            onClicked: {
+                root.composeMinimized = false;
+                root.clampComposeCard();
+                composeBody.forceActiveFocus();
+            }
+        }
+        RowLayout {
+            anchors.fill: parent
+            anchors.leftMargin: n("space-3", 12)
+            anchors.rightMargin: n("space-2", 8)
+            spacing: n("space-2", 8)
+            Icon {
+                name: "drafts"
+                size: n("icon-body", 16)
+                color: c("accent-text", "#e7a97f")
+            }
+            ColumnLayout {
+                Layout.fillWidth: true
+                spacing: 0
+                Text {
+                    text: composeSubject.text.length > 0 ? composeSubject.text : "New message"
+                    color: c("text", "#ece7de")
+                    font.family: c("font-family", "Inter")
+                    font.pixelSize: n("font-size-small", 12)
+                    font.weight: n("font-weight-semibold", 600)
+                    elide: Text.ElideRight
+                    Layout.fillWidth: true
+                }
+                Text {
+                    text: composeTo.text.length > 0 ? "To: " + composeTo.text : "Draft"
+                    color: c("muted", "#a8ece7de")
+                    font.family: c("font-family", "Inter")
+                    font.pixelSize: n("font-size-micro", 11)
+                    elide: Text.ElideRight
+                    Layout.fillWidth: true
+                }
+            }
+            IconButton {
+                icon: "chevronUp"
+                label: "Restore composer"
+                onClicked: {
+                    root.composeMinimized = false;
+                    root.clampComposeCard();
+                    composeBody.forceActiveFocus();
+                }
+            }
+            IconButton { icon: "close"; label: "Close composer"; onClicked: root.closeCompose() }
         }
     }
 
